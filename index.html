@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GIS 矢量数据编辑 Demo</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="eyebrow">VECTOR LAB · GIS DEMO</div>
+        <h1>矢量数据工作台</h1>
+        <p>在模拟平面上编辑、筛选并管理 GeoJSON 要素</p>
+      </div>
+      <div class="data-summary" aria-label="数据概览">
+        <div><strong id="featureCount">0</strong><span>要素</span></div>
+        <div><strong id="layerCount">0</strong><span>图层</span></div>
+        <div><strong id="selectionCount">0</strong><span>已选</span></div>
+      </div>
+      <div class="top-actions">
+        <button id="saveBtn" class="primary"><span class="button-icon">↥</span>保存</button>
+        <a class="button" href="/api/export">导出 GeoJSON</a>
+        <button id="resetBtn">重置数据</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <section>
+          <div class="section-heading">
+            <h2>图层</h2>
+            <div class="section-actions">
+              <button id="showAllBtn" class="text-button">全显</button>
+              <button id="hideAllBtn" class="text-button">全隐</button>
+            </div>
+          </div>
+          <div id="layerList" class="layer-list"></div>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>绘制属性</h2>
+            <span class="section-kicker">NEW FEATURE</span>
+          </div>
+          <label>
+            名称
+            <input id="nameInput" type="text" value="新要素" maxlength="40" placeholder="例如：北门">
+          </label>
+          <label>
+            图层
+            <select id="layerInput">
+              <option>兴趣点</option>
+              <option>道路</option>
+              <option>水域</option>
+              <option>功能区</option>
+              <option>自定义</option>
+            </select>
+          </label>
+          <p class="form-tip">先设置属性，再选择“画点 / 画线 / 画面”。</p>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>后端状态</h2>
+            <span id="statusDot" class="status-dot pending"></span>
+          </div>
+          <div id="backendStatus" class="status">正在连接...</div>
+        </section>
+      </aside>
+
+      <section class="map-panel">
+        <div class="toolbar" role="toolbar" aria-label="地图工具">
+          <div class="tool-group">
+            <span class="toolbar-label">浏览</span>
+            <button data-mode="pan" class="tool active">漫游</button>
+            <button data-mode="select" class="tool">点选</button>
+            <button data-mode="box" class="tool">框选</button>
+          </div>
+          <div class="tool-group">
+            <span class="toolbar-label">编辑</span>
+            <button data-mode="point" class="tool">画点</button>
+            <button data-mode="line" class="tool">画线</button>
+            <button data-mode="polygon" class="tool">画面</button>
+            <button id="finishBtn" class="accent-button">完成绘制</button>
+          </div>
+          <div class="tool-group view-tools">
+            <span class="toolbar-label">视图</span>
+            <button id="zoomInBtn" aria-label="放大">＋</button>
+            <button id="zoomOutBtn" aria-label="缩小">－</button>
+            <button id="fitBtn">全图</button>
+          </div>
+        </div>
+        <div class="map-stage">
+          <canvas id="mapCanvas" aria-label="地图画布"></canvas>
+          <div class="map-badge"><span class="live-dot"></span> LIVE · 模拟坐标系</div>
+          <div id="coordinateReadout" class="coordinate-readout">坐标 —</div>
+        </div>
+        <div id="hint" class="hint">当前：漫游。拖拽移动地图，滚轮缩放。</div>
+      </section>
+
+      <aside class="attribute-panel">
+        <section>
+          <div class="section-heading">
+            <h2>选中要素</h2>
+            <button id="clearSelectionBtn" class="text-button">清除</button>
+          </div>
+          <div id="selectionSummary" class="selection-summary">暂无选择</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>名称</th>
+                  <th>图层</th>
+                  <th>类型</th>
+                </tr>
+              </thead>
+              <tbody id="attributeBody"></tbody>
+            </table>
+          </div>
+          <button id="deleteSelectionBtn" class="danger-button" disabled>删除选中要素</button>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>操作提示</h2>
+            <span class="section-kicker">QUICK GUIDE</span>
+          </div>
+          <ul class="checklist">
+            <li><span>01</span>点选或框选要素查看属性</li>
+            <li><span>02</span>滚轮缩放，漫游模式拖动地图</li>
+            <li><span>03</span>绘制后点击“完成绘制”提交</li>
+            <li><span>04</span>保存后可导出标准 GeoJSON</li>
+          </ul>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

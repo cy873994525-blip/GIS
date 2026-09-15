@@ -1,0 +1,175 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "pt-campus-gate",
+      "properties": {
+        "name": "校园入口",
+        "layer": "兴趣点",
+        "kind": "point"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          180,
+          760
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "ln-main-road",
+      "properties": {
+        "name": "主干道",
+        "layer": "道路",
+        "kind": "line"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            90,
+            640
+          ],
+          [
+            260,
+            610
+          ],
+          [
+            430,
+            580
+          ],
+          [
+            720,
+            520
+          ],
+          [
+            910,
+            460
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "pg-lake",
+      "properties": {
+        "name": "中心湖",
+        "layer": "水域",
+        "kind": "polygon"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              430,
+              720
+            ],
+            [
+              610,
+              690
+            ],
+            [
+              680,
+              800
+            ],
+            [
+              600,
+              910
+            ],
+            [
+              420,
+              880
+            ],
+            [
+              360,
+              790
+            ],
+            [
+              430,
+              720
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "pg-teaching-area",
+      "properties": {
+        "name": "教学区",
+        "layer": "功能区",
+        "kind": "polygon"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              150,
+              180
+            ],
+            [
+              430,
+              150
+            ],
+            [
+              490,
+              330
+            ],
+            [
+              390,
+              480
+            ],
+            [
+              160,
+              440
+            ],
+            [
+              90,
+              260
+            ],
+            [
+              150,
+              180
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "新要素",
+        "layer": "兴趣点",
+        "kind": "polygon"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              594.4323554618122,
+              609.0525983023765
+            ],
+            [
+              812.9997790054987,
+              548.6355869163168
+            ],
+            [
+              665.5111923865883,
+              426.0245932210781
+            ],
+            [
+              594.4323554618122,
+              609.0525983023765
+            ]
+          ]
+        ]
+      },
+      "id": "ft-bb6fca3613"
+    }
+  ]
+}
