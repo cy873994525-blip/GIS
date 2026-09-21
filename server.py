@@ -141,7 +141,7 @@ def dataset_summary(dataset_id, file_name, payload, size_bytes, path_name, creat
 
 def write_json_atomic(path, payload):
     temp_file = path.with_suffix(".tmp")
-    temp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temp_file.replace(path)
 
 
