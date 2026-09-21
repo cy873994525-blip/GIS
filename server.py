@@ -72,14 +72,25 @@ def validate_feature_collection(payload):
     if not isinstance(features, list):
         raise ValueError("features must be a list")
     for feature in features:
-        if not isinstance(feature, dict) or feature.get("type") != "Feature":
-            raise ValueError("each item in features must be a GeoJSON Feature")
-        geometry = feature.get("geometry")
-        if not isinstance(geometry, dict) or not geometry.get("type"):
-            raise ValueError("each feature must include a geometry")
-        if not isinstance(feature.get("properties", {}), dict):
-            raise ValueError("feature properties must be an object")
+        validate_feature(feature)
     return payload
+
+
+def validate_feature(feature):
+    if not isinstance(feature, dict) or feature.get("type") != "Feature":
+        raise ValueError("feature must be a GeoJSON Feature")
+    if not feature.get("id"):
+        raise ValueError("feature must include id")
+    if not isinstance(feature.get("geometry"), dict):
+        raise ValueError("feature must include geometry")
+    if not isinstance(feature.get("properties", {}), dict):
+        raise ValueError("feature properties must be an object")
+    geometry_type = feature["geometry"].get("type")
+    if geometry_type not in {"Point", "LineString", "Polygon"}:
+        raise ValueError("geometry type must be Point, LineString, or Polygon")
+    if "coordinates" not in feature["geometry"]:
+        raise ValueError("geometry must include coordinates")
+    return feature
 
 
 def iter_positions(value):
@@ -270,7 +281,6 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
-
         if path == "/api/layers":
             self.send_json(read_geojson())
             return
@@ -342,6 +352,10 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     return
                 feature.setdefault("id", f"ft-{uuid.uuid4().hex[:10]}")
                 feature.setdefault("properties", {})
+                existing_ids = {item.get("id") for item in data["features"]}
+                while feature["id"] in existing_ids:
+                    feature["id"] = f"ft-{uuid.uuid4().hex[:10]}"
+                validate_feature(feature)
                 data["features"].append(feature)
                 write_geojson(data, active_id)
                 self.send_json({"ok": True, "feature": feature})
@@ -406,26 +420,70 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
     def do_DELETE(self):
         path = urlsplit(self.path).path
         try:
-            if not path.startswith("/api/datasets/"):
+            if path.startswith("/api/datasets/"):
+                dataset_id = unquote(path.removeprefix("/api/datasets/")).strip("/")
+                catalog = read_catalog()
+                if len(catalog["datasets"]) <= 1:
+                    self.send_error_json("至少保留一个数据集", status=409)
+                    return
+                if dataset_id == get_active_id():
+                    self.send_error_json("请先切换到其他数据集，再删除当前数据集", status=409)
+                    return
+                dataset = find_dataset(dataset_id)
+                target = dataset_path(dataset)
+                if target.exists():
+                    target.unlink()
+                catalog["datasets"] = [item for item in catalog["datasets"] if item["id"] != dataset_id]
+                write_catalog(catalog)
+                self.send_json({"ok": True, "deleted": dataset_id})
+                return
+
+            feature_id = self.feature_id_from_path()
+            if not feature_id:
                 self.send_error_json("unknown endpoint", status=404)
                 return
-            dataset_id = unquote(path.removeprefix("/api/datasets/")).strip("/")
-            catalog = read_catalog()
-            if len(catalog["datasets"]) <= 1:
-                self.send_error_json("至少保留一个数据集", status=409)
+            data = read_geojson()
+            remaining = [item for item in data["features"] if str(item.get("id")) != feature_id]
+            if len(remaining) == len(data["features"]):
+                self.send_error_json("feature not found", status=404)
                 return
-            if dataset_id == get_active_id():
-                self.send_error_json("请先切换到其他数据集，再删除当前数据集", status=409)
-                return
-            dataset = find_dataset(dataset_id)
-            target = dataset_path(dataset)
-            if target.exists():
-                target.unlink()
-            catalog["datasets"] = [item for item in catalog["datasets"] if item["id"] != dataset_id]
-            write_catalog(catalog)
-            self.send_json({"ok": True, "deleted": dataset_id})
+            data["features"] = remaining
+            write_geojson(data)
+            self.send_json({"ok": True, "id": feature_id})
         except Exception as exc:
             self.send_error_json(str(exc), status=500)
+
+    def do_PUT(self):
+        try:
+            feature_id = self.feature_id_from_path()
+            if not feature_id:
+                self.send_error_json("feature id is required", status=404)
+                return
+            payload = self.read_json_body()
+            feature = payload.get("feature")
+            if not isinstance(feature, dict):
+                self.send_error_json("feature is required")
+                return
+            feature["id"] = feature_id
+            validate_feature(feature)
+            data = read_geojson()
+            for index, current in enumerate(data["features"]):
+                if str(current.get("id")) == feature_id:
+                    data["features"][index] = feature
+                    write_geojson(data)
+                    self.send_json({"ok": True, "feature": feature})
+                    return
+            self.send_error_json("feature not found", status=404)
+        except Exception as exc:
+            self.send_error_json(str(exc), status=500)
+
+    def feature_id_from_path(self):
+        path = urlsplit(self.path).path
+        prefix = "/api/features/"
+        if not path.startswith(prefix):
+            return None
+        feature_id = unquote(path[len(prefix):]).strip()
+        return feature_id or None
 
 
 def main():

@@ -403,6 +403,111 @@ th {
   }
 }
 
+/* Editing workflow */
+.draft-button {
+  border-color: #d9e1df;
+  background: #f7faf9;
+  color: var(--muted);
+}
+
+.draft-button:not(:disabled):hover {
+  border-color: var(--primary);
+  background: #edf7f5;
+  color: var(--primary-dark);
+}
+
+.selection-editor {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.selection-editor.is-empty {
+  opacity: 0.82;
+}
+
+.editor-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.editor-title {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.editor-state {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.type-chip {
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--primary);
+  font-family: Consolas, monospace;
+  font-size: 10px;
+}
+
+.editor-meta {
+  margin: -2px 0 12px;
+  color: var(--muted);
+  font-family: Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.editor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.editor-actions button {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.editor-actions .danger-button {
+  width: auto;
+  margin-top: 0;
+}
+
+.table-wrap {
+  max-height: 235px;
+}
+
+#attributeBody tr {
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+#attributeBody tr:hover,
+#attributeBody tr.active {
+  background: #edf7f5;
+}
+
+#attributeBody tr.active td:first-child {
+  color: var(--primary);
+  font-weight: 700;
+}
+
+@media (max-width: 760px) {
+  .editor-actions {
+    flex-direction: column;
+  }
+}
+
 /* Presentation pass */
 :root {
   --bg: #edf3f1;

@@ -98,6 +98,8 @@
             <button data-mode="line" class="tool">画线</button>
             <button data-mode="polygon" class="tool">画面</button>
             <button id="finishBtn" class="accent-button">完成绘制</button>
+            <button id="undoDraftBtn" class="draft-button" disabled>撤销节点</button>
+            <button id="cancelDraftBtn" class="draft-button" disabled>取消绘制</button>
           </div>
           <div class="tool-group view-tools">
             <span class="toolbar-label">视图</span>
@@ -134,7 +136,34 @@
               <tbody id="attributeBody"></tbody>
             </table>
           </div>
-          <button id="deleteSelectionBtn" class="danger-button" disabled>删除选中要素</button>
+          <div id="selectionEditor" class="selection-editor is-empty">
+            <div class="editor-heading">
+              <div>
+                <span class="editor-title">属性编辑</span>
+                <span id="editorState" class="editor-state">未选择</span>
+              </div>
+              <span id="editorType" class="type-chip">—</span>
+            </div>
+            <label>
+              名称
+              <input id="editNameInput" type="text" maxlength="40" placeholder="选择一个要素后编辑" disabled>
+            </label>
+            <label>
+              图层
+              <select id="editLayerInput" disabled>
+                <option>兴趣点</option>
+                <option>道路</option>
+                <option>水域</option>
+                <option>功能区</option>
+                <option>自定义</option>
+              </select>
+            </label>
+            <div id="editorMeta" class="editor-meta">点选一行要素开始编辑。</div>
+            <div class="editor-actions">
+              <button id="updateFeatureBtn" class="primary" disabled>保存属性修改</button>
+              <button id="deleteSelectionBtn" class="danger-button" disabled>删除选中要素</button>
+            </div>
+          </div>
         </section>
 
         <section>
