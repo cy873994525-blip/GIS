@@ -12,6 +12,7 @@
 - 响应式工作台布局，支持桌面与窄屏展示
 - Python 后端保存 GeoJSON
 - GeoJSON 导出
+- GeoJSON 文件导入、数据集切换与文件元数据登记
 - Shapefile 与 PostGIS 留出后续扩展位置
 
 ## 运行
@@ -32,6 +33,20 @@ http://127.0.0.1:8000
 2. 画线和画面需要连续点击地图，完成后点击“完成绘制”。
 3. 使用“点选”或“框选”查看属性；删除操作会先保留在当前编辑状态，点击“保存”后写入 GeoJSON。
 4. “全图”会根据当前数据范围自动计算合适的视图。
+
+## A 组：后端文件数据模块（当前实现）
+
+后端现在提供一个轻量的数据集目录。导入的文件会存放在运行时目录 `data/uploads/`，并自动登记文件元数据：
+
+- `GET /api/datasets`：列出数据集、当前激活数据集和要素统计。
+- `POST /api/datasets/import`：导入 GeoJSON/JSON 格式的 FeatureCollection，并自动切换为当前数据集。
+- `POST /api/datasets/{id}/activate`：切换当前数据集。
+- `GET /api/datasets/{id}`：读取指定数据集和元数据。
+- `GET /api/layers`：读取当前数据集，供地图显示。
+- `POST /api/save`、`POST /api/features`：保存当前数据集或追加要素。
+- `GET /api/export`：导出当前数据集。
+
+这部分已经形成“文件导入 → 格式校验 → 元数据登记 → 数据集切换 → 地图读取”的后端闭环。下一步可以继续扩展 Shapefile 解压与 GeoPandas 转换、坐标系识别（EPSG）和数据库存储。
 
 ## 后续扩展建议
 

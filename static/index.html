@@ -30,6 +30,20 @@
       <aside class="sidebar">
         <section>
           <div class="section-heading">
+            <h2>数据文件</h2>
+            <span id="datasetCountLabel" class="section-kicker">0 FILES</span>
+          </div>
+          <label class="file-picker">
+            <span>导入 GeoJSON</span>
+            <input id="fileInput" type="file" accept=".geojson,.json,application/geo+json,application/json">
+            <small>导入后自动切换为当前数据集</small>
+          </label>
+          <div id="datasetList" class="dataset-list"></div>
+          <div id="activeDatasetMeta" class="dataset-meta">正在读取数据文件...</div>
+        </section>
+
+        <section>
+          <div class="section-heading">
             <h2>图层</h2>
             <div class="section-actions">
               <button id="showAllBtn" class="text-button">全显</button>

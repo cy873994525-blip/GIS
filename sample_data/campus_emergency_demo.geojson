@@ -1,0 +1,166 @@
+{
+  "type": "FeatureCollection",
+  "name": "campus_emergency_demo",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "poi-command-center",
+      "properties": {
+        "name": "应急指挥点",
+        "layer": "应急设施",
+        "kind": "point",
+        "category": "command",
+        "status": "available"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [245, 705]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "poi-medical-station",
+      "properties": {
+        "name": "临时医疗点",
+        "layer": "应急设施",
+        "kind": "point",
+        "category": "medical",
+        "status": "available"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [735, 635]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "poi-shelter-a",
+      "properties": {
+        "name": "操场避难点",
+        "layer": "避难场所",
+        "kind": "point",
+        "capacity": 1200,
+        "status": "available"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [570, 285]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "route-evacuation-east",
+      "properties": {
+        "name": "东侧疏散路线",
+        "layer": "疏散路线",
+        "kind": "line",
+        "direction": "east",
+        "priority": 1
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [140, 520],
+          [300, 500],
+          [470, 455],
+          [650, 410],
+          [860, 360]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "route-evacuation-north",
+      "properties": {
+        "name": "北侧疏散路线",
+        "layer": "疏散路线",
+        "kind": "line",
+        "direction": "north",
+        "priority": 2
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [245, 705],
+          [360, 760],
+          [520, 805],
+          [690, 850]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "zone-temporary-shelter",
+      "properties": {
+        "name": "临时安置区",
+        "layer": "避难场所",
+        "kind": "polygon",
+        "area_type": "shelter",
+        "capacity": 2600
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [430, 180],
+            [710, 185],
+            [760, 340],
+            [650, 455],
+            [420, 420],
+            [360, 270],
+            [430, 180]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "zone-building-risk",
+      "properties": {
+        "name": "老旧建筑风险区",
+        "layer": "风险区域",
+        "kind": "polygon",
+        "risk_level": "medium",
+        "inspection": "required"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [120, 610],
+            [315, 615],
+            [350, 790],
+            [230, 900],
+            [95, 820],
+            [120, 610]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "zone-water-risk",
+      "properties": {
+        "name": "积水风险区",
+        "layer": "风险区域",
+        "kind": "polygon",
+        "risk_level": "low",
+        "inspection": "monitoring"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [690, 650],
+            [850, 690],
+            [910, 790],
+            [835, 900],
+            [675, 850],
+            [640, 730],
+            [690, 650]
+          ]
+        ]
+      }
+    }
+  ]
+}

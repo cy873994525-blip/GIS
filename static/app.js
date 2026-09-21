@@ -3,6 +3,8 @@ const ctx = canvas.getContext("2d");
 
 const state = {
   data: { type: "FeatureCollection", features: [] },
+  datasets: [],
+  activeDataset: null,
   visibleLayers: new Set(),
   selectedIds: new Set(),
   mode: "pan",
@@ -65,9 +67,69 @@ function resizeCanvas() {
 async function api(path, options) {
   const response = await fetch(path, options);
   if (!response.ok) {
-    throw new Error(await response.text());
+    let message = await response.text();
+    try {
+      message = JSON.parse(message).error || message;
+    } catch (error) {
+      // Keep the raw response when the server does not return JSON.
+    }
+    throw new Error(message);
   }
   return response.json();
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderDatasets() {
+  const list = document.getElementById("datasetList");
+  const countLabel = document.getElementById("datasetCountLabel");
+  const meta = document.getElementById("activeDatasetMeta");
+  countLabel.textContent = `${state.datasets.length} FILES`;
+  list.innerHTML = "";
+
+  for (const dataset of state.datasets) {
+    const row = document.createElement("div");
+    row.className = `dataset-row${dataset.active ? " active" : ""}`;
+    const info = document.createElement("div");
+    info.className = "dataset-info";
+    const name = document.createElement("strong");
+    name.textContent = dataset.name;
+    const detail = document.createElement("span");
+    detail.textContent = `${dataset.file_name} · ${dataset.feature_count} 个要素`;
+    info.append(name, detail);
+
+    const button = document.createElement("button");
+    button.className = "dataset-switch";
+    button.type = "button";
+    button.textContent = dataset.active ? "当前" : "切换";
+    button.disabled = dataset.active;
+    button.addEventListener("click", () => activateDataset(dataset.id));
+    row.append(info, button);
+    list.appendChild(row);
+  }
+
+  if (state.activeDataset) {
+    const types = state.activeDataset.geometry_types.join("、") || "暂无几何";
+    meta.innerHTML = [
+      `<strong>当前：${state.activeDataset.name}</strong>`,
+      `<span>${state.activeDataset.file_name} · ${formatBytes(state.activeDataset.size_bytes)}</span>`,
+      `<span>几何：${types}</span>`,
+    ].join("");
+  } else {
+    meta.textContent = "暂无当前数据集";
+  }
+}
+
+async function loadDatasets() {
+  const result = await api("/api/datasets");
+  state.datasets = result.datasets;
+  state.activeDataset = state.datasets.find((dataset) => dataset.active) || null;
+  renderDatasets();
 }
 
 async function loadData() {
@@ -85,10 +147,41 @@ async function loadStatus() {
   document.getElementById("backendStatus").textContent = [
     `服务：${status.backend}`,
     `存储：${status.storage}`,
+    `当前：${status.active_dataset} · ${status.dataset_count} 个数据集`,
     `扩展：${status.postgis} · ${status.shapefile}`,
   ].join("\n");
   document.getElementById("backendStatus").style.whiteSpace = "pre-line";
   document.getElementById("statusDot").className = "status-dot";
+}
+
+async function activateDataset(datasetId) {
+  try {
+    await api(`/api/datasets/${encodeURIComponent(datasetId)}/activate`, { method: "POST" });
+    state.selectedIds.clear();
+    await Promise.all([loadDatasets(), loadData(), loadStatus()]);
+    fitView();
+    setNotice(`已切换到数据集“${state.activeDataset.name}”。`);
+  } catch (error) {
+    setNotice(`切换失败：${error.message}`);
+  }
+}
+
+async function importDataset(file) {
+  try {
+    const content = await file.text();
+    JSON.parse(content);
+    await api("/api/datasets/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_name: file.name, content }),
+    });
+    state.selectedIds.clear();
+    await Promise.all([loadDatasets(), loadData(), loadStatus()]);
+    fitView();
+    setNotice(`已导入“${file.name}”，后端已登记文件元数据。`);
+  } catch (error) {
+    setNotice(`导入失败：${error.message}`);
+  }
 }
 
 function renderLayers() {
@@ -579,6 +672,11 @@ document.getElementById("finishBtn").addEventListener("click", finishDraft);
 document.getElementById("zoomInBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 1.2));
 document.getElementById("zoomOutBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 0.82));
 document.getElementById("fitBtn").addEventListener("click", fitView);
+document.getElementById("fileInput").addEventListener("change", (event) => {
+  const [file] = event.target.files;
+  if (file) importDataset(file);
+  event.target.value = "";
+});
 
 document.getElementById("showAllBtn").addEventListener("click", () => {
   state.visibleLayers = new Set(state.data.features.map((feature) => feature.properties.layer || "未命名"));
@@ -641,7 +739,7 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
 
 window.addEventListener("resize", resizeCanvas);
 
-Promise.all([loadData(), loadStatus()]).then(() => {
+Promise.all([loadDatasets(), loadData(), loadStatus()]).then(() => {
   resizeCanvas();
   fitView();
 }).catch((error) => {
