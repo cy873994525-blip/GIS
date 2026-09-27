@@ -614,7 +614,9 @@ function fitView() {
   const padding = 72;
   const width = Math.max(1, bounds.maxX - bounds.minX);
   const height = Math.max(1, bounds.maxY - bounds.minY);
-  state.scale = Math.max(0.25, Math.min(3.5,
+  // Shapefile coordinates may be projected meters in the millions, so the
+  // lower bound must allow very small display scales.
+  state.scale = Math.max(0.00001, Math.min(3.5,
     Math.min((state.viewWidth - padding * 2) / width, (state.viewHeight - padding * 2) / height)));
   state.offsetX = padding - bounds.minX * state.scale;
   state.offsetY = state.viewHeight - padding - bounds.maxY * state.scale;
