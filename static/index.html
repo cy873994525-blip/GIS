@@ -12,7 +12,7 @@
       <div class="brand-block">
         <div class="eyebrow">VECTOR LAB · GIS DEMO</div>
         <h1>矢量数据工作台</h1>
-        <p>在模拟平面上编辑、筛选并管理 GeoJSON 要素</p>
+        <p>在模拟平面上编辑、筛选并管理矢量数据</p>
       </div>
       <div class="data-summary" aria-label="数据概览">
         <div><strong id="featureCount">0</strong><span>要素</span></div>
@@ -34,9 +34,9 @@
             <span id="datasetCountLabel" class="section-kicker">0 FILES</span>
           </div>
           <label class="file-picker">
-            <span>导入 GeoJSON</span>
-            <input id="fileInput" type="file" accept=".geojson,.json,application/geo+json,application/json">
-            <small>导入后自动切换为当前数据集</small>
+            <span>导入矢量文件</span>
+            <input id="fileInput" type="file" accept=".geojson,.json,.zip,application/geo+json,application/json,application/zip">
+            <small>支持 GeoJSON / JSON 与 Shapefile ZIP</small>
           </label>
           <div id="datasetList" class="dataset-list"></div>
           <div id="activeDatasetMeta" class="dataset-meta">正在读取数据文件...</div>

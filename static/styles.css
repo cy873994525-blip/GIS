@@ -231,9 +231,22 @@ select {
   font-size: 10px;
 }
 
-.dataset-switch {
+.dataset-actions {
+  display: flex;
   flex: 0 0 auto;
+  gap: 4px;
+}
+
+.dataset-switch {
   padding: 5px 7px;
+  font-size: 11px;
+}
+
+.dataset-delete {
+  padding: 5px 7px;
+  border-color: #e4c1c1;
+  background: #fffafa;
+  color: var(--danger);
   font-size: 11px;
 }
 

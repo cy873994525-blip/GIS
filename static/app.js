@@ -87,6 +87,11 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatBbox(bbox) {
+  if (!bbox) return "范围：暂无坐标";
+  return `范围：${bbox.map((value) => Number(value).toFixed(1)).join(", ")}`;
+}
+
 function renderDatasets() {
   const list = document.getElementById("datasetList");
   const countLabel = document.getElementById("datasetCountLabel");
@@ -105,13 +110,24 @@ function renderDatasets() {
     detail.textContent = `${dataset.file_name} · ${dataset.feature_count} 个要素`;
     info.append(name, detail);
 
+    const actions = document.createElement("div");
+    actions.className = "dataset-actions";
     const button = document.createElement("button");
     button.className = "dataset-switch";
     button.type = "button";
     button.textContent = dataset.active ? "当前" : "切换";
     button.disabled = dataset.active;
     button.addEventListener("click", () => activateDataset(dataset.id));
-    row.append(info, button);
+
+    const deleteButton = document.createElement("button");
+    deleteButton.className = "dataset-delete";
+    deleteButton.type = "button";
+    deleteButton.textContent = "删除";
+    deleteButton.title = dataset.active ? "当前数据集不能删除" : "删除这个数据集";
+    deleteButton.disabled = dataset.active;
+    deleteButton.addEventListener("click", () => deleteDataset(dataset));
+    actions.append(button, deleteButton);
+    row.append(info, actions);
     list.appendChild(row);
   }
 
@@ -120,7 +136,10 @@ function renderDatasets() {
     meta.innerHTML = [
       `<strong>当前：${state.activeDataset.name}</strong>`,
       `<span>${state.activeDataset.file_name} · ${formatBytes(state.activeDataset.size_bytes)}</span>`,
+      `<span>来源：${state.activeDataset.format}${state.activeDataset.crs ? ` · ${state.activeDataset.crs}` : ""}</span>`,
       `<span>几何：${types}</span>`,
+      `<span>${formatBbox(state.activeDataset.bbox)}</span>`,
+      state.activeDataset.source_note ? `<span>${state.activeDataset.source_note}</span>` : "",
     ].join("");
   } else {
     meta.textContent = "暂无当前数据集";
@@ -169,10 +188,25 @@ async function activateDataset(datasetId) {
   }
 }
 
+async function deleteDataset(dataset) {
+  if (dataset.active) return;
+  if (!window.confirm(`确定删除数据集“${dataset.name}”吗？`)) return;
+  try {
+    await api(`/api/datasets/${encodeURIComponent(dataset.id)}`, { method: "DELETE" });
+    await Promise.all([loadDatasets(), loadStatus()]);
+    setNotice(`已删除数据集“${dataset.name}”。`);
+  } catch (error) {
+    setNotice(`删除数据集失败：${error.message}`);
+  }
+}
+
 async function importDataset(file) {
   try {
-    const content = await file.text();
-    JSON.parse(content);
+    const isZip = file.name.toLowerCase().endsWith(".zip");
+    const content = isZip
+      ? arrayBufferToBase64(await file.arrayBuffer())
+      : await file.text();
+    if (!isZip) JSON.parse(content);
     await api("/api/datasets/import", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -185,6 +219,16 @@ async function importDataset(file) {
   } catch (error) {
     setNotice(`导入失败：${error.message}`);
   }
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
 }
 
 function renderLayers() {
@@ -337,10 +381,25 @@ function drawFeature(feature) {
     ctx.stroke();
   }
 
+  if (geom.type === "MultiLineString") {
+    for (const line of geom.coordinates) {
+      drawPath(line, false);
+      ctx.stroke();
+    }
+  }
+
   if (geom.type === "Polygon") {
     drawPath(geom.coordinates[0], true);
     ctx.fill();
     ctx.stroke();
+  }
+
+  if (geom.type === "MultiPolygon") {
+    for (const polygon of geom.coordinates) {
+      drawPath(polygon[0], true);
+      ctx.fill();
+      ctx.stroke();
+    }
   }
 
   ctx.restore();
@@ -460,9 +519,21 @@ function hitTest(worldPoint) {
         }
       }
     }
-    if (geom.type === "Polygon") {
-      const ring = geom.coordinates[0];
-      if (pointInPolygon(worldPoint, ring) || distancePointToRing(worldPoint, ring) <= tolerance) {
+    if (geom.type === "MultiLineString") {
+      for (const line of geom.coordinates) {
+        for (let s = 1; s < line.length; s++) {
+          if (distancePointToSegment(worldPoint, line[s - 1], line[s]) <= tolerance) {
+            return feature;
+          }
+        }
+      }
+    }
+    if (geom.type === "Polygon" || geom.type === "MultiPolygon") {
+      const polygons = geom.type === "Polygon" ? [geom.coordinates] : geom.coordinates;
+      if (polygons.some((polygon) => {
+        const ring = polygon[0];
+        return pointInPolygon(worldPoint, ring) || distancePointToRing(worldPoint, ring) <= tolerance;
+      })) {
         return feature;
       }
     }
@@ -476,6 +547,8 @@ function getBounds(feature) {
   if (geom.type === "Point") coords.push(geom.coordinates);
   if (geom.type === "LineString") coords.push(...geom.coordinates);
   if (geom.type === "Polygon") coords.push(...geom.coordinates[0]);
+  if (geom.type === "MultiLineString") coords.push(...geom.coordinates.flat());
+  if (geom.type === "MultiPolygon") coords.push(...geom.coordinates.flat(2));
   return coords.reduce((acc, coord) => ({
     minX: Math.min(acc.minX, coord[0]),
     minY: Math.min(acc.minY, coord[1]),

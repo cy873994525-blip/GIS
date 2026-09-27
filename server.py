@@ -2,9 +2,13 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import json
+import math
 import mimetypes
+import io
 import sys
+import struct
 import uuid
+import zipfile
 from urllib.parse import unquote, urlsplit
 
 
@@ -15,6 +19,10 @@ DATA_FILE = DATA_DIR / "features.geojson"
 UPLOAD_DIR = DATA_DIR / "uploads"
 CATALOG_FILE = DATA_DIR / "catalog.json"
 ACTIVE_DATASET_FILE = DATA_DIR / "active_dataset.json"
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_FEATURES = 10000
+MAX_ZIP_MEMBERS = 32
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
 
 
 SAMPLE_DATA = {
@@ -71,6 +79,8 @@ def validate_feature_collection(payload):
     features = payload.get("features")
     if not isinstance(features, list):
         raise ValueError("features must be a list")
+    if len(features) > MAX_FEATURES:
+        raise ValueError(f"feature count cannot exceed {MAX_FEATURES}")
     for feature in features:
         validate_feature(feature)
     return payload
@@ -86,11 +96,82 @@ def validate_feature(feature):
     if not isinstance(feature.get("properties", {}), dict):
         raise ValueError("feature properties must be an object")
     geometry_type = feature["geometry"].get("type")
-    if geometry_type not in {"Point", "LineString", "Polygon"}:
-        raise ValueError("geometry type must be Point, LineString, or Polygon")
-    if "coordinates" not in feature["geometry"]:
-        raise ValueError("geometry must include coordinates")
+    if geometry_type not in {
+        "Point",
+        "LineString",
+        "Polygon",
+        "MultiLineString",
+        "MultiPolygon",
+    }:
+        raise ValueError("unsupported geometry type")
+    validate_geometry_coordinates(geometry_type, feature["geometry"].get("coordinates"))
     return feature
+
+
+def validate_position(position):
+    if (
+        not isinstance(position, list)
+        or len(position) < 2
+        or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in position[:2])
+    ):
+        raise ValueError("coordinates must contain finite numeric positions")
+
+
+def validate_geometry_coordinates(geometry_type, coordinates):
+    if geometry_type == "MultiPolygon":
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError("MultiPolygon must contain polygon parts")
+        for polygon in coordinates:
+            validate_geometry_coordinates("Polygon", polygon)
+        return
+    if geometry_type == "Point":
+        validate_position(coordinates)
+        return
+    if geometry_type == "LineString":
+        if not isinstance(coordinates, list) or len(coordinates) < 2:
+            raise ValueError("LineString must contain at least two positions")
+        for position in coordinates:
+            validate_position(position)
+        return
+    if geometry_type == "MultiLineString":
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError("MultiLineString must contain line parts")
+        for line in coordinates:
+            validate_geometry_coordinates("LineString", line)
+        return
+    if geometry_type == "Polygon":
+        if (
+            not isinstance(coordinates, list)
+            or not coordinates
+            or any(not isinstance(ring, list) or len(ring) < 4 for ring in coordinates)
+        ):
+            raise ValueError("Polygon must contain rings with at least four positions")
+        for ring in coordinates:
+            for position in ring:
+                validate_position(position)
+            if ring[0][:2] != ring[-1][:2]:
+                raise ValueError("Polygon rings must be closed")
+        return
+    raise ValueError("unsupported geometry type")
+
+
+def normalise_feature_collection(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a JSON object")
+    features = payload.get("features")
+    if not isinstance(features, list):
+        raise ValueError("features must be a list")
+    seen_ids = set()
+    for feature in features:
+        if not isinstance(feature, dict):
+            raise ValueError("each item in features must be a GeoJSON Feature")
+        feature.setdefault("id", f"ft-{uuid.uuid4().hex[:10]}")
+        while feature["id"] in seen_ids:
+            feature["id"] = f"ft-{uuid.uuid4().hex[:10]}"
+        feature.setdefault("properties", {})
+        seen_ids.add(feature["id"])
+    validate_feature_collection(payload)
+    return payload
 
 
 def iter_positions(value):
@@ -117,7 +198,17 @@ def calculate_bbox(payload):
     ]
 
 
-def dataset_summary(dataset_id, file_name, payload, size_bytes, path_name, created_at=None):
+def dataset_summary(
+    dataset_id,
+    file_name,
+    payload,
+    size_bytes,
+    path_name,
+    created_at=None,
+    source_format="GeoJSON",
+    crs_name=None,
+    source_note=None,
+):
     validate_feature_collection(payload)
     geometry_types = sorted(
         {
@@ -129,14 +220,180 @@ def dataset_summary(dataset_id, file_name, payload, size_bytes, path_name, creat
         "id": dataset_id,
         "name": Path(file_name).stem or "未命名数据",
         "file_name": file_name,
-        "format": "GeoJSON",
+        "format": source_format,
         "feature_count": len(payload.get("features", [])),
         "geometry_types": geometry_types,
         "bbox": calculate_bbox(payload),
         "size_bytes": size_bytes,
         "created_at": created_at or utc_now(),
         "path": path_name,
+        "crs": crs_name or "Unknown",
+        "source_note": source_note or "坐标系未提供",
     }
+
+
+def decode_dbf_value(raw_value, field_type):
+    text_bytes = raw_value.rstrip(b" \x00")
+    try:
+        text = text_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        text = text_bytes.decode("gbk", errors="replace").strip()
+    if not text:
+        return None
+    if field_type in {"N", "F"}:
+        try:
+            return float(text) if "." in text else int(text)
+        except ValueError:
+            return text
+    if field_type == "L":
+        return text.upper() in {"Y", "T", "1"}
+    return text
+
+
+def read_dbf_records(dbf_bytes):
+    if len(dbf_bytes) < 33:
+        raise ValueError("DBF file is too short")
+    record_count = struct.unpack_from("<I", dbf_bytes, 4)[0]
+    header_length = struct.unpack_from("<H", dbf_bytes, 8)[0]
+    record_length = struct.unpack_from("<H", dbf_bytes, 10)[0]
+    fields = []
+    offset = 32
+    while offset + 32 <= header_length and dbf_bytes[offset] != 0x0D:
+        descriptor = dbf_bytes[offset : offset + 32]
+        field_name = descriptor[:11].split(b"\x00", 1)[0].decode("ascii", errors="replace")
+        fields.append((field_name or f"field_{len(fields) + 1}", chr(descriptor[11]), descriptor[16]))
+        offset += 32
+    if record_length < 1:
+        raise ValueError("DBF record length is invalid")
+
+    records = []
+    for index in range(record_count):
+        start = header_length + index * record_length
+        record = dbf_bytes[start : start + record_length]
+        if len(record) != record_length:
+            raise ValueError("DBF records are truncated")
+        if record[:1] == b"*":
+            records.append(None)
+            continue
+        cursor = 1
+        properties = {}
+        for name, field_type, field_length in fields:
+            properties[name] = decode_dbf_value(record[cursor : cursor + field_length], field_type)
+            cursor += field_length
+        records.append(properties)
+    return records
+
+
+def split_shape_parts(parts, points):
+    result = []
+    for index, start in enumerate(parts):
+        end = parts[index + 1] if index + 1 < len(parts) else len(points)
+        result.append([[float(x), float(y)] for x, y in points[start:end]])
+    return result
+
+
+def read_shp_records(shp_bytes):
+    if len(shp_bytes) < 100:
+        raise ValueError("SHP file is too short")
+    declared_type = struct.unpack_from("<i", shp_bytes, 32)[0]
+    features = []
+    offset = 100
+    while offset < len(shp_bytes):
+        if offset + 8 > len(shp_bytes):
+            raise ValueError("SHP record header is truncated")
+        record_number, content_words = struct.unpack_from(">ii", shp_bytes, offset)
+        content_start = offset + 8
+        content_end = content_start + content_words * 2
+        if content_end > len(shp_bytes):
+            raise ValueError(f"SHP record {record_number} is truncated")
+        record_type = struct.unpack_from("<i", shp_bytes, content_start)[0]
+        if record_type == 0:
+            offset = content_end
+            continue
+        if record_type == 1:
+            x, y = struct.unpack_from("<dd", shp_bytes, content_start + 4)
+            geometry = {"type": "Point", "coordinates": [x, y]}
+        elif record_type in {3, 5}:
+            if content_start + 44 > content_end:
+                raise ValueError(f"SHP record {record_number} has an invalid header")
+            part_count, point_count = struct.unpack_from("<ii", shp_bytes, content_start + 36)
+            if part_count < 1 or point_count < 2:
+                raise ValueError(f"SHP record {record_number} has no usable coordinates")
+            parts_offset = content_start + 44
+            points_offset = parts_offset + part_count * 4
+            expected_end = points_offset + point_count * 16
+            if expected_end > content_end:
+                raise ValueError(f"SHP record {record_number} coordinate data is truncated")
+            parts = list(struct.unpack_from(f"<{part_count}i", shp_bytes, parts_offset))
+            points = [
+                struct.unpack_from("<dd", shp_bytes, points_offset + point_index * 16)
+                for point_index in range(point_count)
+            ]
+            components = split_shape_parts(parts, points)
+            if record_type == 3:
+                geometry = {
+                    "type": "LineString" if len(components) == 1 else "MultiLineString",
+                    "coordinates": components[0] if len(components) == 1 else components,
+                }
+            else:
+                rings = [ring for ring in components if len(ring) >= 4]
+                if not rings:
+                    raise ValueError(f"SHP record {record_number} has no valid polygon rings")
+                for ring in rings:
+                    if ring[0] != ring[-1]:
+                        ring.append(ring[0][:])
+                # The simple renderer and demo store rings as independent polygon parts.
+                geometry = {
+                    "type": "Polygon" if len(rings) == 1 else "MultiPolygon",
+                    "coordinates": rings if len(rings) == 1 else [[ring] for ring in rings],
+                }
+        else:
+            raise ValueError(f"unsupported Shapefile geometry type: {record_type}")
+        features.append({"type": "Feature", "geometry": geometry, "properties": {}})
+        offset = content_end
+    if declared_type not in {1, 3, 5, 8, 11, 13, 15, 18}:
+        raise ValueError(f"unsupported Shapefile geometry type: {declared_type}")
+    return declared_type, features
+
+
+def convert_shapefile_zip(file_name, zip_bytes):
+    if not zipfile.is_zipfile(io.BytesIO(zip_bytes)):
+        raise ValueError("invalid ZIP archive")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+        members = [item for item in archive.infolist() if not item.is_dir()]
+        if len(members) > MAX_ZIP_MEMBERS:
+            raise ValueError(f"Shapefile ZIP cannot contain more than {MAX_ZIP_MEMBERS} files")
+        if any(item.file_size > MAX_IMPORT_BYTES for item in members):
+            raise ValueError("an extracted Shapefile component exceeds the 5 MB limit")
+        shp_files = [item for item in members if Path(item.filename).suffix.lower() == ".shp"]
+        if len(shp_files) != 1:
+            raise ValueError("ZIP must contain exactly one .shp file")
+        shp_item = shp_files[0]
+        stem = Path(shp_item.filename).stem.lower()
+        matching = {
+            Path(item.filename).suffix.lower(): item
+            for item in members
+            if Path(item.filename).stem.lower() == stem
+        }
+        shp_type, features = read_shp_records(archive.read(shp_item))
+        if shp_type not in {1, 3, 5}:
+            raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles")
+        if matching.get(".dbf"):
+            dbf_records = read_dbf_records(archive.read(matching[".dbf"]))
+            if len(dbf_records) != len(features):
+                raise ValueError("DBF record count does not match SHP feature count")
+            for feature, properties in zip(features, dbf_records):
+                feature["properties"] = properties or {}
+
+        payload = normalise_feature_collection({"type": "FeatureCollection", "features": features})
+        prj_item = matching.get(".prj")
+        crs_text = archive.read(prj_item).decode("utf-8", errors="replace") if prj_item else ""
+        crs_name = None
+        if crs_text:
+            crs_name = "PRJ attached"
+            if "WGS_1984" in crs_text or "WGS 84" in crs_text:
+                crs_name = "WGS 84 (detected from .prj)"
+        return payload, crs_name, Path(shp_item.filename).name
 
 
 def write_json_atomic(path, payload):
@@ -226,6 +483,9 @@ def update_dataset_metadata(dataset_id, payload, file_size=None):
                 file_size if file_size is not None else target.stat().st_size,
                 dataset["path"],
                 dataset.get("created_at"),
+                dataset.get("format", "GeoJSON"),
+                dataset.get("crs"),
+                dataset.get("source_note"),
             )
             write_catalog(catalog)
             return catalog["datasets"][index]
@@ -233,7 +493,7 @@ def update_dataset_metadata(dataset_id, payload, file_size=None):
 
 
 def write_geojson(payload, dataset_id=None):
-    validate_feature_collection(payload)
+    payload = normalise_feature_collection(payload)
     dataset_id = dataset_id or get_active_id()
     dataset = find_dataset(dataset_id)
     target = dataset_path(dataset)
@@ -276,6 +536,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
 
     def read_json_body(self):
         length = int(self.headers.get("Content-Length", "0"))
+        if length > MAX_REQUEST_BYTES:
+            raise ValueError(f"request body cannot exceed {MAX_REQUEST_BYTES // (1024 * 1024)} MB")
         raw = self.rfile.read(length).decode("utf-8") if length else "{}"
         return json.loads(raw or "{}")
 
@@ -332,7 +594,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     "dataset_count": len(catalog["datasets"]),
                     "geojson": "已接入",
                     "postgis": "未接入",
-                    "shapefile": "未接入",
+                    "shapefile": "已接入（ZIP 转 GeoJSON）",
                 }
             )
             return
@@ -376,23 +638,41 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             if path == "/api/datasets/import":
                 payload = self.read_json_body()
                 raw_content = payload.get("content")
-                geojson = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
-                validate_feature_collection(geojson)
                 original_name = Path(str(payload.get("file_name") or "imported.geojson")).name
-                if not original_name.lower().endswith((".geojson", ".json")):
-                    raise ValueError("only .geojson and .json files are supported in this demo")
+                suffix = Path(original_name).suffix.lower()
+                source_format = "GeoJSON"
+                crs_name = None
+                source_note = "JSON 文件直接存储"
+                if suffix == ".zip":
+                    import base64
+                    try:
+                        zip_bytes = base64.b64decode(str(raw_content), validate=True)
+                    except Exception as exc:
+                        raise ValueError("invalid base64 Shapefile ZIP content") from exc
+                    if len(zip_bytes) > MAX_IMPORT_BYTES:
+                        raise ValueError(f"Shapefile ZIP cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
+                    geojson, crs_name, shp_name = convert_shapefile_zip(original_name, zip_bytes)
+                    source_format = "Shapefile"
+                    source_note = f"从 {shp_name} 转换为 GeoJSON"
+                else:
+                    if suffix not in {".geojson", ".json"}:
+                        raise ValueError("only .geojson, .json, or Shapefile .zip files are supported")
+                    geojson = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+                    geojson = normalise_feature_collection(geojson)
 
                 dataset_id = f"ds-{uuid.uuid4().hex[:10]}"
                 stored_name = f"{dataset_id}.geojson"
                 target = UPLOAD_DIR / stored_name
-                serialized = json.dumps(geojson, ensure_ascii=False, indent=2)
-                target.write_text(serialized, encoding="utf-8")
+                write_json_atomic(target, geojson)
                 imported = dataset_summary(
                     dataset_id,
                     original_name,
                     geojson,
                     target.stat().st_size,
                     f"uploads/{stored_name}",
+                    source_format=source_format,
+                    crs_name=crs_name,
+                    source_note=source_note,
                 )
                 catalog = read_catalog()
                 catalog["datasets"].append(imported)
@@ -412,10 +692,13 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             self.send_error_json("unknown endpoint", status=404)
         except json.JSONDecodeError as exc:
             self.send_error_json(f"invalid JSON: {exc}", status=400)
-        except (KeyError, ValueError) as exc:
+        except KeyError as exc:
+            self.send_error_json(str(exc), status=404)
+        except ValueError as exc:
             self.send_error_json(str(exc), status=400)
         except Exception as exc:
-            self.send_error_json(str(exc), status=500)
+            status = 404 if isinstance(exc, KeyError) else 400 if isinstance(exc, ValueError) else 500
+            self.send_error_json(str(exc), status=status)
 
     def do_DELETE(self):
         path = urlsplit(self.path).path
@@ -451,7 +734,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             write_geojson(data)
             self.send_json({"ok": True, "id": feature_id})
         except Exception as exc:
-            self.send_error_json(str(exc), status=500)
+            status = 404 if isinstance(exc, KeyError) else 400 if isinstance(exc, ValueError) else 500
+            self.send_error_json(str(exc), status=status)
 
     def do_PUT(self):
         try:
@@ -475,7 +759,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     return
             self.send_error_json("feature not found", status=404)
         except Exception as exc:
-            self.send_error_json(str(exc), status=500)
+            status = 404 if isinstance(exc, KeyError) else 400 if isinstance(exc, ValueError) else 500
+            self.send_error_json(str(exc), status=status)
 
     def feature_id_from_path(self):
         path = urlsplit(self.path).path
