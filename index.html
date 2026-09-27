@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GIS 矢量数据编辑 Demo</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1>GIS 矢量数据编辑与管理</h1>
+        <p>Python 后端 + Canvas 前端 Demo</p>
+      </div>
+      <div class="top-actions">
+        <button id="saveBtn" class="primary">保存</button>
+        <a class="button" href="/api/export">导出 GeoJSON</a>
+        <button id="resetBtn">重置数据</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <section>
+          <h2>图层</h2>
+          <div id="layerList" class="layer-list"></div>
+        </section>
+
+        <section>
+          <h2>绘制属性</h2>
+          <label>
+            名称
+            <input id="nameInput" type="text" value="新要素">
+          </label>
+          <label>
+            图层
+            <select id="layerInput">
+              <option>兴趣点</option>
+              <option>道路</option>
+              <option>水域</option>
+              <option>功能区</option>
+              <option>自定义</option>
+            </select>
+          </label>
+        </section>
+
+        <section>
+          <h2>后端状态</h2>
+          <div id="backendStatus" class="status">正在连接...</div>
+        </section>
+      </aside>
+
+      <section class="map-panel">
+        <div class="toolbar" role="toolbar" aria-label="地图工具">
+          <button data-mode="pan" class="tool active">漫游</button>
+          <button data-mode="select" class="tool">点选</button>
+          <button data-mode="box" class="tool">框选</button>
+          <button data-mode="point" class="tool">画点</button>
+          <button data-mode="line" class="tool">画线</button>
+          <button data-mode="polygon" class="tool">画面</button>
+          <button id="finishBtn">完成绘制</button>
+          <button id="zoomInBtn">放大</button>
+          <button id="zoomOutBtn">缩小</button>
+          <button id="fitBtn">全图</button>
+        </div>
+        <canvas id="mapCanvas" width="1200" height="780" aria-label="地图画布"></canvas>
+        <div id="hint" class="hint">当前：漫游。拖拽移动地图，滚轮缩放。</div>
+      </section>
+
+      <aside class="attribute-panel">
+        <section>
+          <h2>选中要素</h2>
+          <div id="selectionSummary" class="selection-summary">暂无选择</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>名称</th>
+                  <th>图层</th>
+                  <th>类型</th>
+                </tr>
+              </thead>
+              <tbody id="attributeBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section>
+          <h2>作业功能覆盖</h2>
+          <ul class="checklist">
+            <li>鼠标录入点、线、面</li>
+            <li>图形显示、缩放、漫游</li>
+            <li>点选、框选</li>
+            <li>属性查看与图层管理</li>
+            <li>后端保存与导出</li>
+            <li>Shapefile/PostGIS 可在此基础上扩展</li>
+          </ul>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
