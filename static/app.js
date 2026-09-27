@@ -201,23 +201,59 @@ async function deleteDataset(dataset) {
 }
 
 async function importDataset(file) {
+  const fileInput = document.getElementById("fileInput");
+  const status = document.getElementById("datasetImportStatus");
+  const setImportStatus = (message, kind = "") => {
+    status.textContent = message;
+    status.className = `dataset-import-status visible ${kind}`.trim();
+  };
+  fileInput.disabled = true;
+  setImportStatus(`正在导入“${file.name}”，请稍候...`);
   try {
-    const isZip = file.name.toLowerCase().endsWith(".zip");
-    const content = isZip
+    const extension = file.name.toLowerCase().split(".").pop();
+    const isBinary = extension === "zip" || extension === "shp";
+    const content = isBinary
       ? arrayBufferToBase64(await file.arrayBuffer())
       : await file.text();
-    if (!isZip) JSON.parse(content);
-    await api("/api/datasets/import", {
+    if (!isBinary) JSON.parse(content);
+    const sidecars = [];
+    if (extension === "shp") {
+      const baseName = file.name.slice(0, -(extension.length + 1)).toLowerCase();
+      const related = Array.from(document.getElementById("fileInput").files || []);
+      for (const candidate of related) {
+        const candidateExtension = candidate.name.toLowerCase().split(".").pop();
+        const candidateBase = candidate.name.slice(0, -(candidateExtension.length + 1)).toLowerCase();
+        if (candidateBase === baseName && ["shx", "dbf", "prj", "cpg"].includes(candidateExtension)) {
+          sidecars.push({
+            file_name: candidate.name,
+            content: arrayBufferToBase64(await candidate.arrayBuffer()),
+          });
+        }
+      }
+      if (!sidecars.some((item) => item.file_name.toLowerCase().endsWith(".shx")) ||
+          !sidecars.some((item) => item.file_name.toLowerCase().endsWith(".dbf"))) {
+        throw new Error("Shapefile 至少需要同时选择同名 .shp、.shx 和 .dbf 文件");
+      }
+    }
+    const result = await api("/api/datasets/import", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file_name: file.name, content }),
+      body: JSON.stringify({ file_name: file.name, content, sidecars }),
     });
     state.selectedIds.clear();
     await Promise.all([loadDatasets(), loadData(), loadStatus()]);
     fitView();
+    const imported = result.dataset;
     setNotice(`已导入“${file.name}”，后端已登记文件元数据。`);
+    setImportStatus(
+      `导入成功：${imported.feature_count} 个要素，${imported.format || "GeoJSON"}。`,
+      "success",
+    );
   } catch (error) {
     setNotice(`导入失败：${error.message}`);
+    setImportStatus(`导入失败：${error.message}`, "error");
+  } finally {
+    fileInput.disabled = false;
   }
 }
 
@@ -912,9 +948,12 @@ document.getElementById("zoomInBtn").addEventListener("click", () => zoomAt(stat
 document.getElementById("zoomOutBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 0.82));
 document.getElementById("fitBtn").addEventListener("click", fitView);
 document.getElementById("fileInput").addEventListener("change", (event) => {
-  const [file] = event.target.files;
-  if (file) importDataset(file);
-  event.target.value = "";
+  const files = Array.from(event.target.files || []);
+  const shp = files.find((file) => file.name.toLowerCase().endsWith(".shp"));
+  const selected = shp || files[0];
+  if (selected) importDataset(selected).finally(() => {
+    event.target.value = "";
+  });
 });
 
 document.getElementById("showAllBtn").addEventListener("click", () => {

@@ -188,6 +188,35 @@ select {
   cursor: pointer;
 }
 
+.dataset-import-status {
+  display: none;
+  margin: 8px 0 10px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.dataset-import-status.visible {
+  display: block;
+}
+
+.dataset-import-status.success {
+  border-color: #a9cfc4;
+  background: #f0faf6;
+  color: var(--primary-dark);
+}
+
+.dataset-import-status.error {
+  border-color: #e4c1c1;
+  background: #fffafa;
+  color: var(--danger);
+}
+
 .dataset-list {
   display: grid;
   gap: 7px;

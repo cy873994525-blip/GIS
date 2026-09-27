@@ -9,6 +9,7 @@ import sys
 import struct
 import uuid
 import zipfile
+import base64
 from urllib.parse import unquote, urlsplit
 
 
@@ -19,10 +20,10 @@ DATA_FILE = DATA_DIR / "features.geojson"
 UPLOAD_DIR = DATA_DIR / "uploads"
 CATALOG_FILE = DATA_DIR / "catalog.json"
 ACTIVE_DATASET_FILE = DATA_DIR / "active_dataset.json"
-MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_IMPORT_BYTES = 20 * 1024 * 1024
 MAX_FEATURES = 10000
 MAX_ZIP_MEMBERS = 32
-MAX_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
 
 SAMPLE_DATA = {
@@ -232,10 +233,10 @@ def dataset_summary(
     }
 
 
-def decode_dbf_value(raw_value, field_type):
+def decode_dbf_value(raw_value, field_type, encoding="utf-8"):
     text_bytes = raw_value.rstrip(b" \x00")
     try:
-        text = text_bytes.decode("utf-8").strip()
+        text = text_bytes.decode(encoding).strip()
     except UnicodeDecodeError:
         text = text_bytes.decode("gbk", errors="replace").strip()
     if not text:
@@ -250,7 +251,20 @@ def decode_dbf_value(raw_value, field_type):
     return text
 
 
-def read_dbf_records(dbf_bytes):
+def read_cpg_encoding(cpg_bytes):
+    label = cpg_bytes.decode("ascii", errors="ignore").strip().lower()
+    aliases = {
+        "utf-8": "utf-8",
+        "utf8": "utf-8",
+        "65001": "utf-8",
+        "gbk": "gbk",
+        "936": "gbk",
+        "gb2312": "gbk",
+    }
+    return aliases.get(label, "utf-8")
+
+
+def read_dbf_records(dbf_bytes, encoding="utf-8"):
     if len(dbf_bytes) < 33:
         raise ValueError("DBF file is too short")
     record_count = struct.unpack_from("<I", dbf_bytes, 4)[0]
@@ -260,7 +274,7 @@ def read_dbf_records(dbf_bytes):
     offset = 32
     while offset + 32 <= header_length and dbf_bytes[offset] != 0x0D:
         descriptor = dbf_bytes[offset : offset + 32]
-        field_name = descriptor[:11].split(b"\x00", 1)[0].decode("ascii", errors="replace")
+        field_name = descriptor[:11].split(b"\x00", 1)[0].decode(encoding, errors="replace")
         fields.append((field_name or f"field_{len(fields) + 1}", chr(descriptor[11]), descriptor[16]))
         offset += 32
     if record_length < 1:
@@ -278,7 +292,11 @@ def read_dbf_records(dbf_bytes):
         cursor = 1
         properties = {}
         for name, field_type, field_length in fields:
-            properties[name] = decode_dbf_value(record[cursor : cursor + field_length], field_type)
+            properties[name] = decode_dbf_value(
+                record[cursor : cursor + field_length],
+                field_type,
+                encoding,
+            )
             cursor += field_length
         records.append(properties)
     return records
@@ -308,6 +326,7 @@ def read_shp_records(shp_bytes):
             raise ValueError(f"SHP record {record_number} is truncated")
         record_type = struct.unpack_from("<i", shp_bytes, content_start)[0]
         if record_type == 0:
+            features.append(None)
             offset = content_end
             continue
         if record_type == 1:
@@ -317,8 +336,12 @@ def read_shp_records(shp_bytes):
             if content_start + 44 > content_end:
                 raise ValueError(f"SHP record {record_number} has an invalid header")
             part_count, point_count = struct.unpack_from("<ii", shp_bytes, content_start + 36)
+            if part_count == 0 and point_count == 0:
+                features.append(None)
+                offset = content_end
+                continue
             if part_count < 1 or point_count < 2:
-                raise ValueError(f"SHP record {record_number} has no usable coordinates")
+                raise ValueError(f"SHP record {record_number} has invalid coordinates")
             parts_offset = content_start + 44
             points_offset = parts_offset + part_count * 4
             expected_end = points_offset + point_count * 16
@@ -356,18 +379,49 @@ def read_shp_records(shp_bytes):
     return declared_type, features
 
 
+def is_usable_archive_member(item):
+    path = Path(item.filename)
+    parts = {part.lower() for part in path.parts}
+    return (
+        not item.is_dir()
+        and path.name.lower() not in {".ds_store"}
+        and not path.name.startswith("._")
+        and "__macosx" not in parts
+    )
+
+
 def convert_shapefile_zip(file_name, zip_bytes):
     if not zipfile.is_zipfile(io.BytesIO(zip_bytes)):
         raise ValueError("invalid ZIP archive")
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
-        members = [item for item in archive.infolist() if not item.is_dir()]
+        members = [item for item in archive.infolist() if is_usable_archive_member(item)]
         if len(members) > MAX_ZIP_MEMBERS:
             raise ValueError(f"Shapefile ZIP cannot contain more than {MAX_ZIP_MEMBERS} files")
         if any(item.file_size > MAX_IMPORT_BYTES for item in members):
-            raise ValueError("an extracted Shapefile component exceeds the 5 MB limit")
+            raise ValueError(f"an extracted Shapefile component exceeds the {MAX_IMPORT_BYTES // (1024 * 1024)} MB limit")
         shp_files = [item for item in members if Path(item.filename).suffix.lower() == ".shp"]
+        if not shp_files:
+            geojson_files = [
+                item
+                for item in members
+                if Path(item.filename).suffix.lower() in {".geojson", ".json"}
+            ]
+            if len(geojson_files) == 1:
+                try:
+                    payload = json.loads(archive.read(geojson_files[0]).decode("utf-8-sig"))
+                    return (
+                        normalise_feature_collection(payload),
+                        None,
+                        Path(geojson_files[0].filename).name,
+                        "GeoJSON",
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("ZIP 内的 GeoJSON/JSON 文件无法读取") from exc
+            if len(geojson_files) > 1:
+                raise ValueError("ZIP 中包含多个 GeoJSON/JSON 文件，请只保留一个数据文件")
+            raise ValueError("ZIP 中没有找到 .shp 文件；请压缩同名的 .shp/.dbf/.prj 文件")
         if len(shp_files) != 1:
-            raise ValueError("ZIP must contain exactly one .shp file")
+            raise ValueError("ZIP 中必须只包含一个 Shapefile 图层（一个 .shp 文件）")
         shp_item = shp_files[0]
         stem = Path(shp_item.filename).stem.lower()
         matching = {
@@ -375,16 +429,21 @@ def convert_shapefile_zip(file_name, zip_bytes):
             for item in members
             if Path(item.filename).stem.lower() == stem
         }
-        shp_type, features = read_shp_records(archive.read(shp_item))
+        shp_type, raw_features = read_shp_records(archive.read(shp_item))
         if shp_type not in {1, 3, 5}:
             raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles")
+        dbf_encoding = "utf-8"
+        if matching.get(".cpg"):
+            dbf_encoding = read_cpg_encoding(archive.read(matching[".cpg"]))
         if matching.get(".dbf"):
-            dbf_records = read_dbf_records(archive.read(matching[".dbf"]))
-            if len(dbf_records) != len(features):
+            dbf_records = read_dbf_records(archive.read(matching[".dbf"]), dbf_encoding)
+            if len(dbf_records) != len(raw_features):
                 raise ValueError("DBF record count does not match SHP feature count")
-            for feature, properties in zip(features, dbf_records):
-                feature["properties"] = properties or {}
+            for feature, properties in zip(raw_features, dbf_records):
+                if feature is not None:
+                    feature["properties"] = properties or {}
 
+        features = [feature for feature in raw_features if feature is not None]
         payload = normalise_feature_collection({"type": "FeatureCollection", "features": features})
         prj_item = matching.get(".prj")
         crs_text = archive.read(prj_item).decode("utf-8", errors="replace") if prj_item else ""
@@ -393,7 +452,34 @@ def convert_shapefile_zip(file_name, zip_bytes):
             crs_name = "PRJ attached"
             if "WGS_1984" in crs_text or "WGS 84" in crs_text:
                 crs_name = "WGS 84 (detected from .prj)"
-        return payload, crs_name, Path(shp_item.filename).name
+        return payload, crs_name, Path(shp_item.filename).name, "Shapefile"
+
+
+def convert_shapefile_parts(file_name, main_bytes, sidecars):
+    base_name = Path(file_name).stem.lower()
+    files = {Path(name).suffix.lower(): content for name, content in sidecars.items()}
+    files[".shp"] = main_bytes
+    if ".shx" not in files or ".dbf" not in files:
+        raise ValueError("Shapefile import requires matching .shx and .dbf files")
+    shape_type, raw_features = read_shp_records(main_bytes)
+    if shape_type not in {1, 3, 5}:
+        raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles")
+    encoding = read_cpg_encoding(files[".cpg"]) if ".cpg" in files else "utf-8"
+    dbf_records = read_dbf_records(files[".dbf"], encoding)
+    if len(dbf_records) != len(raw_features):
+        raise ValueError("DBF record count does not match SHP feature count")
+    for feature, properties in zip(raw_features, dbf_records):
+        if feature is not None:
+            feature["properties"] = properties or {}
+    features = [feature for feature in raw_features if feature is not None]
+    payload = normalise_feature_collection({"type": "FeatureCollection", "features": features})
+    crs_name = None
+    if ".prj" in files:
+        crs_text = files[".prj"].decode("utf-8", errors="replace")
+        crs_name = "PRJ attached"
+        if "WGS_1984" in crs_text or "WGS 84" in crs_text:
+            crs_name = "WGS 84 (detected from .prj)"
+    return payload, crs_name, f"{base_name}.shp"
 
 
 def write_json_atomic(path, payload):
@@ -594,7 +680,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     "dataset_count": len(catalog["datasets"]),
                     "geojson": "已接入",
                     "postgis": "未接入",
-                    "shapefile": "已接入（ZIP 转 GeoJSON）",
+                    "shapefile": "已接入（ZIP/成套文件转 GeoJSON）",
                 }
             )
             return
@@ -644,14 +730,38 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                 crs_name = None
                 source_note = "JSON 文件直接存储"
                 if suffix == ".zip":
-                    import base64
                     try:
                         zip_bytes = base64.b64decode(str(raw_content), validate=True)
                     except Exception as exc:
                         raise ValueError("invalid base64 Shapefile ZIP content") from exc
                     if len(zip_bytes) > MAX_IMPORT_BYTES:
                         raise ValueError(f"Shapefile ZIP cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
-                    geojson, crs_name, shp_name = convert_shapefile_zip(original_name, zip_bytes)
+                    geojson, crs_name, source_name, source_format = convert_shapefile_zip(original_name, zip_bytes)
+                    source_note = f"从 ZIP 内的 {source_name} 读取并转换为 GeoJSON"
+                elif suffix == ".shp":
+                    try:
+                        main_bytes = base64.b64decode(str(raw_content), validate=True)
+                        if len(main_bytes) > MAX_IMPORT_BYTES:
+                            raise ValueError(
+                                f"Shapefile component cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB"
+                            )
+                        sidecar_payload = payload.get("sidecars") or []
+                        sidecars = {}
+                        for item in sidecar_payload:
+                            sidecar_name = Path(str(item.get("file_name", ""))).name
+                            sidecar_content = base64.b64decode(str(item.get("content", "")), validate=True)
+                            if len(sidecar_content) > MAX_IMPORT_BYTES:
+                                raise ValueError(
+                                    f"Shapefile component cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB"
+                                )
+                            sidecars[sidecar_name] = sidecar_content
+                        geojson, crs_name, shp_name = convert_shapefile_parts(
+                            original_name,
+                            main_bytes,
+                            sidecars,
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError(f"invalid Shapefile component upload: {exc}") from exc
                     source_format = "Shapefile"
                     source_note = f"从 {shp_name} 转换为 GeoJSON"
                 else:

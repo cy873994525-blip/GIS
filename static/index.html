@@ -35,9 +35,10 @@
           </div>
           <label class="file-picker">
             <span>导入矢量文件</span>
-            <input id="fileInput" type="file" accept=".geojson,.json,.zip,application/geo+json,application/json,application/zip">
-            <small>支持 GeoJSON / JSON 与 Shapefile ZIP</small>
+            <input id="fileInput" type="file" multiple accept=".geojson,.json,.zip,.shp,.shx,.dbf,.prj,.cpg,application/geo+json,application/json,application/zip,application/octet-stream">
+            <small>支持 GeoJSON / JSON、Shapefile ZIP 或配套 .shp/.shx/.dbf/.prj/.cpg 文件</small>
           </label>
+          <div id="datasetImportStatus" class="dataset-import-status" aria-live="polite"></div>
           <div id="datasetList" class="dataset-list"></div>
           <div id="activeDatasetMeta" class="dataset-meta">正在读取数据文件...</div>
         </section>
