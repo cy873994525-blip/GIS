@@ -1,0 +1,39 @@
+{
+  "type": "FeatureCollection",
+  "name": "北京地图演示（虚构要素）",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "demo-map-point-a",
+      "properties": { "name": "演示点位 A", "layer": "演示点位", "kind": "point" },
+      "geometry": { "type": "Point", "coordinates": [116.3976, 39.9087] }
+    },
+    {
+      "type": "Feature",
+      "id": "demo-map-point-b",
+      "properties": { "name": "演示点位 B", "layer": "演示点位", "kind": "point" },
+      "geometry": { "type": "Point", "coordinates": [116.408, 39.913] }
+    },
+    {
+      "type": "Feature",
+      "id": "demo-map-route",
+      "properties": { "name": "演示路线", "layer": "演示路线", "kind": "line" },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[116.386, 39.905], [116.394, 39.908], [116.402, 39.910], [116.412, 39.912]]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "demo-map-area",
+      "properties": { "name": "演示区域", "layer": "演示区域", "kind": "polygon" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [116.399, 39.901], [116.407, 39.901], [116.410, 39.906],
+          [116.401, 39.907], [116.399, 39.901]
+        ]]
+      }
+    }
+  ]
+}

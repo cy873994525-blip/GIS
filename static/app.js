@@ -1,5 +1,10 @@
 const canvas = document.getElementById("mapCanvas");
 const ctx = canvas.getContext("2d");
+const tileLayer = document.getElementById("baseMapTiles");
+const visibleTiles = new Map();
+const MAX_MERCATOR_LAT = 85.05112878;
+const TILE_SIZE = 256;
+const MAX_TILE_ZOOM = 19;
 
 const state = {
   data: { type: "FeatureCollection", features: [] },
@@ -37,6 +42,9 @@ const state = {
   lastRowClickId: null,
   // 拖拽结束后浏览器会补一个 click，用它吃掉那次点击。
   skipClickOnce: false,
+  geographic: false,
+  baseMapEnabled: true,
+  baseMapErrorShown: false,
 };
 
 // 属性表每页渲染的行数。后端 MAX_FEATURES 是 10000，全量建 DOM 会把页面拖死。
@@ -70,18 +78,114 @@ const hints = {
   edit: "当前：编辑几何。选中一个要素后，拖节点改形状，拖要素本体整体平移，双击边插入节点，Alt+点击删除节点。",
 };
 
+function projectWorld(coord) {
+  if (!state.geographic) return coord;
+  const latitude = Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, coord[1]));
+  const radians = latitude * Math.PI / 180;
+  return [coord[0], Math.asinh(Math.tan(radians)) * 180 / Math.PI];
+}
+
+function unprojectWorld(coord) {
+  if (!state.geographic) return coord;
+  return [coord[0], Math.atan(Math.sinh(coord[1] * Math.PI / 180)) * 180 / Math.PI];
+}
+
 function worldToScreen(coord) {
+  const projected = projectWorld(coord);
   return {
-    x: coord[0] * state.scale + state.offsetX,
-    y: state.viewHeight - (coord[1] * state.scale + state.offsetY),
+    x: projected[0] * state.scale + state.offsetX,
+    y: state.viewHeight - (projected[1] * state.scale + state.offsetY),
   };
 }
 
 function screenToWorld(x, y) {
-  return [
+  return unprojectWorld([
     (x - state.offsetX) / state.scale,
     ((state.viewHeight - y) - state.offsetY) / state.scale,
-  ];
+  ]);
+}
+
+function isGeographicDataset() {
+  if (!state.data.features.length) return false;
+  const bounds = getDataBounds();
+  if (![bounds.minX, bounds.minY, bounds.maxX, bounds.maxY].every(Number.isFinite)) return false;
+  if (bounds.minX < -180 || bounds.maxX > 180 ||
+      bounds.minY < -MAX_MERCATOR_LAT || bounds.maxY > MAX_MERCATOR_LAT) return false;
+  const crs = state.activeDataset?.crs || "Unknown";
+  return crs === "Unknown" || /WGS[ _]?84|EPSG:?4326|CRS:?84/i.test(crs);
+}
+
+function syncMapMode() {
+  state.geographic = isGeographicDataset();
+  state.baseMapErrorShown = false;
+  const enabled = state.geographic && state.baseMapEnabled;
+  const button = document.getElementById("baseMapBtn");
+  button.disabled = !state.geographic;
+  button.classList.toggle("active", enabled);
+  button.setAttribute("aria-pressed", String(enabled));
+  button.textContent = state.geographic ? (enabled ? "地图：开" : "地图：关") : "需经纬度";
+  document.getElementById("mapBadgeText").textContent = state.geographic
+    ? (enabled ? "WGS 84 经纬度 · 在线底图" : "WGS 84 经纬度 · 底图已关闭")
+    : "模拟 / 投影坐标 · 平面画布";
+  document.getElementById("mapAttribution").hidden = !enabled;
+  canvas.classList.toggle("with-basemap", enabled);
+  draw();
+}
+
+function renderBasemapTiles() {
+  if (!state.geographic || !state.baseMapEnabled) {
+    for (const image of visibleTiles.values()) image.remove();
+    visibleTiles.clear();
+    return;
+  }
+
+  const zoom = Math.max(0, Math.min(MAX_TILE_ZOOM,
+    Math.floor(Math.log2(state.scale * 360 / TILE_SIZE))));
+  const tilesPerSide = 2 ** zoom;
+  const tileWorldSize = 360 / tilesPerSide;
+  const leftWorld = -state.offsetX / state.scale;
+  const rightWorld = (state.viewWidth - state.offsetX) / state.scale;
+  const topWorld = (state.viewHeight - state.offsetY) / state.scale;
+  const bottomWorld = -state.offsetY / state.scale;
+  const firstX = Math.max(0, Math.floor((leftWorld + 180) / tileWorldSize));
+  const lastX = Math.min(tilesPerSide - 1, Math.floor((rightWorld + 180) / tileWorldSize));
+  const firstY = Math.max(0, Math.floor((180 - topWorld) / tileWorldSize));
+  const lastY = Math.min(tilesPerSide - 1, Math.floor((180 - bottomWorld) / tileWorldSize));
+  const needed = new Set();
+
+  for (let x = firstX; x <= lastX; x += 1) {
+    for (let y = firstY; y <= lastY; y += 1) {
+      const key = `${zoom}/${x}/${y}`;
+      needed.add(key);
+      let image = visibleTiles.get(key);
+      if (!image) {
+        image = document.createElement("img");
+        image.alt = "";
+        image.draggable = false;
+        image.decoding = "async";
+        image.addEventListener("error", () => {
+          if (!state.geographic || !state.baseMapEnabled ||
+              visibleTiles.get(key) !== image || state.baseMapErrorShown) return;
+          state.baseMapErrorShown = true;
+          document.getElementById("mapBadgeText").textContent = "底图暂时无法加载，请检查网络";
+        });
+        image.src = `https://tile.openstreetmap.org/${key}.png`;
+        visibleTiles.set(key, image);
+        tileLayer.appendChild(image);
+      }
+      const tilePixels = tileWorldSize * state.scale;
+      image.style.left = `${(x * tileWorldSize - 180) * state.scale + state.offsetX}px`;
+      image.style.top = `${state.viewHeight - ((180 - y * tileWorldSize) * state.scale + state.offsetY)}px`;
+      image.style.width = `${tilePixels + 0.5}px`;
+      image.style.height = `${tilePixels + 0.5}px`;
+    }
+  }
+
+  for (const [key, image] of visibleTiles) {
+    if (needed.has(key)) continue;
+    image.remove();
+    visibleTiles.delete(key);
+  }
 }
 
 function resizeCanvas() {
@@ -193,6 +297,7 @@ async function loadDatasets() {
 
 async function loadData() {
   state.data = await api("/api/layers");
+  state.geographic = false;
   const layers = new Set(state.data.features.map((f) => f.properties.layer || "未命名"));
   state.visibleLayers = layers;
   // 数据集换了，旧的编辑目标已经不在数据里了。
@@ -222,6 +327,7 @@ async function activateDataset(datasetId) {
     await api(`/api/datasets/${encodeURIComponent(datasetId)}/activate`, { method: "POST" });
     state.selectedIds.clear();
     await Promise.all([loadDatasets(), loadData(), loadStatus()]);
+    syncMapMode();
     fitView();
     setNotice(`已切换到数据集“${state.activeDataset.name}”。`);
   } catch (error) {
@@ -283,6 +389,7 @@ async function importDataset(file) {
     });
     state.selectedIds.clear();
     await Promise.all([loadDatasets(), loadData(), loadStatus()]);
+    syncMapMode();
     fitView();
     const imported = result.dataset;
     setNotice(`已导入“${file.name}”，后端已登记文件元数据。`);
@@ -295,6 +402,30 @@ async function importDataset(file) {
     setImportStatus(`导入失败：${error.message}`, "error");
   } finally {
     fileInput.disabled = false;
+  }
+}
+
+async function openMapDemo() {
+  const button = document.getElementById("openMapDemoBtn");
+  button.disabled = true;
+  state.baseMapEnabled = true;
+  try {
+    await loadDatasets();
+    const existing = state.datasets.find((dataset) => dataset.file_name === "map_demo.geojson");
+    if (existing) {
+      await activateDataset(existing.id);
+      return;
+    }
+    const response = await fetch("/static/map_demo.geojson");
+    if (!response.ok) throw new Error("无法读取地图示例文件");
+    const file = new File([await response.blob()], "map_demo.geojson", {
+      type: "application/geo+json",
+    });
+    await importDataset(file);
+  } catch (error) {
+    setNotice(`打开地图示例失败：${error.message}`);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1185,8 +1316,9 @@ function drawSelectionBox() {
 }
 
 function draw() {
+  renderBasemapTiles();
   ctx.clearRect(0, 0, state.viewWidth, state.viewHeight);
-  drawGrid();
+  if (!state.geographic) drawGrid();
   for (const feature of state.data.features) {
     drawFeature(feature);
   }
@@ -1296,16 +1428,19 @@ function getDataBounds() {
 }
 
 function fitView() {
-  const bounds = getDataBounds();
+  const dataBounds = getDataBounds();
+  const lowerLeft = projectWorld([dataBounds.minX, dataBounds.minY]);
+  const upperRight = projectWorld([dataBounds.maxX, dataBounds.maxY]);
   const padding = 72;
-  const width = Math.max(1, bounds.maxX - bounds.minX);
-  const height = Math.max(1, bounds.maxY - bounds.minY);
-  // Shapefile coordinates may be projected meters in the millions, so the
-  // lower bound must allow very small display scales.
-  state.scale = Math.max(0.00001, Math.min(3.5,
+  const minimumSpan = state.geographic ? 0.01 : 1;
+  const width = Math.max(minimumSpan, upperRight[0] - lowerLeft[0]);
+  const height = Math.max(minimumSpan, upperRight[1] - lowerLeft[1]);
+  const minimumScale = state.geographic ? TILE_SIZE / 360 : 0.00001;
+  const maximumScale = state.geographic ? TILE_SIZE * 2 ** MAX_TILE_ZOOM / 360 : 3.5;
+  state.scale = Math.max(minimumScale, Math.min(maximumScale,
     Math.min((state.viewWidth - padding * 2) / width, (state.viewHeight - padding * 2) / height)));
-  state.offsetX = padding - bounds.minX * state.scale;
-  state.offsetY = state.viewHeight - padding - bounds.maxY * state.scale;
+  state.offsetX = state.viewWidth / 2 - (lowerLeft[0] + upperRight[0]) / 2 * state.scale;
+  state.offsetY = state.viewHeight / 2 - (lowerLeft[1] + upperRight[1]) / 2 * state.scale;
   draw();
 }
 
@@ -1536,7 +1671,9 @@ async function finishDraft() {
 
 function zoomAt(screenX, screenY, factor) {
   const before = screenToWorld(screenX, screenY);
-  state.scale = Math.max(0.25, Math.min(3.5, state.scale * factor));
+  const minimumScale = state.geographic ? TILE_SIZE / 360 : 0.00001;
+  const maximumScale = state.geographic ? TILE_SIZE * 2 ** MAX_TILE_ZOOM / 360 : 3.5;
+  state.scale = Math.max(minimumScale, Math.min(maximumScale, state.scale * factor));
   const afterScreen = worldToScreen(before);
   state.offsetX += screenX - afterScreen.x;
   state.offsetY -= screenY - afterScreen.y;
@@ -1847,6 +1984,13 @@ document.getElementById("endEditBtn").addEventListener("click", () => setMode("s
 document.getElementById("zoomInBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 1.2));
 document.getElementById("zoomOutBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 0.82));
 document.getElementById("fitBtn").addEventListener("click", fitView);
+document.getElementById("baseMapBtn").addEventListener("click", () => {
+  if (!state.geographic) return;
+  state.baseMapEnabled = !state.baseMapEnabled;
+  syncMapMode();
+  setNotice(state.baseMapEnabled ? "已显示在线地图底图。" : "已隐藏在线地图底图。");
+});
+document.getElementById("openMapDemoBtn").addEventListener("click", openMapDemo);
 document.getElementById("fileInput").addEventListener("change", (event) => {
   const files = Array.from(event.target.files || []);
   const shp = files.find((file) => file.name.toLowerCase().endsWith(".shp"));
@@ -1957,6 +2101,7 @@ document.getElementById("saveBtn").addEventListener("click", async () => {
 document.getElementById("resetBtn").addEventListener("click", async () => {
   const result = await api("/api/reset", { method: "POST" });
   state.data = result.data;
+  state.geographic = false;
   state.visibleLayers = new Set(state.data.features.map((feature) => feature.properties.layer || "未命名"));
   state.selectedIds.clear();
   state.draft = [];
@@ -1967,6 +2112,8 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
   renderLayers();
   renderAttributes();
   syncDraftControls();
+  await Promise.all([loadDatasets(), loadStatus()]);
+  syncMapMode();
   fitView();
   setNotice("数据已重置为示例内容。 ");
   draw();
@@ -2040,6 +2187,7 @@ window.addEventListener("resize", resizeCanvas);
 
 Promise.all([loadDatasets(), loadData(), loadStatus()]).then(() => {
   resizeCanvas();
+  syncMapMode();
   fitView();
 }).catch((error) => {
   document.getElementById("backendStatus").textContent = `连接失败：${error.message}`;
