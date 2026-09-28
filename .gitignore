@@ -1,5 +1,9 @@
-.venv/
 __pycache__/
-*.pyc
-*.log
-.tmp/
+*.py[cod]
+.DS_Store
+
+# Runtime-created dataset catalog and imported GeoJSON files.
+data/catalog.json
+data/active_dataset.json
+data/uploads/
+sample_data/shapefile_demo_sources/
