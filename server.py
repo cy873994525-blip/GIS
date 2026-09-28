@@ -13,6 +13,20 @@ import base64
 from urllib.parse import unquote, urlsplit
 
 
+# 兼容层：str.removeprefix / str.removesuffix 是 Python 3.9 才有的，
+# 本机与部分演示环境只有 3.8（本机为 3.8.8），直接用会让
+# 「数据集切换 / 删除 / 单数据集查询」三个接口 500。
+# 下面两个函数是等价实现，在 3.9+ 上行为完全一致。
+def remove_prefix(text, prefix):
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def remove_suffix(text, suffix):
+    if suffix and text.endswith(suffix):
+        return text[: -len(suffix)]
+    return text
+
+
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 DATA_DIR = ROOT / "data"
@@ -662,7 +676,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             return
 
         if path.startswith("/api/datasets/"):
-            dataset_id = unquote(path.removeprefix("/api/datasets/")).strip("/")
+            dataset_id = unquote(remove_prefix(path, "/api/datasets/")).strip("/")
             if dataset_id:
                 dataset, payload = read_dataset(dataset_id)
                 self.send_json({"ok": True, "dataset": dataset, "data": payload})
@@ -792,7 +806,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                 return
 
             if path.startswith("/api/datasets/") and path.endswith("/activate"):
-                dataset_id = unquote(path.removeprefix("/api/datasets/").removesuffix("/activate")).strip("/")
+                dataset_id = unquote(remove_suffix(remove_prefix(path, "/api/datasets/"), "/activate")).strip("/")
                 find_dataset(dataset_id)
                 set_active_id(dataset_id)
                 dataset, data = read_dataset(dataset_id)
@@ -814,7 +828,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             if path.startswith("/api/datasets/"):
-                dataset_id = unquote(path.removeprefix("/api/datasets/")).strip("/")
+                dataset_id = unquote(remove_prefix(path, "/api/datasets/")).strip("/")
                 catalog = read_catalog()
                 if len(catalog["datasets"]) <= 1:
                     self.send_error_json("至少保留一个数据集", status=409)

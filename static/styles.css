@@ -960,3 +960,306 @@ section {
     padding-right: 0;
   }
 }
+
+/* ============================================================
+   交互编辑与属性模块
+   ============================================================ */
+
+/* 让 workspace 变成「主区 + 底部抽屉」两行。这里只加 grid-template-rows，
+   不重新声明 display，760px 媒体查询里的 flex 布局因此不受影响。 */
+.workspace {
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+#mapCanvas.mode-point,
+#mapCanvas.mode-line,
+#mapCanvas.mode-polygon,
+#mapCanvas.mode-box {
+  cursor: crosshair;
+}
+
+#mapCanvas.mode-select {
+  cursor: pointer;
+}
+
+#mapCanvas.mode-edit {
+  cursor: default;
+}
+
+#mapCanvas.mode-edit.is-dragging-vertex {
+  cursor: crosshair;
+}
+
+#mapCanvas.mode-edit.is-over-vertex {
+  cursor: move;
+}
+
+/* ---------- 底部属性表抽屉 ---------- */
+
+.attribute-drawer {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.attribute-drawer.collapsed .drawer-head {
+  border-bottom: 0;
+}
+
+.drawer-toggle {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 6px;
+  color: var(--primary);
+}
+
+.drawer-caret {
+  display: block;
+  font-size: 11px;
+  transition: transform 160ms ease;
+}
+
+.attribute-drawer.collapsed .drawer-caret {
+  transform: rotate(-90deg);
+}
+
+.drawer-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.drawer-title h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.drawer-title .section-kicker {
+  margin-bottom: 0;
+}
+
+.drawer-count {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.drawer-filter {
+  display: flex;
+  gap: 1px;
+  margin-left: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+  background: var(--border);
+}
+
+.filter-button {
+  border: 0;
+  border-radius: 0;
+  background: var(--surface);
+  padding: 6px 11px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.filter-button:hover {
+  color: var(--primary-dark);
+  transform: none;
+}
+
+.filter-button.active {
+  background: #d9efed;
+  color: var(--primary-dark);
+  font-weight: 600;
+}
+
+.drawer-search {
+  width: 170px;
+  flex: 0 0 auto;
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.drawer-action {
+  flex: 0 0 auto;
+  padding: 6px 11px;
+  font-size: 12px;
+}
+
+.attribute-drawer.collapsed .drawer-body {
+  display: none;
+}
+
+.drawer-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.drawer-table-wrap {
+  max-height: 268px;
+}
+
+.drawer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.drawer-page-info {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.drawer-pager {
+  display: flex;
+  gap: 6px;
+}
+
+.drawer-pager button {
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+/* ---------- 属性表本体 ---------- */
+
+.attribute-table {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.attribute-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.attribute-table td {
+  max-width: 220px;
+  padding: 6px 9px;
+  border-bottom: 1px solid #eef2f0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.attribute-table tbody tr {
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+.attribute-table tbody tr:nth-child(even) {
+  background: #fafcfb;
+}
+
+.attribute-table tbody tr:hover {
+  background: #edf7f5;
+}
+
+.attribute-table tbody tr.active {
+  background: #e2f2ef;
+}
+
+.attribute-table tbody tr.active td:first-child {
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.attribute-table td.cell-id {
+  color: var(--muted);
+  font-family: Consolas, monospace;
+}
+
+.attribute-table td.cell-empty {
+  color: #b6c2bd;
+}
+
+.attribute-table td.cell-editing {
+  padding: 0;
+}
+
+.attribute-table td.cell-editing input {
+  width: 100%;
+  min-width: 90px;
+  padding: 6px 9px;
+  border: 1px solid var(--primary);
+  border-radius: 0;
+  font-size: 12px;
+}
+
+.th-inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.field-remove {
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.5;
+}
+
+.field-remove:hover {
+  border: 0;
+  background: transparent;
+  opacity: 1;
+  transform: none;
+}
+
+/* ---------- 右侧动态属性编辑表单 ---------- */
+
+.edit-field-list {
+  display: grid;
+  gap: 10px;
+  max-height: 268px;
+  margin-bottom: 4px;
+  overflow: auto;
+}
+
+.edit-field-list label {
+  margin-bottom: 0;
+}
+
+.edit-field-list input {
+  font-size: 12px;
+}
+
+.edit-field-list .empty-layer {
+  margin: 0;
+}
+
+.editor-field-name {
+  font-family: Consolas, monospace;
+  font-size: 11px;
+}
