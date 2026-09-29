@@ -12,7 +12,7 @@
       <div class="brand-block">
         <div class="eyebrow">VECTOR LAB · GIS DEMO</div>
         <h1>矢量数据工作台</h1>
-        <p>在模拟平面上编辑、筛选并管理矢量数据</p>
+        <p>在地图底图或模拟平面上编辑、筛选并管理矢量数据</p>
       </div>
       <div class="data-summary" aria-label="数据概览">
         <div><strong id="featureCount">0</strong><span>要素</span></div>
@@ -34,10 +34,12 @@
             <span id="datasetCountLabel" class="section-kicker">0 FILES</span>
           </div>
           <label class="file-picker">
-            <span>导入矢量文件</span>
+            <span>导入地图数据</span>
             <input id="fileInput" type="file" multiple accept=".geojson,.json,.zip,.shp,.shx,.dbf,.prj,.cpg,application/geo+json,application/json,application/zip,application/octet-stream">
             <small>支持 GeoJSON / JSON、Shapefile ZIP 或配套 .shp/.shx/.dbf/.prj/.cpg 文件</small>
           </label>
+          <button id="openMapDemoBtn" class="map-example-button" type="button">打开真实地图示例</button>
+          <p class="form-tip">WGS 84 经纬度数据会自动叠加在线底图；其他投影仍显示在平面画布中。</p>
           <div id="datasetImportStatus" class="dataset-import-status" aria-live="polite"></div>
           <div id="datasetList" class="dataset-list"></div>
           <div id="activeDatasetMeta" class="dataset-meta">正在读取数据文件...</div>
@@ -65,15 +67,9 @@
           </label>
           <label>
             图层
-            <select id="layerInput">
-              <option>兴趣点</option>
-              <option>道路</option>
-              <option>水域</option>
-              <option>功能区</option>
-              <option>自定义</option>
-            </select>
+            <input id="layerInput" type="text" list="layerOptions" value="兴趣点" maxlength="20">
           </label>
-          <p class="form-tip">先设置属性，再选择“画点 / 画线 / 画面”。</p>
+          <p class="form-tip">先设置属性，再选择“画点 / 画线 / 画面”。图层既可以输入已有图层名，也可以直接输入新名称。</p>
         </section>
 
         <section>
@@ -102,17 +98,29 @@
             <button id="undoDraftBtn" class="draft-button" disabled>撤销节点</button>
             <button id="cancelDraftBtn" class="draft-button" disabled>取消绘制</button>
           </div>
+          <div class="tool-group">
+            <span class="toolbar-label">几何</span>
+            <button data-mode="edit" class="tool">编辑几何</button>
+            <button id="undoGeometryBtn" class="draft-button" disabled>撤销几何</button>
+            <button id="endEditBtn" class="draft-button" disabled>结束编辑</button>
+          </div>
           <div class="tool-group view-tools">
             <span class="toolbar-label">视图</span>
             <button id="zoomInBtn" aria-label="放大">＋</button>
             <button id="zoomOutBtn" aria-label="缩小">－</button>
             <button id="fitBtn">全图</button>
           </div>
+          <div class="tool-group">
+            <span class="toolbar-label">底图</span>
+            <button id="baseMapBtn" type="button" aria-pressed="false" disabled>在线地图</button>
+          </div>
         </div>
         <div class="map-stage">
+          <div id="baseMapTiles" class="basemap-tiles" aria-hidden="true"></div>
           <canvas id="mapCanvas" aria-label="地图画布"></canvas>
-          <div class="map-badge"><span class="live-dot"></span> LIVE · 模拟坐标系</div>
+          <div class="map-badge"><span class="live-dot"></span><span id="mapBadgeText">模拟平面坐标系</span></div>
           <div id="coordinateReadout" class="coordinate-readout">坐标 —</div>
+          <a id="mapAttribution" class="map-attribution" href="https://www.amap.com/" target="_blank" rel="noopener noreferrer" hidden>© 高德地图</a>
         </div>
         <div id="hint" class="hint">当前：漫游。拖拽移动地图，滚轮缩放。</div>
       </section>
@@ -126,17 +134,11 @@
           <div id="selectionSummary" class="selection-summary">暂无选择</div>
           <div class="table-wrap">
             <table>
-              <thead>
-                <tr>
-                  <th>ID</th>
-                  <th>名称</th>
-                  <th>图层</th>
-                  <th>类型</th>
-                </tr>
-              </thead>
+              <thead id="selectionHead"></thead>
               <tbody id="attributeBody"></tbody>
             </table>
           </div>
+          <p class="form-tip">完整的多字段属性表在地图下方的抽屉里。</p>
           <div id="selectionEditor" class="selection-editor is-empty">
             <div class="editor-heading">
               <div>
@@ -145,20 +147,9 @@
               </div>
               <span id="editorType" class="type-chip">—</span>
             </div>
-            <label>
-              名称
-              <input id="editNameInput" type="text" maxlength="40" placeholder="选择一个要素后编辑" disabled>
-            </label>
-            <label>
-              图层
-              <select id="editLayerInput" disabled>
-                <option>兴趣点</option>
-                <option>道路</option>
-                <option>水域</option>
-                <option>功能区</option>
-                <option>自定义</option>
-              </select>
-            </label>
+            <div id="editFieldList" class="edit-field-list">
+              <p class="empty-layer">点选一个要素后编辑属性。</p>
+            </div>
             <div id="editorMeta" class="editor-meta">点选一行要素开始编辑。</div>
             <div class="editor-actions">
               <button id="updateFeatureBtn" class="primary" disabled>保存属性修改</button>
@@ -176,12 +167,49 @@
             <li><span>01</span>点选或框选要素查看属性</li>
             <li><span>02</span>滚轮缩放，漫游模式拖动地图</li>
             <li><span>03</span>绘制后点击“完成绘制”提交</li>
-            <li><span>04</span>保存后可导出标准 GeoJSON</li>
+            <li><span>04</span>“编辑几何”可拖动节点、整体平移要素</li>
+            <li><span>05</span>底部属性表双击单元格即可改属性</li>
           </ul>
         </section>
       </aside>
+
+      <section id="attributeDrawer" class="attribute-drawer">
+        <div class="drawer-head">
+          <button id="drawerToggleBtn" class="drawer-toggle" type="button" aria-expanded="true" title="展开 / 折叠属性表">
+            <span class="drawer-caret">▾</span>
+          </button>
+          <div class="drawer-title">
+            <span class="section-kicker">ATTRIBUTE TABLE</span>
+            <h2>属性表</h2>
+          </div>
+          <span id="attributeCount" class="drawer-count">共 0 个要素</span>
+          <div class="drawer-filter" role="group" aria-label="属性表过滤">
+            <button type="button" class="filter-button active" data-filter="all">全部</button>
+            <button type="button" class="filter-button" data-filter="selected">仅选中</button>
+          </div>
+          <input id="attributeSearch" class="drawer-search" type="search" placeholder="搜索字段值…" aria-label="搜索属性值">
+          <button id="addFieldBtn" class="drawer-action" type="button">新增字段</button>
+        </div>
+        <div class="drawer-body">
+          <div class="table-wrap drawer-table-wrap">
+            <table class="attribute-table">
+              <thead id="attributeHead"></thead>
+              <tbody id="attributeTableBody"></tbody>
+            </table>
+          </div>
+          <div class="drawer-footer">
+            <span id="attributePageInfo" class="drawer-page-info">—</span>
+            <div class="drawer-pager">
+              <button id="attributePrevBtn" type="button">上一页</button>
+              <button id="attributeNextBtn" type="button">下一页</button>
+            </div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
+
+  <datalist id="layerOptions"></datalist>
 
   <script src="/static/app.js"></script>
 </body>

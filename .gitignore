@@ -6,4 +6,5 @@ __pycache__/
 data/catalog.json
 data/active_dataset.json
 data/uploads/
+data/features.geojson
 sample_data/shapefile_demo_sources/
