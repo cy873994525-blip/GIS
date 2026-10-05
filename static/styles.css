@@ -947,6 +947,74 @@ section {
   font-weight: 700;
 }
 
+.analysis-panel {
+  border-color: #b8d5d0;
+  background: linear-gradient(180deg, #fbfffe, #f2faf8);
+}
+
+.analysis-panel label {
+  margin-bottom: 9px;
+}
+
+.analysis-panel select,
+.analysis-panel input {
+  min-width: 0;
+}
+
+.analysis-measure-actions,
+.analysis-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+  margin: 4px 0 11px;
+}
+
+.analysis-inline-input {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.analysis-inline-input input {
+  flex: 1;
+}
+
+.analysis-inline-input span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.analysis-result {
+  min-height: 42px;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.analysis-result.success {
+  border-color: #9bc8bf;
+  background: #effaf7;
+  color: var(--primary-dark);
+}
+
+.analysis-result.warning {
+  border-color: #e4c997;
+  background: #fffaf0;
+  color: #8a6123;
+}
+
+.analysis-result.error {
+  border-color: #e4b8b8;
+  background: #fff7f7;
+  color: var(--danger);
+}
+
 @media (max-width: 1280px) {
   .topbar {
     gap: 14px;

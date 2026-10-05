@@ -171,6 +171,36 @@
             <li><span>05</span>底部属性表双击单元格即可改属性</li>
           </ul>
         </section>
+
+        <section class="analysis-panel">
+          <div class="section-heading">
+            <h2>空间分析</h2>
+            <span class="section-kicker">MEMBER D</span>
+          </div>
+          <p class="form-tip">先点选一个要素，再执行测量、缓冲区或相交查询。</p>
+          <label>
+            分析要素
+            <select id="analysisFeatureSelect" aria-label="分析要素">
+              <option value="">请先选择要素</option>
+            </select>
+          </label>
+          <div class="analysis-measure-actions">
+            <button id="measureDistanceBtn" type="button">测量距离</button>
+            <button id="measureAreaBtn" type="button">测量面积</button>
+          </div>
+          <label>
+            缓冲距离
+            <div class="analysis-inline-input">
+              <input id="bufferDistanceInput" type="number" min="0.000001" step="any" value="100" aria-label="缓冲距离">
+              <span id="bufferDistanceUnit">米 / 平面单位</span>
+            </div>
+          </label>
+          <div class="analysis-actions">
+            <button id="bufferBtn" class="primary" type="button">生成缓冲区</button>
+            <button id="intersectsBtn" type="button">查询相交</button>
+          </div>
+          <div id="analysisResult" class="analysis-result" aria-live="polite">分析结果会显示在这里。</div>
+        </section>
       </aside>
 
       <section id="attributeDrawer" class="attribute-drawer">
