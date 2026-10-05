@@ -10,6 +10,7 @@ import struct
 import uuid
 import zipfile
 import base64
+import re
 from urllib.parse import unquote, urlsplit
 
 
@@ -211,6 +212,418 @@ def calculate_bbox(payload):
         max(position[0] for position in positions),
         max(position[1] for position in positions),
     ]
+
+
+EARTH_RADIUS_M = 6371008.8
+BUFFER_CIRCLE_STEPS = 48
+
+
+def geometry_positions(geometry):
+    return list(iter_positions((geometry or {}).get("coordinates", [])))
+
+
+def dataset_is_geographic(dataset, payload):
+    bbox = calculate_bbox(payload)
+    if not bbox or bbox[0] < -180 or bbox[2] > 180 or bbox[1] < -90 or bbox[3] > 90:
+        return False
+    crs_name = str(dataset.get("crs") or "Unknown")
+    return crs_name == "Unknown" or bool(re.search(r"WGS[ _]?84|EPSG:?4326|CRS:?84", crs_name, re.I))
+
+
+def map_coordinates(value, transform):
+    if isinstance(value, list) and len(value) >= 2 and all(
+        isinstance(item, (int, float)) for item in value[:2]
+    ):
+        return transform(value)
+    if isinstance(value, list):
+        return [map_coordinates(item, transform) for item in value]
+    raise ValueError("invalid geometry coordinates")
+
+
+def local_projection_center(geometry):
+    positions = geometry_positions(geometry)
+    if not positions:
+        raise ValueError("geometry has no coordinates")
+    longitude = math.radians(sum(point[0] for point in positions) / len(positions))
+    latitude = math.radians(sum(point[1] for point in positions) / len(positions))
+    return longitude, latitude
+
+
+def azimuthal_equidistant_forward(point, center):
+    longitude, latitude = math.radians(point[0]), math.radians(point[1])
+    lon0, lat0 = center
+    delta_lon = longitude - lon0
+    cosine_c = max(-1.0, min(1.0,
+        math.sin(lat0) * math.sin(latitude) +
+        math.cos(lat0) * math.cos(latitude) * math.cos(delta_lon)
+    ))
+    angular_distance = math.acos(cosine_c)
+    if angular_distance < 1e-12:
+        return [0.0, 0.0]
+    sine_c = math.sin(angular_distance)
+    scale = angular_distance / sine_c if abs(sine_c) > 1e-12 else 1.0
+    x = EARTH_RADIUS_M * scale * math.cos(latitude) * math.sin(delta_lon)
+    y = EARTH_RADIUS_M * scale * (
+        math.cos(lat0) * math.sin(latitude) -
+        math.sin(lat0) * math.cos(latitude) * math.cos(delta_lon)
+    )
+    return [x, y]
+
+
+def azimuthal_equidistant_inverse(point, center):
+    x, y = point[:2]
+    lon0, lat0 = center
+    distance = math.hypot(x, y)
+    if distance < 1e-9:
+        return [math.degrees(lon0), math.degrees(lat0)]
+    angular_distance = distance / EARTH_RADIUS_M
+    sine_c, cosine_c = math.sin(angular_distance), math.cos(angular_distance)
+    latitude = math.asin(
+        cosine_c * math.sin(lat0) + y * sine_c * math.cos(lat0) / distance
+    )
+    longitude = lon0 + math.atan2(
+        x * sine_c,
+        distance * math.cos(lat0) * cosine_c - y * math.sin(lat0) * sine_c,
+    )
+    return [math.degrees(longitude), math.degrees(latitude)]
+
+
+def cross_2d(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def subtract_2d(a, b):
+    return [a[0] - b[0], a[1] - b[1]]
+
+
+def unit_vector(a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        raise ValueError("buffer input contains a zero-length segment")
+    return [dx / length, dy / length]
+
+
+def line_intersection(p, direction_a, q, direction_b):
+    denominator = cross_2d(direction_a, direction_b)
+    if abs(denominator) < 1e-10:
+        return [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2]
+    amount = cross_2d(subtract_2d(q, p), direction_b) / denominator
+    return [p[0] + amount * direction_a[0], p[1] + amount * direction_a[1]]
+
+
+def sample_arc(center, start, end, direction, max_step=math.pi / 12, forced_delta=None):
+    start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+    end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+    if forced_delta is None:
+        delta = (end_angle - start_angle) % (2 * math.pi)
+        if direction < 0:
+            delta = -((start_angle - end_angle) % (2 * math.pi))
+    else:
+        delta = forced_delta
+    radius = math.hypot(start[0] - center[0], start[1] - center[1])
+    steps = max(1, int(math.ceil(abs(delta) / max_step)))
+    return [
+        [center[0] + radius * math.cos(start_angle + delta * index / steps),
+         center[1] + radius * math.sin(start_angle + delta * index / steps)]
+        for index in range(steps + 1)
+    ]
+
+
+def offset_polyline_side(points, distance, side):
+    directions = [unit_vector(points[index], points[index + 1]) for index in range(len(points) - 1)]
+    normals = [[-direction[1] * side, direction[0] * side] for direction in directions]
+    result = [[points[0][0] + normals[0][0] * distance,
+               points[0][1] + normals[0][1] * distance]]
+    for index in range(1, len(points) - 1):
+        previous, following = directions[index - 1], directions[index]
+        turn = cross_2d(previous, following)
+        before = [points[index][0] + normals[index - 1][0] * distance,
+                  points[index][1] + normals[index - 1][1] * distance]
+        after = [points[index][0] + normals[index][0] * distance,
+                 points[index][1] + normals[index][1] * distance]
+        if turn * side < -1e-10:
+            arc = sample_arc(points[index], before, after, 1 if turn > 0 else -1)
+            result.extend(arc[1:])
+        else:
+            join = line_intersection(before, previous, after, following)
+            if math.hypot(join[0] - points[index][0], join[1] - points[index][1]) > distance * 12:
+                result.extend([before, after])
+            else:
+                result.append(join)
+    result.append([points[-1][0] + normals[-1][0] * distance,
+                   points[-1][1] + normals[-1][1] * distance])
+    return result, directions
+
+
+def buffer_line_string(points, distance):
+    if len(points) < 2:
+        raise ValueError("line buffer requires at least two coordinates")
+    left, directions = offset_polyline_side(points, distance, 1)
+    right, _ = offset_polyline_side(points, distance, -1)
+    end_direction = directions[-1]
+    end_left = left[-1]
+    end_right = right[-1]
+    end_cap = sample_arc(
+        points[-1], end_left, end_right, -1, forced_delta=-math.pi
+    )
+    start_direction = directions[0]
+    start_right = right[0]
+    start_left = left[0]
+    start_cap = sample_arc(
+        points[0], start_right, start_left, -1, forced_delta=-math.pi
+    )
+    ring = left + end_cap[1:] + list(reversed(right[:-1])) + start_cap[1:-1]
+    if ring[0] != ring[-1]:
+        ring.append(ring[0][:])
+    return ring
+
+
+def signed_ring_area(ring):
+    return sum(
+        ring[index - 1][0] * ring[index][1] - ring[index][0] * ring[index - 1][1]
+        for index in range(1, len(ring))
+    ) / 2
+
+
+def offset_ring(ring, distance):
+    points = ring[:-1] if ring[0][:2] == ring[-1][:2] else ring[:]
+    if len(points) < 3:
+        raise ValueError("polygon ring requires at least three distinct coordinates")
+    orientation = 1 if signed_ring_area(points + [points[0]]) >= 0 else -1
+    result = []
+    for index, point in enumerate(points):
+        previous = points[index - 1]
+        following = points[(index + 1) % len(points)]
+        incoming = unit_vector(previous, point)
+        outgoing = unit_vector(point, following)
+        normal_in = [incoming[1] * orientation, -incoming[0] * orientation]
+        normal_out = [outgoing[1] * orientation, -outgoing[0] * orientation]
+        before = [point[0] + normal_in[0] * distance,
+                  point[1] + normal_in[1] * distance]
+        after = [point[0] + normal_out[0] * distance,
+                 point[1] + normal_out[1] * distance]
+        turn = cross_2d(incoming, outgoing)
+        if turn * orientation * distance > 1e-10:
+            arc = sample_arc(point, before, after, orientation)
+            result.extend(arc[:-1])
+        else:
+            join = line_intersection(before, incoming, after, outgoing)
+            if math.hypot(join[0] - point[0], join[1] - point[1]) > abs(distance) * 12:
+                result.extend([before, after])
+            else:
+                result.append(join)
+    if len(result) < 3:
+        raise ValueError("buffer distance collapses this polygon")
+    result.append(result[0][:])
+    if abs(signed_ring_area(result)) < 1e-8 or signed_ring_area(result) * signed_ring_area(ring) <= 0:
+        raise ValueError("buffer distance collapses this polygon")
+    return result
+
+
+def buffer_polygon(polygon, distance):
+    if not polygon or not polygon[0]:
+        raise ValueError("polygon buffer requires an exterior ring")
+    result = [offset_ring(polygon[0], distance)]
+    for hole in polygon[1:]:
+        try:
+            result.append(offset_ring(hole, -distance))
+        except ValueError:
+            # A narrow hole may disappear when the positive buffer closes it.
+            continue
+    return result
+
+
+def buffer_geometry(geometry, distance):
+    kind = geometry.get("type")
+    coords = geometry.get("coordinates")
+    if kind == "Point":
+        x, y = coords[:2]
+        ring = [
+            [x + distance * math.cos(2 * math.pi * index / BUFFER_CIRCLE_STEPS),
+             y + distance * math.sin(2 * math.pi * index / BUFFER_CIRCLE_STEPS)]
+            for index in range(BUFFER_CIRCLE_STEPS)
+        ]
+        ring.append(ring[0][:])
+        return {"type": "Polygon", "coordinates": [ring]}
+    if kind == "LineString":
+        return {"type": "Polygon", "coordinates": [buffer_line_string(coords, distance)]}
+    if kind == "MultiLineString":
+        return {
+            "type": "MultiPolygon",
+            "coordinates": [[buffer_line_string(line, distance)] for line in coords],
+        }
+    if kind == "Polygon":
+        return {"type": "Polygon", "coordinates": buffer_polygon(coords, distance)}
+    if kind == "MultiPolygon":
+        return {"type": "MultiPolygon", "coordinates": [buffer_polygon(poly, distance) for poly in coords]}
+    raise ValueError(f"buffer does not support geometry type {kind}")
+
+
+def geometries_intersect(first, second):
+    def collect(geometry):
+        kind, coordinates = geometry["type"], geometry["coordinates"]
+        points, lines, polygons = [], [], []
+        if kind == "Point":
+            points.append(coordinates[:2])
+        elif kind == "LineString":
+            lines.append(coordinates)
+        elif kind == "MultiLineString":
+            lines.extend(coordinates)
+        elif kind == "Polygon":
+            polygons.append(coordinates)
+            lines.extend(coordinates)
+        elif kind == "MultiPolygon":
+            polygons.extend(coordinates)
+            lines.extend(ring for polygon in coordinates for ring in polygon)
+        else:
+            raise ValueError(f"intersection query does not support geometry type {kind}")
+        points.extend(point for line in lines for point in line)
+        return points, lines, polygons
+
+    def orientation(a, b, c):
+        return cross_2d(subtract_2d(b, a), subtract_2d(c, a))
+
+    def on_segment(point, a, b):
+        return abs(orientation(a, b, point)) <= 1e-10 and (
+            min(a[0], b[0]) - 1e-10 <= point[0] <= max(a[0], b[0]) + 1e-10 and
+            min(a[1], b[1]) - 1e-10 <= point[1] <= max(a[1], b[1]) + 1e-10
+        )
+
+    def segments_intersect(a, b, c, d):
+        o1, o2 = orientation(a, b, c), orientation(a, b, d)
+        o3, o4 = orientation(c, d, a), orientation(c, d, b)
+        if ((o1 > 1e-10 and o2 < -1e-10) or (o1 < -1e-10 and o2 > 1e-10)) and \
+           ((o3 > 1e-10 and o4 < -1e-10) or (o3 < -1e-10 and o4 > 1e-10)):
+            return True
+        return (abs(o1) <= 1e-10 and on_segment(c, a, b)) or \
+            (abs(o2) <= 1e-10 and on_segment(d, a, b)) or \
+            (abs(o3) <= 1e-10 and on_segment(a, c, d)) or \
+            (abs(o4) <= 1e-10 and on_segment(b, c, d))
+
+    def point_in_ring(point, ring):
+        inside = False
+        for index in range(len(ring) - 1):
+            a, b = ring[index], ring[index + 1]
+            if on_segment(point, a, b):
+                return True
+            if (a[1] > point[1]) != (b[1] > point[1]):
+                crossing_x = (b[0] - a[0]) * (point[1] - a[1]) / (b[1] - a[1]) + a[0]
+                if point[0] < crossing_x:
+                    inside = not inside
+        return inside
+
+    def point_in_polygon(point, polygon):
+        return bool(polygon and point_in_ring(point, polygon[0]) and
+                    not any(point_in_ring(point, hole) for hole in polygon[1:]))
+
+    points_a, lines_a, polygons_a = collect(first)
+    points_b, lines_b, polygons_b = collect(second)
+    for line_a in lines_a:
+        for line_b in lines_b:
+            if any(segments_intersect(a, b, c, d)
+                   for a, b in zip(line_a, line_a[1:])
+                   for c, d in zip(line_b, line_b[1:])):
+                return True
+    for point in points_a:
+        if any(on_segment(point, a, b) for line in lines_b for a, b in zip(line, line[1:])):
+            return True
+        if any(point_in_polygon(point, polygon) for polygon in polygons_b):
+            return True
+    for point in points_b:
+        if any(on_segment(point, a, b) for line in lines_a for a, b in zip(line, line[1:])):
+            return True
+        if any(point_in_polygon(point, polygon) for polygon in polygons_a):
+            return True
+    return any(point_in_polygon(point, polygon) for point in points_a for polygon in polygons_b) or \
+        any(point_in_polygon(point, polygon) for point in points_b for polygon in polygons_a)
+
+
+def planar_line_length(points):
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in zip(points, points[1:]))
+
+
+def geodesic_segment_length(first, second):
+    longitude_a, latitude_a = math.radians(first[0]), math.radians(first[1])
+    longitude_b, latitude_b = math.radians(second[0]), math.radians(second[1])
+    delta_latitude = latitude_b - latitude_a
+    delta_longitude = longitude_b - longitude_a
+    haversine = math.sin(delta_latitude / 2) ** 2 + math.cos(latitude_a) * math.cos(latitude_b) * math.sin(delta_longitude / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(haversine)))
+
+
+def geodesic_line_length(points):
+    return sum(geodesic_segment_length(a, b) for a, b in zip(points, points[1:]))
+
+
+def planar_ring_area(ring):
+    return abs(sum(
+        ring[index - 1][0] * ring[index][1] - ring[index][0] * ring[index - 1][1]
+        for index in range(1, len(ring))
+    ) / 2)
+
+
+def geodesic_ring_area(ring):
+    area = 0.0
+    for first, second in zip(ring, ring[1:]):
+        longitude_delta = math.radians(second[0] - first[0])
+        while longitude_delta > math.pi:
+            longitude_delta -= 2 * math.pi
+        while longitude_delta < -math.pi:
+            longitude_delta += 2 * math.pi
+        area += longitude_delta * (2 + math.sin(math.radians(first[1])) + math.sin(math.radians(second[1])))
+    return abs(area * EARTH_RADIUS_M ** 2 / 2)
+
+
+def geometry_length(geometry, geographic=False):
+    kind = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    measure_line = geodesic_line_length if geographic else planar_line_length
+    if kind == "Point":
+        return 0.0
+    if kind == "LineString":
+        return measure_line(coordinates)
+    if kind == "MultiLineString":
+        return sum(measure_line(line) for line in coordinates)
+    if kind == "Polygon":
+        return sum(measure_line(ring) for ring in coordinates)
+    if kind == "MultiPolygon":
+        return sum(measure_line(ring) for polygon in coordinates for ring in polygon)
+    raise ValueError(f"distance does not support geometry type {kind}")
+
+
+def geometry_area(geometry, geographic=False):
+    kind = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    measure_ring = geodesic_ring_area if geographic else planar_ring_area
+    if kind == "Polygon":
+        if not coordinates:
+            return 0.0
+        return max(0.0, measure_ring(coordinates[0]) - sum(measure_ring(ring) for ring in coordinates[1:]))
+    if kind == "MultiPolygon":
+        return sum(geometry_area({"type": "Polygon", "coordinates": polygon}, geographic) for polygon in coordinates)
+    raise ValueError(f"area does not support geometry type {kind}")
+
+
+def resolve_analysis_feature(data, feature_id):
+    if not feature_id:
+        raise ValueError("feature_id is required")
+    for feature in data.get("features", []):
+        if str(feature.get("id")) == str(feature_id):
+            return feature
+    raise KeyError(f"feature not found: {feature_id}")
+
+
+def analysis_geometry(payload, data):
+    feature_id = payload.get("feature_id")
+    if feature_id:
+        return resolve_analysis_feature(data, feature_id)["geometry"], feature_id
+    geometry = payload.get("geometry")
+    if not isinstance(geometry, dict):
+        raise ValueError("feature_id or geometry is required")
+    validate_feature({"type": "Feature", "id": "analysis-input", "geometry": geometry, "properties": {}})
+    return geometry, None
 
 
 def dataset_summary(
@@ -704,6 +1117,114 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlsplit(self.path).path
         try:
+            if path == "/api/spatial/measure":
+                request = self.read_json_body()
+                operation = str(request.get("operation") or "").lower()
+                dataset, data = read_dataset()
+                geometry, feature_id = analysis_geometry(request, data)
+                geographic = dataset_is_geographic(dataset, data)
+                if operation == "distance":
+                    value = geometry_length(geometry, geographic)
+                    unit = "m" if geographic else "map units"
+                elif operation == "area":
+                    value = geometry_area(geometry, geographic)
+                    unit = "m²" if geographic else "map units²"
+                else:
+                    raise ValueError("operation must be distance or area")
+                self.send_json({
+                    "ok": True,
+                    "operation": operation,
+                    "value": value,
+                    "unit": unit,
+                    "feature_id": feature_id,
+                    "geographic": geographic,
+                    "coordinate_system": "WGS 84 经纬度" if geographic else "平面坐标",
+                })
+                return
+
+            if path == "/api/spatial/buffer":
+                request = self.read_json_body()
+                dataset, data = read_dataset()
+                source = resolve_analysis_feature(data, request.get("feature_id"))
+                try:
+                    distance = float(request.get("distance"))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("distance must be a number") from exc
+                if not math.isfinite(distance) or distance <= 0:
+                    raise ValueError("distance must be greater than zero")
+                if distance > 1e8:
+                    raise ValueError("distance is too large")
+                geographic = dataset_is_geographic(dataset, data)
+                if geographic:
+                    center = local_projection_center(source["geometry"])
+                    projected = map_coordinates(
+                        source["geometry"].get("coordinates"),
+                        lambda point: azimuthal_equidistant_forward(point, center),
+                    )
+                    projected_geometry = {
+                        "type": source["geometry"]["type"],
+                        "coordinates": projected,
+                    }
+                    buffered_projected = buffer_geometry(projected_geometry, distance)
+                    buffered_coordinates = map_coordinates(
+                        buffered_projected["coordinates"],
+                        lambda point: azimuthal_equidistant_inverse(point, center),
+                    )
+                    buffered_geometry = {
+                        "type": buffered_projected["type"],
+                        "coordinates": buffered_coordinates,
+                    }
+                    distance_unit = "m"
+                else:
+                    buffered_geometry = buffer_geometry(source["geometry"], distance)
+                    distance_unit = "map units"
+                buffer_id = f"buffer-{uuid.uuid4().hex[:10]}"
+                source_name = (source.get("properties") or {}).get("name") or source["id"]
+                buffer_feature = {
+                    "type": "Feature",
+                    "id": buffer_id,
+                    "properties": {
+                        "name": f"缓冲区 · {source_name}",
+                        "layer": "空间分析",
+                        "kind": "buffer",
+                        "analysis": "buffer",
+                        "source_id": source["id"],
+                        "distance": distance,
+                        "distance_unit": distance_unit,
+                    },
+                    "geometry": buffered_geometry,
+                }
+                validate_feature(buffer_feature)
+                data["features"].append(buffer_feature)
+                write_geojson(data, dataset["id"])
+                self.send_json({
+                    "ok": True,
+                    "feature": buffer_feature,
+                    "source_id": source["id"],
+                    "distance": distance,
+                    "unit": distance_unit,
+                    "geographic": geographic,
+                })
+                return
+
+            if path == "/api/spatial/intersects":
+                request = self.read_json_body()
+                dataset, data = read_dataset()
+                source = resolve_analysis_feature(data, request.get("feature_id"))
+                matches = [
+                    feature for feature in data.get("features", [])
+                    if feature.get("id") != source.get("id") and
+                    geometries_intersect(source["geometry"], feature["geometry"])
+                ]
+                self.send_json({
+                    "ok": True,
+                    "source_id": source["id"],
+                    "matches": matches,
+                    "count": len(matches),
+                    "coordinate_system": "WGS 84 经纬度" if dataset_is_geographic(dataset, data) else "平面坐标",
+                })
+                return
+
             if path == "/api/features":
                 payload = self.read_json_body()
                 active_id = get_active_id()
