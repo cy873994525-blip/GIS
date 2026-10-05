@@ -191,6 +191,7 @@ function syncMapMode() {
     : "模拟 / 投影坐标 · 平面画布";
   document.getElementById("mapAttribution").hidden = !enabled;
   canvas.classList.toggle("with-basemap", enabled);
+  renderAnalysisFeatureOptions();
   draw();
 }
 
@@ -367,6 +368,7 @@ async function loadData() {
   state.attributePage = 1;
   renderLayers();
   renderAttributes();
+  renderAnalysisFeatureOptions();
   updateStats();
   syncDraftControls();
   draw();
@@ -564,6 +566,127 @@ function selectedFeatures() {
   return state.data.features.filter((feature) => state.selectedIds.has(feature.id));
 }
 
+function formatAnalysisNumber(value) {
+  if (!Number.isFinite(value)) return "—";
+  if (Math.abs(value) >= 100000) return value.toLocaleString("zh-CN", { maximumFractionDigits: 0 });
+  if (Math.abs(value) >= 100) return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+  return value.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
+}
+
+function analysisFeature() {
+  const selected = selectedFeatures();
+  const select = document.getElementById("analysisFeatureSelect");
+  const selectedId = select.value || (selected.length === 1 ? selected[0].id : "");
+  return state.data.features.find((feature) => feature.id === selectedId) || null;
+}
+
+function renderAnalysisFeatureOptions() {
+  const select = document.getElementById("analysisFeatureSelect");
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "请先选择要素";
+  select.appendChild(placeholder);
+  for (const feature of state.data.features) {
+    const option = document.createElement("option");
+    option.value = feature.id;
+    const name = feature.properties?.name || feature.id;
+    option.textContent = `${name} · ${feature.geometry.type}`;
+    select.appendChild(option);
+  }
+  const selected = selectedFeatures();
+  const nextValue = selected.length === 1 ? selected[0].id : previous;
+  select.value = state.data.features.some((feature) => feature.id === nextValue) ? nextValue : "";
+  document.getElementById("bufferDistanceUnit").textContent = state.geographic ? "米" : "平面单位";
+}
+
+function setAnalysisResult(message, kind = "") {
+  const result = document.getElementById("analysisResult");
+  result.textContent = message;
+  result.className = `analysis-result ${kind}`.trim();
+}
+
+async function measureSpatial(operation) {
+  const feature = analysisFeature();
+  if (!feature) {
+    setAnalysisResult("请先点选或选择一个要素。", "warning");
+    return;
+  }
+  try {
+    const result = await api("/api/spatial/measure", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation, feature_id: feature.id }),
+    });
+    const label = operation === "distance" ? "长度 / 距离" : "面积";
+    setAnalysisResult(`${label}：${formatAnalysisNumber(result.value)} ${result.unit}（${result.coordinate_system}）`, "success");
+    setNotice(`已计算“${feature.properties?.name || feature.id}”的${label}。`);
+  } catch (error) {
+    setAnalysisResult(`计算失败：${error.message}`, "error");
+  }
+}
+
+async function createBufferAnalysis() {
+  const feature = analysisFeature();
+  const distance = Number(document.getElementById("bufferDistanceInput").value);
+  if (!feature) {
+    setAnalysisResult("请先点选或选择一个要素。", "warning");
+    return;
+  }
+  if (!Number.isFinite(distance) || distance <= 0) {
+    setAnalysisResult("缓冲距离必须是大于 0 的数字。", "warning");
+    return;
+  }
+  try {
+    const result = await api("/api/spatial/buffer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ feature_id: feature.id, distance }),
+    });
+    state.data.features.push(result.feature);
+    state.visibleLayers.add(result.feature.properties.layer || "空间分析");
+    state.selectedIds = new Set([result.feature.id]);
+    renderLayers();
+    renderAttributes();
+    renderAnalysisFeatureOptions();
+    updateStats();
+    syncMapMode();
+    await Promise.all([loadDatasets(), loadStatus()]);
+    setAnalysisResult(`已生成缓冲区：${formatAnalysisNumber(distance)} ${result.unit}，新要素 ${result.feature.id}`, "success");
+    setNotice("缓冲区已生成并保存到当前数据集。 ");
+  } catch (error) {
+    setAnalysisResult(`缓冲区失败：${error.message}`, "error");
+  }
+}
+
+async function queryIntersections() {
+  const feature = analysisFeature();
+  if (!feature) {
+    setAnalysisResult("请先点选或选择一个要素。", "warning");
+    return;
+  }
+  try {
+    const result = await api("/api/spatial/intersects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ feature_id: feature.id }),
+    });
+    const ids = [feature.id, ...result.matches.map((item) => item.id)];
+    selectFeatures(ids);
+    const names = result.matches.slice(0, 3).map((item) => item.properties?.name || item.id);
+    const suffix = result.count > 3 ? " 等" : "";
+    setAnalysisResult(
+      result.count ? `相交查询：${result.count} 个要素（${names.join("、")}${suffix}）` : "相交查询：没有找到其他相交要素。",
+      result.count ? "success" : "",
+    );
+    setNotice(`已选中源要素及 ${result.count} 个相交要素。`);
+  } catch (error) {
+    setAnalysisResult(`相交查询失败：${error.message}`, "error");
+  }
+}
+
 function selectFeatures(ids) {
   state.selectedIds = new Set(ids);
   // 编辑几何模式下，选中项就是编辑目标。表格点行、框选都会走到这里。
@@ -576,6 +699,7 @@ function selectFeatures(ids) {
     }
   }
   renderAttributes();
+  renderAnalysisFeatureOptions();
   draw();
 }
 
@@ -842,6 +966,7 @@ async function persistAllFeatures(nextData, message) {
   state.dirty = false;
   renderLayers();
   renderAttributes();
+  renderAnalysisFeatureOptions();
   draw();
   setNotice(message);
 }
@@ -1684,6 +1809,7 @@ async function addFeature(geometry) {
   state.dirty = false;
   renderLayers();
   renderAttributes();
+  renderAnalysisFeatureOptions();
   setNotice(`已新增“${result.feature.properties.name}”，可继续绘制或保存。`);
   draw();
 }
@@ -2046,6 +2172,14 @@ document.getElementById("endEditBtn").addEventListener("click", () => setMode("s
 document.getElementById("zoomInBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 1.2));
 document.getElementById("zoomOutBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 0.82));
 document.getElementById("fitBtn").addEventListener("click", fitView);
+document.getElementById("analysisFeatureSelect").addEventListener("change", (event) => {
+  const id = event.target.value;
+  if (id) selectFeatures([id]);
+});
+document.getElementById("measureDistanceBtn").addEventListener("click", () => measureSpatial("distance"));
+document.getElementById("measureAreaBtn").addEventListener("click", () => measureSpatial("area"));
+document.getElementById("bufferBtn").addEventListener("click", createBufferAnalysis);
+document.getElementById("intersectsBtn").addEventListener("click", queryIntersections);
 document.getElementById("baseMapBtn").addEventListener("click", () => {
   if (!state.geographic) return;
   state.baseMapEnabled = !state.baseMapEnabled;
