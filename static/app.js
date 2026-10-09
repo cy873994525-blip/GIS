@@ -2118,18 +2118,20 @@ document.getElementById("fileInput").addEventListener("change", (event) => {
   });
 });
 
-document.getElementById("showAllBtn").addEventListener("click", () => {
-  state.visibleLayers = new Set(state.data.features.map((feature) => feature.properties.layer || "未命名"));
-  renderLayers();
-  draw();
-  setNotice("已显示全部图层。 ");
+document.getElementById("showAllBtn").addEventListener("click", async () => {
+  state.visibleDatasetIds = new Set(state.datasets.map((dataset) => dataset.id));
+  await loadData();
+  syncMapMode();
+  renderDatasets();
+  setNotice("已显示全部数据集与图层。");
 });
 
-document.getElementById("hideAllBtn").addEventListener("click", () => {
-  state.visibleLayers.clear();
-  renderLayers();
-  draw();
-  setNotice("已隐藏全部图层。 ");
+document.getElementById("hideAllBtn").addEventListener("click", async () => {
+  state.visibleDatasetIds.clear();
+  await loadData();
+  syncMapMode();
+  renderDatasets();
+  setNotice("已隐藏全部数据集。");
 });
 
 document.getElementById("clearSelectionBtn").addEventListener("click", () => {
