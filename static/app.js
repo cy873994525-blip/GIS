@@ -209,18 +209,16 @@ function renderBasemapTiles() {
   const zoom = Math.max(TILE_MIN_ZOOM, Math.min(TILE_MAX_ZOOM,
     Math.floor(Math.log2(state.scale * 360 / TILE_SIZE))));
   const tilesPerSide = 2 ** zoom;
-  const tileWorldSizeX = 360 / tilesPerSide;   // x：线性经度
-  const tileWorldSizeY = 180 / tilesPerSide;   // y：Web Mercator 纬度（±85.05° → 0..2^z）
+  const tileWorldSize = 360 / tilesPerSide; // x：线性经度；y：mercator 度（projectWorld 输出为 asinh(tanφ)*180/π，范围 ±180）
   const leftWorld = -state.offsetX / state.scale;
   const rightWorld = (state.viewWidth - state.offsetX) / state.scale;
   const topWorld = (state.viewHeight - state.offsetY) / state.scale;
   const bottomWorld = -state.offsetY / state.scale;
-  const firstX = Math.max(0, Math.floor((leftWorld + 180) / tileWorldSizeX));
-  const lastX = Math.min(tilesPerSide - 1, Math.floor((rightWorld + 180) / tileWorldSizeX));
-  const topClamped = Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, topWorld));
-  const bottomClamped = Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, bottomWorld));
-  const firstY = Math.max(0, Math.floor((90 - topClamped) / tileWorldSizeY));
-  const lastY = Math.min(tilesPerSide - 1, Math.floor((90 - bottomClamped) / tileWorldSizeY));
+  const firstX = Math.max(0, Math.floor((leftWorld + 180) / tileWorldSize));
+  const lastX = Math.min(tilesPerSide - 1, Math.floor((rightWorld + 180) / tileWorldSize));
+  // Web Mercator 标准 XYZ：y 行号 = (180 - mercator度) / 360 * 2^z（与 projectWorld 的 y 输出同空间）
+  const firstY = Math.max(0, Math.floor((180 - topWorld) / tileWorldSize));
+  const lastY = Math.min(tilesPerSide - 1, Math.floor((180 - bottomWorld) / tileWorldSize));
   const needed = new Set();
 
   for (let x = firstX; x <= lastX; x += 1) {
@@ -243,9 +241,9 @@ function renderBasemapTiles() {
         visibleTiles.set(key, image);
         tileLayer.appendChild(image);
       }
-      const tilePixels = tileWorldSizeX * state.scale;
-      image.style.left = `${(x * tileWorldSizeX - 180) * state.scale + state.offsetX}px`;
-      image.style.top = `${state.viewHeight - ((90 - y * tileWorldSizeY) * state.scale + state.offsetY)}px`;
+      const tilePixels = tileWorldSize * state.scale;
+      image.style.left = `${(x * tileWorldSize - 180) * state.scale + state.offsetX}px`;
+      image.style.top = `${state.viewHeight - ((180 - y * tileWorldSize) * state.scale + state.offsetY)}px`;
       image.style.width = `${tilePixels + 0.5}px`;
       image.style.height = `${tilePixels + 0.5}px`;
     }
