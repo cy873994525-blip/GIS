@@ -326,7 +326,7 @@ function renderDatasets() {
         state.visibleDatasetIds.delete(dataset.id);
       }
       await loadData();
-      fitView();
+      syncMapMode();
     });
     showLabel.append(showCheck, document.createTextNode("显示"));
 
@@ -378,7 +378,9 @@ async function loadDatasets() {
   state.datasets = result.datasets;
   state.activeDataset = state.datasets.find((dataset) => dataset.active) || null;
   if (!state.visibleDatasetIdsInitialized) {
-    state.visibleDatasetIds = new Set(state.datasets.map((dataset) => dataset.id));
+    state.visibleDatasetIds = new Set(
+      state.datasets.filter((dataset) => dataset.active).map((dataset) => dataset.id)
+    );
     state.visibleDatasetIdsInitialized = true;
   }
   renderDatasets();
