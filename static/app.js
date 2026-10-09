@@ -420,6 +420,11 @@ async function importDataset(file) {
   setImportStatus(`正在导入“${file.name}”，请稍候...`);
   try {
     const extension = file.name.toLowerCase().split(".").pop();
+    if (["prj", "cpg", "shx", "dbf"].includes(extension)) {
+      throw new Error(
+        `“${file.name}”是 Shapefile 配套文件，不能单独导入；请与同名的 .shp/.shx/.dbf 成套选择（.prj/.cpg 可选）`
+      );
+    }
     const isBinary = extension === "zip" || extension === "shp";
     const content = isBinary
       ? arrayBufferToBase64(await file.arrayBuffer())

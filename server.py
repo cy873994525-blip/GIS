@@ -1061,6 +1061,11 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     source_format = "Shapefile"
                     source_note = f"从 {shp_name} 转换为 GeoJSON"
                 else:
+                    if suffix in {".prj", ".cpg", ".shx", ".dbf"}:
+                        raise ValueError(
+                            f"{suffix} 是 Shapefile 配套文件，不能单独导入；"
+                            "请与同名的 .shp/.shx/.dbf 成套上传（.prj/.cpg 可选）"
+                        )
                     if suffix not in {".geojson", ".json"}:
                         raise ValueError("only .geojson, .json, or Shapefile .zip files are supported")
                     geojson = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
