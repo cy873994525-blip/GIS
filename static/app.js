@@ -15,6 +15,8 @@ const state = {
   data: { type: "FeatureCollection", features: [] },
   datasets: [],
   activeDataset: null,
+  visibleDatasetIds: new Set(),
+  visibleDatasetIdsInitialized: false,
   visibleLayers: new Set(),
   selectedIds: new Set(),
   mode: "pan",
@@ -173,7 +175,10 @@ function isGeographicDataset() {
   if (![bounds.minX, bounds.minY, bounds.maxX, bounds.maxY].every(Number.isFinite)) return false;
   if (bounds.minX < -180 || bounds.maxX > 180 ||
       bounds.minY < -MAX_MERCATOR_LAT || bounds.maxY > MAX_MERCATOR_LAT) return false;
-  const crs = state.activeDataset?.crs || "Unknown";
+  const crsList = state.datasets
+    .filter((dataset) => state.visibleDatasetIds.has(dataset.id))
+    .map((dataset) => dataset.crs || "Unknown");
+  const crs = crsList.length ? crsList.join(" ") : "Unknown";
   return crs === "Unknown" || /WGS[ _]?84|EPSG:?4326|CRS:?84/i.test(crs);
 }
 
@@ -307,6 +312,24 @@ function renderDatasets() {
 
     const actions = document.createElement("div");
     actions.className = "dataset-actions";
+
+    const showLabel = document.createElement("label");
+    showLabel.className = "dataset-show";
+    showLabel.title = "在地图上显示/隐藏这个数据集";
+    const showCheck = document.createElement("input");
+    showCheck.type = "checkbox";
+    showCheck.checked = state.visibleDatasetIds.has(dataset.id);
+    showCheck.addEventListener("change", async () => {
+      if (showCheck.checked) {
+        state.visibleDatasetIds.add(dataset.id);
+      } else {
+        state.visibleDatasetIds.delete(dataset.id);
+      }
+      await loadData();
+      fitView();
+    });
+    showLabel.append(showCheck, document.createTextNode("显示"));
+
     const button = document.createElement("button");
     button.className = "dataset-switch";
     button.type = "button";
@@ -321,7 +344,7 @@ function renderDatasets() {
     deleteButton.title = dataset.active ? "当前数据集不能删除" : "删除这个数据集";
     deleteButton.disabled = dataset.active;
     deleteButton.addEventListener("click", () => deleteDataset(dataset));
-    actions.append(button, deleteButton);
+    actions.append(showLabel, button, deleteButton);
     row.append(info, actions);
     list.appendChild(row);
   }
@@ -354,11 +377,17 @@ async function loadDatasets() {
   const result = await api("/api/datasets");
   state.datasets = result.datasets;
   state.activeDataset = state.datasets.find((dataset) => dataset.active) || null;
+  if (!state.visibleDatasetIdsInitialized) {
+    state.visibleDatasetIds = new Set(state.datasets.map((dataset) => dataset.id));
+    state.visibleDatasetIdsInitialized = true;
+  }
   renderDatasets();
 }
 
 async function loadData() {
-  state.data = await api("/api/layers");
+  const ids = [...state.visibleDatasetIds];
+  const query = ids.length ? `?ids=${encodeURIComponent(ids.join(","))}` : "";
+  state.data = await api(`/api/layers${query}`);
   state.geographic = false;
   const layers = new Set(state.data.features.map((f) => f.properties.layer || "未命名"));
   state.visibleLayers = layers;
@@ -388,6 +417,7 @@ async function activateDataset(datasetId) {
   try {
     await api(`/api/datasets/${encodeURIComponent(datasetId)}/activate`, { method: "POST" });
     state.selectedIds.clear();
+    state.visibleDatasetIds.add(datasetId);
     await Promise.all([loadDatasets(), loadData(), loadStatus()]);
     syncMapMode();
     fitView();
@@ -402,7 +432,8 @@ async function deleteDataset(dataset) {
   if (!window.confirm(`确定删除数据集“${dataset.name}”吗？`)) return;
   try {
     await api(`/api/datasets/${encodeURIComponent(dataset.id)}`, { method: "DELETE" });
-    await Promise.all([loadDatasets(), loadStatus()]);
+    state.visibleDatasetIds.delete(dataset.id);
+    await Promise.all([loadDatasets(), loadData(), loadStatus()]);
     setNotice(`已删除数据集“${dataset.name}”。`);
   } catch (error) {
     setNotice(`删除数据集失败：${error.message}`);
@@ -459,6 +490,7 @@ async function importDataset(file) {
     syncMapMode();
     fitView();
     const imported = result.dataset;
+    state.visibleDatasetIds.add(imported.id);
     setNotice(`已导入“${file.name}”，后端已登记文件元数据。`);
     setImportStatus(
       `导入成功：${imported.feature_count} 个要素，${imported.format || "GeoJSON"}。`,

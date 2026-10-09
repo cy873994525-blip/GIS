@@ -263,7 +263,26 @@ select {
 .dataset-actions {
   display: flex;
   flex: 0 0 auto;
+  align-items: center;
   gap: 4px;
+}
+
+.dataset-show {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.dataset-show input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: #2e7d74;
+  cursor: pointer;
 }
 
 .dataset-switch {

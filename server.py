@@ -8,7 +8,13 @@
 #   2. 补全 Shapefile 几何类型：支持 PointZ/PolyLineZ/PolygonZ/PointM/
 #      PolyLineM/PolygonM 并保留 Z 坐标，MultiPoint 给出明确报错；
 #   3. Polygon 洞结构保真：按环的包含关系保留内环（洞），输出标准 GeoJSON；
-#   4. 配套前端 static/app.js 多边形渲染支持洞环（evenodd 挖空）。
+#   4. 配套前端 static/app.js 多边形渲染支持洞环（evenodd 挖空）；
+#   5. T1 投影坐标转换：可选依赖 pyproj，导入时自动把投影坐标系要素转换为
+#      WGS 84 经纬度（crs/crs_kind/source_note 同步更新，可叠加在线底图），
+#      未安装 pyproj 或识别失败时安全降级为平面显示；
+#   6. 多图层叠加：/api/layers 支持 ?ids= 合并多个数据集（要素 layer 覆盖为
+#      数据集名、保留 dataset_id），配套 .prj/.cpg/.shx/.dbf 单独导入给出
+#      明确提示。
 # =============================================================================
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -23,7 +29,7 @@ import struct
 import uuid
 import zipfile
 import base64
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 # 兼容层：str.removeprefix / str.removesuffix 是 Python 3.9 才有的，
@@ -883,6 +889,26 @@ def read_geojson():
     return read_dataset()[1]
 
 
+def read_layers(dataset_ids):
+    """读取多个数据集并合并为一个图层集合。
+
+    每个要素的 properties.layer 覆盖为所在数据集名称（前端按 layer 分组
+    显示/隐藏），并保留 dataset_id 便于溯源。
+    """
+    features = []
+    for dataset_id in dataset_ids:
+        dataset, payload = read_dataset(dataset_id)
+        layer_name = dataset.get("name") or dataset.get("file_name") or dataset_id
+        for feature in payload.get("features", []):
+            item = dict(feature)
+            props = dict(item.get("properties") or {})
+            props["layer"] = layer_name
+            props["dataset_id"] = dataset_id
+            item["properties"] = props
+            features.append(item)
+    return {"type": "FeatureCollection", "features": features}
+
+
 class GisDemoHandler(SimpleHTTPRequestHandler):
     server_version = "GisVectorDemo/0.3"
 
@@ -922,7 +948,12 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/api/layers":
-            self.send_json(read_geojson())
+            query = parse_qs(urlsplit(self.path).query)
+            ids = [item for item in (query.get("ids") or [""])[0].split(",") if item]
+            if ids:
+                self.send_json(read_layers(ids))
+            else:
+                self.send_json(read_geojson())
             return
 
         if path == "/api/export":
