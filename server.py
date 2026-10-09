@@ -40,6 +40,16 @@ def remove_suffix(text, suffix):
     return text
 
 
+# pyproj 为可选依赖：安装后导入投影 Shapefile 时会自动把投影坐标转换为
+# WGS 84 经纬度，从而可以叠加在线底图；未安装时保持平面坐标显示。
+try:
+    from pyproj import Transformer
+
+    HAS_PYPROJ = True
+except ImportError:  # pragma: no cover - 未安装 pyproj 的环境
+    HAS_PYPROJ = False
+
+
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 DATA_DIR = ROOT / "data"
@@ -399,6 +409,83 @@ def parse_prj_crs(wkt):
     return (name or "Unknown"), kind, epsg
 
 
+def extract_epsg_from_label(label):
+    """从坐标系名称（如 “CGCS2000 … (EPSG:4540)”）里提取 EPSG 编号，无则返回 None。"""
+    if not label:
+        return None
+    match = re.search(r"EPSG[:_]?(\d+)", label)
+    return match.group(1) if match else None
+
+
+def build_projection_transformer(crs_wkt, epsg):
+    """构造 源投影坐标系 → WGS 84(EPSG:4326) 的转换器。
+
+    优先使用 .prj 的原始 WKT（忠实于文件里的投影参数），WKT 不可用时退回
+    EPSG 编号。返回 (transformer, source) 或 (None, None)。
+    """
+    source = None
+    if crs_wkt and "PROJCS" in crs_wkt:
+        source = crs_wkt
+    elif epsg:
+        source = f"EPSG:{epsg}"
+    if not source or not HAS_PYPROJ:
+        return None, None
+    try:
+        transformer = Transformer.from_crs(source, "EPSG:4326", always_xy=True)
+    except Exception:
+        return None, None
+    return transformer, source
+
+
+def transform_position(position, transformer):
+    x, y = position[0], position[1]
+    try:
+        lon, lat = transformer.transform(x, y)
+    except Exception:
+        return position
+    if not (math.isfinite(lon) and math.isfinite(lat)):
+        return position  # 超出投影有效范围的点保留原值
+    result = [lon, lat]
+    if len(position) > 2:
+        result.extend(position[2:])  # 保留 Z 等附加维度
+    return result
+
+
+def transform_coordinates(coordinates, transformer):
+    """递归转换 GeoJSON coordinates（点 / 线 / 面 / 多面共用）。"""
+    if (
+        isinstance(coordinates, list)
+        and len(coordinates) >= 2
+        and all(isinstance(item, (int, float)) for item in coordinates[:2])
+    ):
+        return transform_position(coordinates, transformer)
+    if isinstance(coordinates, list):
+        return [transform_coordinates(child, transformer) for child in coordinates]
+    return coordinates
+
+
+def project_geojson_to_wgs84(payload, crs_wkt, epsg, source_desc):
+    """把投影坐标系的要素集合统一转换到 WGS 84 经纬度。
+
+    成功返回 (converted_payload, crs_label)，其中 crs_label 形如
+    “WGS 84（已从 … 投影坐标转换）”；转换不可用或失败返回 (None, None)。
+    """
+    if not HAS_PYPROJ:
+        return None, None
+    transformer, _source = build_projection_transformer(crs_wkt, epsg)
+    if transformer is None:
+        return None, None
+    try:
+        for feature in payload.get("features", []):
+            geometry = feature.get("geometry") or {}
+            if isinstance(geometry.get("coordinates"), list):
+                geometry["coordinates"] = transform_coordinates(geometry["coordinates"], transformer)
+    except Exception:
+        return None, None
+    source_label = source_desc or "投影坐标"
+    return payload, f"WGS 84（已从 {source_label} 投影坐标转换）"
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -653,10 +740,11 @@ def convert_shapefile_zip(file_name, zip_bytes):
         prj_item = matching.get(".prj")
         crs_name = None
         crs_kind = "unknown"
+        crs_wkt = None
         if prj_item:
-            crs_text = archive.read(prj_item).decode("utf-8", errors="replace")
-            crs_name, crs_kind, _epsg = parse_prj_crs(crs_text)
-        return payload, crs_name, Path(shp_item.filename).name, "Shapefile", crs_kind
+            crs_wkt = archive.read(prj_item).decode("utf-8", errors="replace")
+            crs_name, crs_kind, _epsg = parse_prj_crs(crs_wkt)
+        return payload, crs_name, Path(shp_item.filename).name, "Shapefile", crs_kind, crs_wkt
 
 
 def convert_shapefile_parts(file_name, main_bytes, sidecars):
@@ -679,10 +767,11 @@ def convert_shapefile_parts(file_name, main_bytes, sidecars):
     payload = normalise_feature_collection({"type": "FeatureCollection", "features": features})
     crs_name = None
     crs_kind = "unknown"
+    crs_wkt = None
     if ".prj" in files:
-        crs_text = files[".prj"].decode("utf-8", errors="replace")
-        crs_name, crs_kind, _epsg = parse_prj_crs(crs_text)
-    return payload, crs_name, f"{base_name}.shp", crs_kind
+        crs_wkt = files[".prj"].decode("utf-8", errors="replace")
+        crs_name, crs_kind, _epsg = parse_prj_crs(crs_wkt)
+    return payload, crs_name, f"{base_name}.shp", crs_kind, crs_wkt
 
 
 def write_json_atomic(path, payload):
@@ -932,6 +1021,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                 source_format = "GeoJSON"
                 crs_name = None
                 crs_kind = "unknown"
+                crs_wkt = None
                 source_note = "JSON 文件直接存储"
                 if suffix == ".zip":
                     try:
@@ -940,7 +1030,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                         raise ValueError("invalid base64 Shapefile ZIP content") from exc
                     if len(zip_bytes) > MAX_IMPORT_BYTES:
                         raise ValueError(f"Shapefile ZIP cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
-                    geojson, crs_name, source_name, source_format, crs_kind = convert_shapefile_zip(
+                    geojson, crs_name, source_name, source_format, crs_kind, crs_wkt = convert_shapefile_zip(
                         original_name, zip_bytes
                     )
                     source_note = f"从 ZIP 内的 {source_name} 读取并转换为 GeoJSON"
@@ -961,7 +1051,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                                     f"Shapefile component cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB"
                                 )
                             sidecars[sidecar_name] = sidecar_content
-                        geojson, crs_name, shp_name, crs_kind = convert_shapefile_parts(
+                        geojson, crs_name, shp_name, crs_kind, crs_wkt = convert_shapefile_parts(
                             original_name,
                             main_bytes,
                             sidecars,
@@ -976,15 +1066,30 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     geojson = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
                     geojson = normalise_feature_collection(geojson)
 
+                if crs_kind == "projected":
+                    converted, converted_crs = project_geojson_to_wgs84(
+                        geojson,
+                        crs_wkt,
+                        extract_epsg_from_label(crs_name),
+                        crs_name,
+                    )
+                    if converted is not None:
+                        geojson = converted
+                        crs_kind = "geographic"
+                        crs_name = converted_crs
+                        source_note = (
+                            f"{source_note}；已从投影坐标自动转换为 WGS 84 经纬度，可叠加在线底图"
+                        )
+                    else:
+                        source_note = (
+                            f"{source_note}；检测为投影坐标系，但自动转换不可用"
+                            "（未安装 pyproj 或无法识别源坐标系），当前以平面坐标显示"
+                        )
+
                 dataset_id = f"ds-{uuid.uuid4().hex[:10]}"
                 stored_name = f"{dataset_id}.geojson"
                 target = UPLOAD_DIR / stored_name
                 write_json_atomic(target, geojson)
-                if crs_kind == "projected":
-                    source_note = (
-                        f"{source_note}；检测为投影坐标系，当前以平面坐标显示，"
-                        "如需叠加在线底图需先进行投影转换"
-                    )
                 imported = dataset_summary(
                     dataset_id,
                     original_name,
