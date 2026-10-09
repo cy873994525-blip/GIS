@@ -1303,15 +1303,17 @@ function drawFeature(feature) {
   }
 
   if (geom.type === "Polygon") {
-    drawPath(geom.coordinates[0], true);
-    ctx.fill();
+    ctx.beginPath();
+    for (const ring of geom.coordinates) drawRingPath(ring);
+    ctx.fill("evenodd");
     ctx.stroke();
   }
 
   if (geom.type === "MultiPolygon") {
     for (const polygon of geom.coordinates) {
-      drawPath(polygon[0], true);
-      ctx.fill();
+      ctx.beginPath();
+      for (const ring of polygon) drawRingPath(ring);
+      ctx.fill("evenodd");
       ctx.stroke();
     }
   }
@@ -1330,6 +1332,20 @@ function drawPath(coords, closed) {
     }
   });
   if (closed) ctx.closePath();
+}
+
+// 追加一个闭合环到当前 path（调用方需已 beginPath）。外环与洞环画在同一个
+// path 里，配合 fill("evenodd") 才能把洞真正挖空；无洞数据行为与原来一致。
+function drawRingPath(ring) {
+  ring.forEach((coord, index) => {
+    const p = worldToScreen(coord);
+    if (index === 0) {
+      ctx.moveTo(p.x, p.y);
+    } else {
+      ctx.lineTo(p.x, p.y);
+    }
+  });
+  ctx.closePath();
 }
 
 function drawDraft() {

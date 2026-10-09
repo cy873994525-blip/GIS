@@ -66,7 +66,7 @@ http://127.0.0.1:8000
 
 前端的数据文件面板支持查看文件大小、来源格式、几何类型、bbox 和坐标系提示，并可切换或删除非当前数据集。
 
-这部分已经形成“文件导入 → 格式校验/转换 → 元数据登记 → 数据集切换 → 地图读取 → 文件管理”的后端闭环。当前 `.prj` 只做坐标系提示，还没有进行 Albers 等投影到经纬度的坐标转换；下一步可以继续扩展完整的 CRS/EPSG 转换、复杂 Polygon 洞结构和数据库存储。
+这部分已经形成“文件导入 → 格式校验/转换 → 元数据登记 → 数据集切换 → 地图读取 → 文件管理”的后端闭环。当前已增强 `.prj` 识别（区分地理/投影坐标系并提取规范名称与 EPSG），并保留 Polygon 洞结构（内环）；还没有进行 Albers 等投影坐标到经纬度的完整坐标转换；下一步可以继续扩展完整的 CRS/EPSG 转换和数据库存储。
 
 ### A 组本次工作详细记录
 
@@ -146,7 +146,43 @@ Y 范围约为 2367106 至 6385320
 
 本次 A 组主要完成了后端文件数据模块的扩展和联调。首先完善了 GeoJSON/JSON 文件的校验、存储、数据集登记和切换功能；然后新增了 Shapefile ZIP 以及 `.shp/.shx/.dbf/.prj/.cpg` 成套文件的导入能力，后端能够解析几何、属性、编码和坐标系信息，并统一转换为 GeoJSON 供前端地图使用。针对真实省级行政区数据测试中出现的地图空白问题，我们进一步定位到投影坐标数值较大导致原有缩放范围不适配，并修改了全图缩放逻辑。最终，真实的 34 个省级行政区要素能够成功导入、登记、切换并在地图上显示。
 
-目前 A 组还可以继续扩展的方向包括：完整的 CRS/EPSG 投影转换、Polygon 洞结构的严格处理、更多 Shapefile 几何类型、数据库/PostGIS 存储，以及更完整的属性字段编辑能力。
+目前 A 组还可以继续扩展的方向包括：完整的 CRS/EPSG 投影坐标转换、数据库/PostGIS 存储、MultiPoint 图层支持，以及更完整的属性字段编辑能力。
+
+### A 组本次补充记录（2026-10-09）
+
+在既有文件数据模块基础上，本次补齐了三个之前留作扩展的方向，并保持“只使用 Python 标准库、GeoJSON/JSON 与 Shapefile 统一转 GeoJSON”的设计不变。
+
+#### 1. 增强 `.prj` / CRS 识别
+
+原先 `.prj` 只粗略判断是否含 “WGS 84”，其余一律标记为 “PRJ attached”。本次新增 `parse_prj_crs()`：
+
+- 解析 WKT，区分**地理坐标系（GEOGCS，经纬度）**与**投影坐标系（PROJCS，米制）**；
+- 提取规范坐标系名称（如 `CGCS2000 / 3-degree Gauss-Kruger CM 114E`）与可选的 `AUTHORITY["EPSG","nnnn"]` 编号；
+- 识别常见基准（WGS 84、Beijing 1954、Xian 1980、CGCS2000 等）；
+- 数据集元数据新增 `crs_kind` 字段（`geographic` / `projected` / `unknown`）；
+- 对投影坐标系，导入提示会注明“当前以平面坐标显示，如需叠加在线底图需先进行投影转换”，避免误以为已与底图对齐。
+
+#### 2. 补全 Shapefile 几何类型与 Z 坐标
+
+原先仅支持 Point(1)、PolyLine(3)、Polygon(5)，而声明类型检查却接受 MultiPoint/Z 类型，解析会报 “unsupported”。本次：
+
+- 支持 Z/M 变体：PointZ(11)、PolyLineZ(13)、PolygonZ(15)、PointM(21)、PolyLineM(23)、PolygonM(25)；Z 类型把第三维 Z 保留到坐标 `[x, y, z]`（前端仍只取前两维，行为不变），M 值在 GeoJSON 中无对应语义、按规范忽略；
+- 声明类型与记录类型检查统一为 `SUPPORTED_SHAPE_TYPES`，不再出现“声明接受但解析拒绝”的不一致；
+- MultiPoint(8/18/28) 因前端暂不渲染多点要素，给出明确的友好报错（提示先转为点/线），而非含糊的 “unsupported”。
+
+#### 3. Polygon 洞结构保真
+
+原先把 Polygon 记录里的多个环扁平化成独立的 MultiPolygon 部分，内环（洞）结构丢失。本次新增 `_polygon_from_rings()`，按“环的包含关系 + 面积”还原拓扑：
+
+- 面积最大的环作为外环，被外环包含的较小环作为该外环的**洞（内环）**；
+- 输出标准 GeoJSON：单个外环 → `Polygon(外环, 洞环…)`，多个相互分离的外环 → `MultiPolygon`；
+- 配套调整前端多边形渲染：把外环与所有洞环画到同一个 Canvas path，用 `fill("evenodd")` 真正把洞挖空；无洞数据渲染结果与之前完全一致。
+
+#### 4. 本次验证结果
+
+- `python -m py_compile server.py`、`node --check static/app.js`、`git diff --check` 均通过；
+- 自测脚本 8/8：`.prj` 地理/投影/EPSG 识别、空 `.prj`、带洞 Polygon 保留内环、PointZ 保留 Z、MultiPoint 友好报错、样例 Point ZIP 回归；
+- 端到端（启动 `server.py`，通过 `/api/datasets/import` 导入“带洞 Polygon + CGCS2000 投影 `.prj`”的 ZIP）8/8：导入成功、`format=Shapefile`、`feature_count=1`、`geometry_types=[Polygon]`、`crs_kind=projected`、crs 名称含 CGCS2000、导入后 GeoJSON 保留 2 个环（外环+洞）。
 
 ## C 组：交互编辑、属性与地图展示模块
 

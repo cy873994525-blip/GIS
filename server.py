@@ -1,9 +1,22 @@
+# =============================================================================
+# GIS 矢量数据编辑 Demo —— 后端（A 组）
+# A 组职责：GeoJSON / Shapefile 文件数据模块与 API 基础框架
+#
+# 2026-10-09 完善记录（A 组）：
+#   1. 增强 .prj/CRS 识别：区分地理/投影坐标系（GEOGCS/PROJCS），提取规范
+#      坐标系名称与 EPSG 编号，数据集元数据新增 crs_kind 字段；
+#   2. 补全 Shapefile 几何类型：支持 PointZ/PolyLineZ/PolygonZ/PointM/
+#      PolyLineM/PolygonM 并保留 Z 坐标，MultiPoint 给出明确报错；
+#   3. Polygon 洞结构保真：按环的包含关系保留内环（洞），输出标准 GeoJSON；
+#   4. 配套前端 static/app.js 多边形渲染支持洞环（evenodd 挖空）。
+# =============================================================================
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import json
 import math
 import mimetypes
+import re
 import io
 import sys
 import struct
@@ -223,6 +236,7 @@ def dataset_summary(
     source_format="GeoJSON",
     crs_name=None,
     source_note=None,
+    crs_kind="unknown",
 ):
     validate_feature_collection(payload)
     geometry_types = sorted(
@@ -243,6 +257,7 @@ def dataset_summary(
         "created_at": created_at or utc_now(),
         "path": path_name,
         "crs": crs_name or "Unknown",
+        "crs_kind": crs_kind,
         "source_note": source_note or "坐标系未提供",
     }
 
@@ -316,11 +331,163 @@ def read_dbf_records(dbf_bytes, encoding="utf-8"):
     return records
 
 
+# ---------------------------------------------------------------------------
+# .prj / CRS 识别
+# ---------------------------------------------------------------------------
+# 常见地理坐标系（GEOGCS）的地图基准名称，用于把 .prj 里的 DATUM 名称翻译成
+# 便于展示的规范名称。
+GEOGCS_ALIASES = {
+    "WGS_1984": "WGS 84",
+    "WGS84": "WGS 84",
+    "D_WGS_1984": "WGS 84",
+    "D_WGS84": "WGS 84",
+    "D_Beijing_1954": "Beijing 1954",
+    "Beijing_1954": "Beijing 1954",
+    "D_Xian_1980": "Xian 1980",
+    "Xian_1980": "Xian 1980",
+    "D_China_2000": "CGCS2000",
+    "China_2000": "CGCS2000",
+    "D_North_American_1983": "North American Datum 1983",
+    "NAD83": "North American Datum 1983",
+    "D_North_American_1927": "North American Datum 1927",
+    "D_ETRS_1989": "ETRS89",
+    "D_OSGB_1936": "OSGB 1936",
+}
+
+
+def parse_prj_crs(wkt):
+    """解析 .prj 的 WKT 文本，返回 (crs_name, crs_kind, epsg)。
+
+    crs_kind 取值为 "geographic"（经纬度）、"projected"（投影坐标）或
+    "unknown"。crs_name 尽量给出规范名称；epsg 为可选的 AUTHORITY 编号。
+    """
+    if not wkt:
+        return "Unknown", "unknown", None
+    compact = "".join(wkt.split())
+    epsg = None
+    epsg_match = re.search(r'AUTHORITY\["EPSG"\s*,\s*"(\d+)"\]', compact)
+    if epsg_match:
+        epsg = epsg_match.group(1)
+
+    kind = "unknown"
+    if "PROJCS" in compact:
+        kind = "projected"
+    elif "GEOGCS" in compact:
+        kind = "geographic"
+
+    # 主名称与内部基准：在保留空格的原始 WKT 上匹配（坐标系名称常含空格，
+    # 如 "WGS 84"；compact 只用于关键字判断与 EPSG 提取）。
+    name = None
+    name_match = re.match(r'^(?:PROJCS|GEOGCS)\s*\[\s*"([^"]+)"', wkt)
+    if name_match:
+        name = name_match.group(1)
+
+    datum = None
+    for pattern in (r'GEOGCS\s*\[\s*"([^"]+)"', r'DATUM\s*\[\s*"([^"]+)"'):
+        datum_match = re.search(pattern, wkt)
+        if datum_match:
+            datum = datum_match.group(1)
+    if datum:
+        datum = GEOGCS_ALIASES.get(datum, datum)
+
+    if not name and datum:
+        name = datum
+    if epsg and name and epsg not in name:
+        name = f"{name} (EPSG:{epsg})"
+    elif epsg and not name:
+        name = f"EPSG:{epsg}"
+    return (name or "Unknown"), kind, epsg
+
+
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Shapefile 几何类型
+# ---------------------------------------------------------------------------
+# record_type / 声明类型 → 基础 GeoJSON 几何类型。Z 变体（11/13/15）额外携带
+# 第三维 Z，M 变体（21/23/25）的 measure 值在 GeoJSON 中没有对应语义，忽略。
+SHAPE_BASE_TYPE = {
+    1: "Point",
+    3: "LineString",
+    5: "Polygon",
+    11: "Point",
+    13: "LineString",
+    15: "Polygon",
+    21: "Point",
+    23: "LineString",
+    25: "Polygon",
+}
+SUPPORTED_SHAPE_TYPES = set(SHAPE_BASE_TYPE)
+MULTIPOINT_TYPES = {8, 18, 28}  # MultiPoint / MultiPointZ / MultiPointM（暂不支持渲染）
+
+
+def ring_signed_area(ring):
+    """鞋带公式计算环的有符号面积；绝对值为面积，符号指示环绕方向。"""
+    area = 0.0
+    n = len(ring)
+    for index in range(n):
+        x1, y1 = ring[index][0], ring[index][1]
+        x2, y2 = ring[(index + 1) % n][0], ring[(index + 1) % n][1]
+        area += x1 * y2 - x2 * y1
+    return area / 2.0
+
+
+def point_in_ring(point, ring):
+    """射线法判断点是否在（闭合）环内部。"""
+    x, y = point[0], point[1]
+    inside = False
+    n = len(ring)
+    for index in range(n):
+        x1, y1 = ring[index][0], ring[index][1]
+        x2, y2 = ring[(index + 1) % n][0], ring[(index + 1) % n][1]
+        if (y1 > y) != (y2 > y):
+            hit_x = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+            if x < hit_x:
+                inside = not inside
+    return inside
+
+
+def _polygon_from_rings(rings):
+    """把一组闭合环组装成标准 GeoJSON Polygon/MultiPolygon，保留洞（内环）。
+
+    Shapefile 一个 Polygon 记录里的多个 parts，既可能是外环+洞环（内环），
+    也可能是多个相互分离的外环。这里按「环的包含关系」还原：面积最大的环
+    作为外环，被外环包含的较小环作为该外环的洞。这样导入后洞结构不再被
+    扁平化成独立多边形，前端可正确挖空显示。
+    """
+    if not rings:
+        raise ValueError("polygon geometry requires at least one ring")
+    ordered = sorted(rings, key=lambda ring: -abs(ring_signed_area(ring)))
+    polygons = []  # 每个元素: {"outer": 外环, "holes": [洞环, ...]}
+    for ring in ordered:
+        sample = ring[0]
+        target = None
+        for poly in polygons:
+            if point_in_ring(sample, poly["outer"]):
+                if target is None or abs(ring_signed_area(poly["outer"])) < abs(
+                    ring_signed_area(target["outer"])
+                ):
+                    target = poly
+        if target is None:
+            polygons.append({"outer": ring, "holes": []})
+        else:
+            target["holes"].append(ring)
+    if len(polygons) == 1:
+        poly = polygons[0]
+        return {"type": "Polygon", "coordinates": [poly["outer"]] + poly["holes"]}
+    return {
+        "type": "MultiPolygon",
+        "coordinates": [[poly["outer"]] + poly["holes"] for poly in polygons],
+    }
+
+
 def split_shape_parts(parts, points):
     result = []
     for index, start in enumerate(parts):
         end = parts[index + 1] if index + 1 < len(parts) else len(points)
-        result.append([[float(x), float(y)] for x, y in points[start:end]])
+        # list(point) 会保留 [x, y] 或 [x, y, z] 的完整坐标（Z 类型时）。
+        result.append([list(point) for point in points[start:end]])
     return result
 
 
@@ -328,6 +495,12 @@ def read_shp_records(shp_bytes):
     if len(shp_bytes) < 100:
         raise ValueError("SHP file is too short")
     declared_type = struct.unpack_from("<i", shp_bytes, 32)[0]
+    if declared_type in MULTIPOINT_TYPES:
+        raise ValueError(
+            "当前 Demo 暂不支持 MultiPoint 图层；请在 GIS 软件中把多点要素转为点/线后重新导出"
+        )
+    if declared_type not in SUPPORTED_SHAPE_TYPES:
+        raise ValueError(f"unsupported Shapefile geometry type: {declared_type}")
     features = []
     offset = 100
     while offset < len(shp_bytes):
@@ -343,10 +516,22 @@ def read_shp_records(shp_bytes):
             features.append(None)
             offset = content_end
             continue
-        if record_type == 1:
+        if record_type not in SUPPORTED_SHAPE_TYPES:
+            raise ValueError(f"unsupported Shapefile geometry type: {record_type}")
+        has_z = record_type in {11, 13, 15}
+        if record_type in {1, 11, 21}:
+            # Point / PointZ / PointM
             x, y = struct.unpack_from("<dd", shp_bytes, content_start + 4)
-            geometry = {"type": "Point", "coordinates": [x, y]}
-        elif record_type in {3, 5}:
+            coordinates = [x, y]
+            if has_z:
+                if content_start + 28 > content_end:
+                    raise ValueError(f"SHP record {record_number} is truncated")
+                z, = struct.unpack_from("<d", shp_bytes, content_start + 20)
+                coordinates.append(z)
+            geometry = {"type": "Point", "coordinates": coordinates}
+        elif record_type in {3, 5, 13, 15, 23, 25}:
+            # PolyLine / Polygon（及 Z/M 变体）：几何头布局相同，
+            # Z 类型的 Z 数组位于点数组之后。
             if content_start + 44 > content_end:
                 raise ValueError(f"SHP record {record_number} has an invalid header")
             part_count, point_count = struct.unpack_from("<ii", shp_bytes, content_start + 36)
@@ -366,8 +551,18 @@ def read_shp_records(shp_bytes):
                 struct.unpack_from("<dd", shp_bytes, points_offset + point_index * 16)
                 for point_index in range(point_count)
             ]
+            if has_z:
+                z_array_start = expected_end + 16  # 跳过 zmin/zmax
+                z_array_end = z_array_start + point_count * 8
+                if z_array_end > content_end:
+                    raise ValueError(f"SHP record {record_number} Z data is truncated")
+                z_values = [
+                    struct.unpack_from("<d", shp_bytes, z_array_start + point_index * 8)[0]
+                    for point_index in range(point_count)
+                ]
+                points = [(x, y, z) for (x, y), z in zip(points, z_values)]
             components = split_shape_parts(parts, points)
-            if record_type == 3:
+            if SHAPE_BASE_TYPE[record_type] == "LineString":
                 geometry = {
                     "type": "LineString" if len(components) == 1 else "MultiLineString",
                     "coordinates": components[0] if len(components) == 1 else components,
@@ -379,17 +574,13 @@ def read_shp_records(shp_bytes):
                 for ring in rings:
                     if ring[0] != ring[-1]:
                         ring.append(ring[0][:])
-                # The simple renderer and demo store rings as independent polygon parts.
-                geometry = {
-                    "type": "Polygon" if len(rings) == 1 else "MultiPolygon",
-                    "coordinates": rings if len(rings) == 1 else [[ring] for ring in rings],
-                }
+                # 先按环的闭合形状组装几何；洞结构（内环）由 build_polygon_geometry
+                # 在 Polygon 层面进一步处理。
+                geometry = _polygon_from_rings(rings)
         else:
             raise ValueError(f"unsupported Shapefile geometry type: {record_type}")
         features.append({"type": "Feature", "geometry": geometry, "properties": {}})
         offset = content_end
-    if declared_type not in {1, 3, 5, 8, 11, 13, 15, 18}:
-        raise ValueError(f"unsupported Shapefile geometry type: {declared_type}")
     return declared_type, features
 
 
@@ -444,8 +635,8 @@ def convert_shapefile_zip(file_name, zip_bytes):
             if Path(item.filename).stem.lower() == stem
         }
         shp_type, raw_features = read_shp_records(archive.read(shp_item))
-        if shp_type not in {1, 3, 5}:
-            raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles")
+        if shp_type not in SUPPORTED_SHAPE_TYPES:
+            raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles (incl. Z/M)")
         dbf_encoding = "utf-8"
         if matching.get(".cpg"):
             dbf_encoding = read_cpg_encoding(archive.read(matching[".cpg"]))
@@ -460,13 +651,12 @@ def convert_shapefile_zip(file_name, zip_bytes):
         features = [feature for feature in raw_features if feature is not None]
         payload = normalise_feature_collection({"type": "FeatureCollection", "features": features})
         prj_item = matching.get(".prj")
-        crs_text = archive.read(prj_item).decode("utf-8", errors="replace") if prj_item else ""
         crs_name = None
-        if crs_text:
-            crs_name = "PRJ attached"
-            if "WGS_1984" in crs_text or "WGS 84" in crs_text:
-                crs_name = "WGS 84 (detected from .prj)"
-        return payload, crs_name, Path(shp_item.filename).name, "Shapefile"
+        crs_kind = "unknown"
+        if prj_item:
+            crs_text = archive.read(prj_item).decode("utf-8", errors="replace")
+            crs_name, crs_kind, _epsg = parse_prj_crs(crs_text)
+        return payload, crs_name, Path(shp_item.filename).name, "Shapefile", crs_kind
 
 
 def convert_shapefile_parts(file_name, main_bytes, sidecars):
@@ -476,8 +666,8 @@ def convert_shapefile_parts(file_name, main_bytes, sidecars):
     if ".shx" not in files or ".dbf" not in files:
         raise ValueError("Shapefile import requires matching .shx and .dbf files")
     shape_type, raw_features = read_shp_records(main_bytes)
-    if shape_type not in {1, 3, 5}:
-        raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles")
+    if shape_type not in SUPPORTED_SHAPE_TYPES:
+        raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles (incl. Z/M)")
     encoding = read_cpg_encoding(files[".cpg"]) if ".cpg" in files else "utf-8"
     dbf_records = read_dbf_records(files[".dbf"], encoding)
     if len(dbf_records) != len(raw_features):
@@ -488,12 +678,11 @@ def convert_shapefile_parts(file_name, main_bytes, sidecars):
     features = [feature for feature in raw_features if feature is not None]
     payload = normalise_feature_collection({"type": "FeatureCollection", "features": features})
     crs_name = None
+    crs_kind = "unknown"
     if ".prj" in files:
         crs_text = files[".prj"].decode("utf-8", errors="replace")
-        crs_name = "PRJ attached"
-        if "WGS_1984" in crs_text or "WGS 84" in crs_text:
-            crs_name = "WGS 84 (detected from .prj)"
-    return payload, crs_name, f"{base_name}.shp"
+        crs_name, crs_kind, _epsg = parse_prj_crs(crs_text)
+    return payload, crs_name, f"{base_name}.shp", crs_kind
 
 
 def write_json_atomic(path, payload):
@@ -742,6 +931,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                 suffix = Path(original_name).suffix.lower()
                 source_format = "GeoJSON"
                 crs_name = None
+                crs_kind = "unknown"
                 source_note = "JSON 文件直接存储"
                 if suffix == ".zip":
                     try:
@@ -750,7 +940,9 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                         raise ValueError("invalid base64 Shapefile ZIP content") from exc
                     if len(zip_bytes) > MAX_IMPORT_BYTES:
                         raise ValueError(f"Shapefile ZIP cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
-                    geojson, crs_name, source_name, source_format = convert_shapefile_zip(original_name, zip_bytes)
+                    geojson, crs_name, source_name, source_format, crs_kind = convert_shapefile_zip(
+                        original_name, zip_bytes
+                    )
                     source_note = f"从 ZIP 内的 {source_name} 读取并转换为 GeoJSON"
                 elif suffix == ".shp":
                     try:
@@ -769,7 +961,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                                     f"Shapefile component cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB"
                                 )
                             sidecars[sidecar_name] = sidecar_content
-                        geojson, crs_name, shp_name = convert_shapefile_parts(
+                        geojson, crs_name, shp_name, crs_kind = convert_shapefile_parts(
                             original_name,
                             main_bytes,
                             sidecars,
@@ -788,6 +980,11 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                 stored_name = f"{dataset_id}.geojson"
                 target = UPLOAD_DIR / stored_name
                 write_json_atomic(target, geojson)
+                if crs_kind == "projected":
+                    source_note = (
+                        f"{source_note}；检测为投影坐标系，当前以平面坐标显示，"
+                        "如需叠加在线底图需先进行投影转换"
+                    )
                 imported = dataset_summary(
                     dataset_id,
                     original_name,
@@ -797,6 +994,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     source_format=source_format,
                     crs_name=crs_name,
                     source_note=source_note,
+                    crs_kind=crs_kind,
                 )
                 catalog = read_catalog()
                 catalog["datasets"].append(imported)
