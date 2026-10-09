@@ -1,0 +1,95 @@
+{
+  "datasets": [
+    {
+      "id": "d9575c63a0",
+      "name": "国界线(WGS84)",
+      "file_name": "国界线(WGS84).shp",
+      "format": "Shapefile",
+      "feature_count": 517,
+      "geometry_types": [
+        "LineString"
+      ],
+      "bbox": [
+        73.498962,
+        3.832541,
+        135.087387,
+        53.558498
+      ],
+      "size_bytes": 1056412,
+      "created_at": "2026-10-09T10:05:17+00:00",
+      "path": "uploads/d9575c63a0.geojson",
+      "crs": "GCS_WGS_1984",
+      "crs_kind": "geographic",
+      "source_note": "方案B（2026-10-09）：由中国_省(WGS84) 省界外轮廓提取生成（shapely 并集外边界，含南海诸岛轮廓），与省界及在线底图完全一致；替代原 Albers 转换国界线（原数据在未定国界区与底图画法存在差异）"
+    },
+    {
+      "id": "be24a7c373",
+      "name": "中国_省(WGS84)",
+      "file_name": "中国_省(WGS84).shp",
+      "format": "Shapefile",
+      "feature_count": 34,
+      "geometry_types": [
+        "MultiPolygon",
+        "Polygon"
+      ],
+      "bbox": [
+        73.498962,
+        3.832541,
+        135.087387,
+        53.558498
+      ],
+      "size_bytes": 1825638,
+      "created_at": "2026-10-09T10:05:18+00:00",
+      "path": "uploads/be24a7c373.geojson",
+      "crs": "GCS_WGS_1984",
+      "crs_kind": "geographic",
+      "source_note": "从 中国_省.shp 转换为 GeoJSON；WGS 84 经纬度，可叠加在线底图"
+    },
+    {
+      "id": "3e2c715212",
+      "name": "省会城市坐标(WGS84)",
+      "file_name": "省会城市坐标(WGS84).geojson",
+      "format": "GeoJSON",
+      "feature_count": 34,
+      "geometry_types": [
+        "Point"
+      ],
+      "bbox": [
+        87.6168,
+        20.0444,
+        126.5349,
+        45.8033
+      ],
+      "size_bytes": 5347,
+      "created_at": "2026-10-09T10:05:18+00:00",
+      "path": "uploads/3e2c715212.geojson",
+      "crs": "WGS 84",
+      "crs_kind": "geographic",
+      "source_note": "34 个省级行政区首府 WGS84 坐标（手写），可直接叠加在线底图"
+    },
+    {
+      "id": "ds-218176081f",
+      "name": "map_demo",
+      "file_name": "map_demo.geojson",
+      "format": "GeoJSON",
+      "feature_count": 4,
+      "geometry_types": [
+        "LineString",
+        "Point",
+        "Polygon"
+      ],
+      "bbox": [
+        116.386,
+        39.901,
+        116.412,
+        39.913
+      ],
+      "size_bytes": 2046,
+      "created_at": "2026-10-09T10:07:29+00:00",
+      "path": "uploads/ds-218176081f.geojson",
+      "crs": "Unknown",
+      "crs_kind": "unknown",
+      "source_note": "JSON 文件直接存储"
+    }
+  ]
+}
