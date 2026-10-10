@@ -1,36 +1,17 @@
-# =============================================================================
-# GIS 矢量数据编辑 Demo —— 后端（A 组 · 陈怡 Chen Yi）
-# A 组职责：GeoJSON / Shapefile 文件数据模块与 API 基础框架
-# 归属：本文件（后端全部逻辑）由 A 组成员陈怡（Chen Yi）负责实现与维护。
-#
-# 2026-10-09 完善记录（A 组）：
-#   1. 增强 .prj/CRS 识别：区分地理/投影坐标系（GEOGCS/PROJCS），提取规范
-#      坐标系名称与 EPSG 编号，数据集元数据新增 crs_kind 字段；
-#   2. 补全 Shapefile 几何类型：支持 PointZ/PolyLineZ/PolygonZ/PointM/
-#      PolyLineM/PolygonM 并保留 Z 坐标，MultiPoint 给出明确报错；
-#   3. Polygon 洞结构保真：按环的包含关系保留内环（洞），输出标准 GeoJSON；
-#   4. 配套前端 static/app.js 多边形渲染支持洞环（evenodd 挖空）；
-#   5. T1 投影坐标转换：可选依赖 pyproj，导入时自动把投影坐标系要素转换为
-#      WGS 84 经纬度（crs/crs_kind/source_note 同步更新，可叠加在线底图），
-#      未安装 pyproj 或识别失败时安全降级为平面显示；
-#   6. 多图层叠加：/api/layers 支持 ?ids= 合并多个数据集（要素 layer 覆盖为
-#      数据集名、保留 dataset_id），配套 .prj/.cpg/.shx/.dbf 单独导入给出
-#      明确提示。
-# =============================================================================
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import json
 import math
 import mimetypes
-import re
 import io
 import sys
 import struct
 import uuid
 import zipfile
 import base64
-from urllib.parse import parse_qs, unquote, urlsplit
+import re
+from urllib.parse import unquote, urlsplit
 
 
 # 兼容层：str.removeprefix / str.removesuffix 是 Python 3.9 才有的，
@@ -45,16 +26,6 @@ def remove_suffix(text, suffix):
     if suffix and text.endswith(suffix):
         return text[: -len(suffix)]
     return text
-
-
-# pyproj 为可选依赖：安装后导入投影 Shapefile 时会自动把投影坐标转换为
-# WGS 84 经纬度，从而可以叠加在线底图；未安装时保持平面坐标显示。
-try:
-    from pyproj import Transformer
-
-    HAS_PYPROJ = True
-except ImportError:  # pragma: no cover - 未安装 pyproj 的环境
-    HAS_PYPROJ = False
 
 
 ROOT = Path(__file__).resolve().parent
@@ -243,6 +214,418 @@ def calculate_bbox(payload):
     ]
 
 
+EARTH_RADIUS_M = 6371008.8
+BUFFER_CIRCLE_STEPS = 48
+
+
+def geometry_positions(geometry):
+    return list(iter_positions((geometry or {}).get("coordinates", [])))
+
+
+def dataset_is_geographic(dataset, payload):
+    bbox = calculate_bbox(payload)
+    if not bbox or bbox[0] < -180 or bbox[2] > 180 or bbox[1] < -90 or bbox[3] > 90:
+        return False
+    crs_name = str(dataset.get("crs") or "Unknown")
+    return crs_name == "Unknown" or bool(re.search(r"WGS[ _]?84|EPSG:?4326|CRS:?84", crs_name, re.I))
+
+
+def map_coordinates(value, transform):
+    if isinstance(value, list) and len(value) >= 2 and all(
+        isinstance(item, (int, float)) for item in value[:2]
+    ):
+        return transform(value)
+    if isinstance(value, list):
+        return [map_coordinates(item, transform) for item in value]
+    raise ValueError("invalid geometry coordinates")
+
+
+def local_projection_center(geometry):
+    positions = geometry_positions(geometry)
+    if not positions:
+        raise ValueError("geometry has no coordinates")
+    longitude = math.radians(sum(point[0] for point in positions) / len(positions))
+    latitude = math.radians(sum(point[1] for point in positions) / len(positions))
+    return longitude, latitude
+
+
+def azimuthal_equidistant_forward(point, center):
+    longitude, latitude = math.radians(point[0]), math.radians(point[1])
+    lon0, lat0 = center
+    delta_lon = longitude - lon0
+    cosine_c = max(-1.0, min(1.0,
+        math.sin(lat0) * math.sin(latitude) +
+        math.cos(lat0) * math.cos(latitude) * math.cos(delta_lon)
+    ))
+    angular_distance = math.acos(cosine_c)
+    if angular_distance < 1e-12:
+        return [0.0, 0.0]
+    sine_c = math.sin(angular_distance)
+    scale = angular_distance / sine_c if abs(sine_c) > 1e-12 else 1.0
+    x = EARTH_RADIUS_M * scale * math.cos(latitude) * math.sin(delta_lon)
+    y = EARTH_RADIUS_M * scale * (
+        math.cos(lat0) * math.sin(latitude) -
+        math.sin(lat0) * math.cos(latitude) * math.cos(delta_lon)
+    )
+    return [x, y]
+
+
+def azimuthal_equidistant_inverse(point, center):
+    x, y = point[:2]
+    lon0, lat0 = center
+    distance = math.hypot(x, y)
+    if distance < 1e-9:
+        return [math.degrees(lon0), math.degrees(lat0)]
+    angular_distance = distance / EARTH_RADIUS_M
+    sine_c, cosine_c = math.sin(angular_distance), math.cos(angular_distance)
+    latitude = math.asin(
+        cosine_c * math.sin(lat0) + y * sine_c * math.cos(lat0) / distance
+    )
+    longitude = lon0 + math.atan2(
+        x * sine_c,
+        distance * math.cos(lat0) * cosine_c - y * math.sin(lat0) * sine_c,
+    )
+    return [math.degrees(longitude), math.degrees(latitude)]
+
+
+def cross_2d(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def subtract_2d(a, b):
+    return [a[0] - b[0], a[1] - b[1]]
+
+
+def unit_vector(a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        raise ValueError("buffer input contains a zero-length segment")
+    return [dx / length, dy / length]
+
+
+def line_intersection(p, direction_a, q, direction_b):
+    denominator = cross_2d(direction_a, direction_b)
+    if abs(denominator) < 1e-10:
+        return [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2]
+    amount = cross_2d(subtract_2d(q, p), direction_b) / denominator
+    return [p[0] + amount * direction_a[0], p[1] + amount * direction_a[1]]
+
+
+def sample_arc(center, start, end, direction, max_step=math.pi / 12, forced_delta=None):
+    start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+    end_angle = math.atan2(end[1] - center[1], end[0] - center[0])
+    if forced_delta is None:
+        delta = (end_angle - start_angle) % (2 * math.pi)
+        if direction < 0:
+            delta = -((start_angle - end_angle) % (2 * math.pi))
+    else:
+        delta = forced_delta
+    radius = math.hypot(start[0] - center[0], start[1] - center[1])
+    steps = max(1, int(math.ceil(abs(delta) / max_step)))
+    return [
+        [center[0] + radius * math.cos(start_angle + delta * index / steps),
+         center[1] + radius * math.sin(start_angle + delta * index / steps)]
+        for index in range(steps + 1)
+    ]
+
+
+def offset_polyline_side(points, distance, side):
+    directions = [unit_vector(points[index], points[index + 1]) for index in range(len(points) - 1)]
+    normals = [[-direction[1] * side, direction[0] * side] for direction in directions]
+    result = [[points[0][0] + normals[0][0] * distance,
+               points[0][1] + normals[0][1] * distance]]
+    for index in range(1, len(points) - 1):
+        previous, following = directions[index - 1], directions[index]
+        turn = cross_2d(previous, following)
+        before = [points[index][0] + normals[index - 1][0] * distance,
+                  points[index][1] + normals[index - 1][1] * distance]
+        after = [points[index][0] + normals[index][0] * distance,
+                 points[index][1] + normals[index][1] * distance]
+        if turn * side < -1e-10:
+            arc = sample_arc(points[index], before, after, 1 if turn > 0 else -1)
+            result.extend(arc[1:])
+        else:
+            join = line_intersection(before, previous, after, following)
+            if math.hypot(join[0] - points[index][0], join[1] - points[index][1]) > distance * 12:
+                result.extend([before, after])
+            else:
+                result.append(join)
+    result.append([points[-1][0] + normals[-1][0] * distance,
+                   points[-1][1] + normals[-1][1] * distance])
+    return result, directions
+
+
+def buffer_line_string(points, distance):
+    if len(points) < 2:
+        raise ValueError("line buffer requires at least two coordinates")
+    left, directions = offset_polyline_side(points, distance, 1)
+    right, _ = offset_polyline_side(points, distance, -1)
+    end_direction = directions[-1]
+    end_left = left[-1]
+    end_right = right[-1]
+    end_cap = sample_arc(
+        points[-1], end_left, end_right, -1, forced_delta=-math.pi
+    )
+    start_direction = directions[0]
+    start_right = right[0]
+    start_left = left[0]
+    start_cap = sample_arc(
+        points[0], start_right, start_left, -1, forced_delta=-math.pi
+    )
+    ring = left + end_cap[1:] + list(reversed(right[:-1])) + start_cap[1:-1]
+    if ring[0] != ring[-1]:
+        ring.append(ring[0][:])
+    return ring
+
+
+def signed_ring_area(ring):
+    return sum(
+        ring[index - 1][0] * ring[index][1] - ring[index][0] * ring[index - 1][1]
+        for index in range(1, len(ring))
+    ) / 2
+
+
+def offset_ring(ring, distance):
+    points = ring[:-1] if ring[0][:2] == ring[-1][:2] else ring[:]
+    if len(points) < 3:
+        raise ValueError("polygon ring requires at least three distinct coordinates")
+    orientation = 1 if signed_ring_area(points + [points[0]]) >= 0 else -1
+    result = []
+    for index, point in enumerate(points):
+        previous = points[index - 1]
+        following = points[(index + 1) % len(points)]
+        incoming = unit_vector(previous, point)
+        outgoing = unit_vector(point, following)
+        normal_in = [incoming[1] * orientation, -incoming[0] * orientation]
+        normal_out = [outgoing[1] * orientation, -outgoing[0] * orientation]
+        before = [point[0] + normal_in[0] * distance,
+                  point[1] + normal_in[1] * distance]
+        after = [point[0] + normal_out[0] * distance,
+                 point[1] + normal_out[1] * distance]
+        turn = cross_2d(incoming, outgoing)
+        if turn * orientation * distance > 1e-10:
+            arc = sample_arc(point, before, after, orientation)
+            result.extend(arc[:-1])
+        else:
+            join = line_intersection(before, incoming, after, outgoing)
+            if math.hypot(join[0] - point[0], join[1] - point[1]) > abs(distance) * 12:
+                result.extend([before, after])
+            else:
+                result.append(join)
+    if len(result) < 3:
+        raise ValueError("buffer distance collapses this polygon")
+    result.append(result[0][:])
+    if abs(signed_ring_area(result)) < 1e-8 or signed_ring_area(result) * signed_ring_area(ring) <= 0:
+        raise ValueError("buffer distance collapses this polygon")
+    return result
+
+
+def buffer_polygon(polygon, distance):
+    if not polygon or not polygon[0]:
+        raise ValueError("polygon buffer requires an exterior ring")
+    result = [offset_ring(polygon[0], distance)]
+    for hole in polygon[1:]:
+        try:
+            result.append(offset_ring(hole, -distance))
+        except ValueError:
+            # A narrow hole may disappear when the positive buffer closes it.
+            continue
+    return result
+
+
+def buffer_geometry(geometry, distance):
+    kind = geometry.get("type")
+    coords = geometry.get("coordinates")
+    if kind == "Point":
+        x, y = coords[:2]
+        ring = [
+            [x + distance * math.cos(2 * math.pi * index / BUFFER_CIRCLE_STEPS),
+             y + distance * math.sin(2 * math.pi * index / BUFFER_CIRCLE_STEPS)]
+            for index in range(BUFFER_CIRCLE_STEPS)
+        ]
+        ring.append(ring[0][:])
+        return {"type": "Polygon", "coordinates": [ring]}
+    if kind == "LineString":
+        return {"type": "Polygon", "coordinates": [buffer_line_string(coords, distance)]}
+    if kind == "MultiLineString":
+        return {
+            "type": "MultiPolygon",
+            "coordinates": [[buffer_line_string(line, distance)] for line in coords],
+        }
+    if kind == "Polygon":
+        return {"type": "Polygon", "coordinates": buffer_polygon(coords, distance)}
+    if kind == "MultiPolygon":
+        return {"type": "MultiPolygon", "coordinates": [buffer_polygon(poly, distance) for poly in coords]}
+    raise ValueError(f"buffer does not support geometry type {kind}")
+
+
+def geometries_intersect(first, second):
+    def collect(geometry):
+        kind, coordinates = geometry["type"], geometry["coordinates"]
+        points, lines, polygons = [], [], []
+        if kind == "Point":
+            points.append(coordinates[:2])
+        elif kind == "LineString":
+            lines.append(coordinates)
+        elif kind == "MultiLineString":
+            lines.extend(coordinates)
+        elif kind == "Polygon":
+            polygons.append(coordinates)
+            lines.extend(coordinates)
+        elif kind == "MultiPolygon":
+            polygons.extend(coordinates)
+            lines.extend(ring for polygon in coordinates for ring in polygon)
+        else:
+            raise ValueError(f"intersection query does not support geometry type {kind}")
+        points.extend(point for line in lines for point in line)
+        return points, lines, polygons
+
+    def orientation(a, b, c):
+        return cross_2d(subtract_2d(b, a), subtract_2d(c, a))
+
+    def on_segment(point, a, b):
+        return abs(orientation(a, b, point)) <= 1e-10 and (
+            min(a[0], b[0]) - 1e-10 <= point[0] <= max(a[0], b[0]) + 1e-10 and
+            min(a[1], b[1]) - 1e-10 <= point[1] <= max(a[1], b[1]) + 1e-10
+        )
+
+    def segments_intersect(a, b, c, d):
+        o1, o2 = orientation(a, b, c), orientation(a, b, d)
+        o3, o4 = orientation(c, d, a), orientation(c, d, b)
+        if ((o1 > 1e-10 and o2 < -1e-10) or (o1 < -1e-10 and o2 > 1e-10)) and \
+           ((o3 > 1e-10 and o4 < -1e-10) or (o3 < -1e-10 and o4 > 1e-10)):
+            return True
+        return (abs(o1) <= 1e-10 and on_segment(c, a, b)) or \
+            (abs(o2) <= 1e-10 and on_segment(d, a, b)) or \
+            (abs(o3) <= 1e-10 and on_segment(a, c, d)) or \
+            (abs(o4) <= 1e-10 and on_segment(b, c, d))
+
+    def point_in_ring(point, ring):
+        inside = False
+        for index in range(len(ring) - 1):
+            a, b = ring[index], ring[index + 1]
+            if on_segment(point, a, b):
+                return True
+            if (a[1] > point[1]) != (b[1] > point[1]):
+                crossing_x = (b[0] - a[0]) * (point[1] - a[1]) / (b[1] - a[1]) + a[0]
+                if point[0] < crossing_x:
+                    inside = not inside
+        return inside
+
+    def point_in_polygon(point, polygon):
+        return bool(polygon and point_in_ring(point, polygon[0]) and
+                    not any(point_in_ring(point, hole) for hole in polygon[1:]))
+
+    points_a, lines_a, polygons_a = collect(first)
+    points_b, lines_b, polygons_b = collect(second)
+    for line_a in lines_a:
+        for line_b in lines_b:
+            if any(segments_intersect(a, b, c, d)
+                   for a, b in zip(line_a, line_a[1:])
+                   for c, d in zip(line_b, line_b[1:])):
+                return True
+    for point in points_a:
+        if any(on_segment(point, a, b) for line in lines_b for a, b in zip(line, line[1:])):
+            return True
+        if any(point_in_polygon(point, polygon) for polygon in polygons_b):
+            return True
+    for point in points_b:
+        if any(on_segment(point, a, b) for line in lines_a for a, b in zip(line, line[1:])):
+            return True
+        if any(point_in_polygon(point, polygon) for polygon in polygons_a):
+            return True
+    return any(point_in_polygon(point, polygon) for point in points_a for polygon in polygons_b) or \
+        any(point_in_polygon(point, polygon) for point in points_b for polygon in polygons_a)
+
+
+def planar_line_length(points):
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1])
+               for a, b in zip(points, points[1:]))
+
+
+def geodesic_segment_length(first, second):
+    longitude_a, latitude_a = math.radians(first[0]), math.radians(first[1])
+    longitude_b, latitude_b = math.radians(second[0]), math.radians(second[1])
+    delta_latitude = latitude_b - latitude_a
+    delta_longitude = longitude_b - longitude_a
+    haversine = math.sin(delta_latitude / 2) ** 2 + math.cos(latitude_a) * math.cos(latitude_b) * math.sin(delta_longitude / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(haversine)))
+
+
+def geodesic_line_length(points):
+    return sum(geodesic_segment_length(a, b) for a, b in zip(points, points[1:]))
+
+
+def planar_ring_area(ring):
+    return abs(sum(
+        ring[index - 1][0] * ring[index][1] - ring[index][0] * ring[index - 1][1]
+        for index in range(1, len(ring))
+    ) / 2)
+
+
+def geodesic_ring_area(ring):
+    area = 0.0
+    for first, second in zip(ring, ring[1:]):
+        longitude_delta = math.radians(second[0] - first[0])
+        while longitude_delta > math.pi:
+            longitude_delta -= 2 * math.pi
+        while longitude_delta < -math.pi:
+            longitude_delta += 2 * math.pi
+        area += longitude_delta * (2 + math.sin(math.radians(first[1])) + math.sin(math.radians(second[1])))
+    return abs(area * EARTH_RADIUS_M ** 2 / 2)
+
+
+def geometry_length(geometry, geographic=False):
+    kind = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    measure_line = geodesic_line_length if geographic else planar_line_length
+    if kind == "Point":
+        return 0.0
+    if kind == "LineString":
+        return measure_line(coordinates)
+    if kind == "MultiLineString":
+        return sum(measure_line(line) for line in coordinates)
+    if kind == "Polygon":
+        return sum(measure_line(ring) for ring in coordinates)
+    if kind == "MultiPolygon":
+        return sum(measure_line(ring) for polygon in coordinates for ring in polygon)
+    raise ValueError(f"distance does not support geometry type {kind}")
+
+
+def geometry_area(geometry, geographic=False):
+    kind = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    measure_ring = geodesic_ring_area if geographic else planar_ring_area
+    if kind == "Polygon":
+        if not coordinates:
+            return 0.0
+        return max(0.0, measure_ring(coordinates[0]) - sum(measure_ring(ring) for ring in coordinates[1:]))
+    if kind == "MultiPolygon":
+        return sum(geometry_area({"type": "Polygon", "coordinates": polygon}, geographic) for polygon in coordinates)
+    raise ValueError(f"area does not support geometry type {kind}")
+
+
+def resolve_analysis_feature(data, feature_id):
+    if not feature_id:
+        raise ValueError("feature_id is required")
+    for feature in data.get("features", []):
+        if str(feature.get("id")) == str(feature_id):
+            return feature
+    raise KeyError(f"feature not found: {feature_id}")
+
+
+def analysis_geometry(payload, data):
+    feature_id = payload.get("feature_id")
+    if feature_id:
+        return resolve_analysis_feature(data, feature_id)["geometry"], feature_id
+    geometry = payload.get("geometry")
+    if not isinstance(geometry, dict):
+        raise ValueError("feature_id or geometry is required")
+    validate_feature({"type": "Feature", "id": "analysis-input", "geometry": geometry, "properties": {}})
+    return geometry, None
+
+
 def dataset_summary(
     dataset_id,
     file_name,
@@ -253,7 +636,6 @@ def dataset_summary(
     source_format="GeoJSON",
     crs_name=None,
     source_note=None,
-    crs_kind="unknown",
 ):
     validate_feature_collection(payload)
     geometry_types = sorted(
@@ -274,7 +656,6 @@ def dataset_summary(
         "created_at": created_at or utc_now(),
         "path": path_name,
         "crs": crs_name or "Unknown",
-        "crs_kind": crs_kind,
         "source_note": source_note or "坐标系未提供",
     }
 
@@ -348,240 +729,11 @@ def read_dbf_records(dbf_bytes, encoding="utf-8"):
     return records
 
 
-# ---------------------------------------------------------------------------
-# .prj / CRS 识别
-# ---------------------------------------------------------------------------
-# 常见地理坐标系（GEOGCS）的地图基准名称，用于把 .prj 里的 DATUM 名称翻译成
-# 便于展示的规范名称。
-GEOGCS_ALIASES = {
-    "WGS_1984": "WGS 84",
-    "WGS84": "WGS 84",
-    "D_WGS_1984": "WGS 84",
-    "D_WGS84": "WGS 84",
-    "D_Beijing_1954": "Beijing 1954",
-    "Beijing_1954": "Beijing 1954",
-    "D_Xian_1980": "Xian 1980",
-    "Xian_1980": "Xian 1980",
-    "D_China_2000": "CGCS2000",
-    "China_2000": "CGCS2000",
-    "D_North_American_1983": "North American Datum 1983",
-    "NAD83": "North American Datum 1983",
-    "D_North_American_1927": "North American Datum 1927",
-    "D_ETRS_1989": "ETRS89",
-    "D_OSGB_1936": "OSGB 1936",
-}
-
-
-def parse_prj_crs(wkt):
-    """解析 .prj 的 WKT 文本，返回 (crs_name, crs_kind, epsg)。
-
-    crs_kind 取值为 "geographic"（经纬度）、"projected"（投影坐标）或
-    "unknown"。crs_name 尽量给出规范名称；epsg 为可选的 AUTHORITY 编号。
-    """
-    if not wkt:
-        return "Unknown", "unknown", None
-    compact = "".join(wkt.split())
-    epsg = None
-    epsg_match = re.search(r'AUTHORITY\["EPSG"\s*,\s*"(\d+)"\]', compact)
-    if epsg_match:
-        epsg = epsg_match.group(1)
-
-    kind = "unknown"
-    if "PROJCS" in compact:
-        kind = "projected"
-    elif "GEOGCS" in compact:
-        kind = "geographic"
-
-    # 主名称与内部基准：在保留空格的原始 WKT 上匹配（坐标系名称常含空格，
-    # 如 "WGS 84"；compact 只用于关键字判断与 EPSG 提取）。
-    name = None
-    name_match = re.match(r'^(?:PROJCS|GEOGCS)\s*\[\s*"([^"]+)"', wkt)
-    if name_match:
-        name = name_match.group(1)
-
-    datum = None
-    for pattern in (r'GEOGCS\s*\[\s*"([^"]+)"', r'DATUM\s*\[\s*"([^"]+)"'):
-        datum_match = re.search(pattern, wkt)
-        if datum_match:
-            datum = datum_match.group(1)
-    if datum:
-        datum = GEOGCS_ALIASES.get(datum, datum)
-
-    if not name and datum:
-        name = datum
-    if epsg and name and epsg not in name:
-        name = f"{name} (EPSG:{epsg})"
-    elif epsg and not name:
-        name = f"EPSG:{epsg}"
-    return (name or "Unknown"), kind, epsg
-
-
-def extract_epsg_from_label(label):
-    """从坐标系名称（如 “CGCS2000 … (EPSG:4540)”）里提取 EPSG 编号，无则返回 None。"""
-    if not label:
-        return None
-    match = re.search(r"EPSG[:_]?(\d+)", label)
-    return match.group(1) if match else None
-
-
-def build_projection_transformer(crs_wkt, epsg):
-    """构造 源投影坐标系 → WGS 84(EPSG:4326) 的转换器。
-
-    优先使用 .prj 的原始 WKT（忠实于文件里的投影参数），WKT 不可用时退回
-    EPSG 编号。返回 (transformer, source) 或 (None, None)。
-    """
-    source = None
-    if crs_wkt and "PROJCS" in crs_wkt:
-        source = crs_wkt
-    elif epsg:
-        source = f"EPSG:{epsg}"
-    if not source or not HAS_PYPROJ:
-        return None, None
-    try:
-        transformer = Transformer.from_crs(source, "EPSG:4326", always_xy=True)
-    except Exception:
-        return None, None
-    return transformer, source
-
-
-def transform_position(position, transformer):
-    x, y = position[0], position[1]
-    try:
-        lon, lat = transformer.transform(x, y)
-    except Exception:
-        return position
-    if not (math.isfinite(lon) and math.isfinite(lat)):
-        return position  # 超出投影有效范围的点保留原值
-    result = [lon, lat]
-    if len(position) > 2:
-        result.extend(position[2:])  # 保留 Z 等附加维度
-    return result
-
-
-def transform_coordinates(coordinates, transformer):
-    """递归转换 GeoJSON coordinates（点 / 线 / 面 / 多面共用）。"""
-    if (
-        isinstance(coordinates, list)
-        and len(coordinates) >= 2
-        and all(isinstance(item, (int, float)) for item in coordinates[:2])
-    ):
-        return transform_position(coordinates, transformer)
-    if isinstance(coordinates, list):
-        return [transform_coordinates(child, transformer) for child in coordinates]
-    return coordinates
-
-
-def project_geojson_to_wgs84(payload, crs_wkt, epsg, source_desc):
-    """把投影坐标系的要素集合统一转换到 WGS 84 经纬度。
-
-    成功返回 (converted_payload, crs_label)，其中 crs_label 形如
-    “WGS 84（已从 … 投影坐标转换）”；转换不可用或失败返回 (None, None)。
-    """
-    if not HAS_PYPROJ:
-        return None, None
-    transformer, _source = build_projection_transformer(crs_wkt, epsg)
-    if transformer is None:
-        return None, None
-    try:
-        for feature in payload.get("features", []):
-            geometry = feature.get("geometry") or {}
-            if isinstance(geometry.get("coordinates"), list):
-                geometry["coordinates"] = transform_coordinates(geometry["coordinates"], transformer)
-    except Exception:
-        return None, None
-    source_label = source_desc or "投影坐标"
-    return payload, f"WGS 84（已从 {source_label} 投影坐标转换）"
-
-
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Shapefile 几何类型
-# ---------------------------------------------------------------------------
-# record_type / 声明类型 → 基础 GeoJSON 几何类型。Z 变体（11/13/15）额外携带
-# 第三维 Z，M 变体（21/23/25）的 measure 值在 GeoJSON 中没有对应语义，忽略。
-SHAPE_BASE_TYPE = {
-    1: "Point",
-    3: "LineString",
-    5: "Polygon",
-    11: "Point",
-    13: "LineString",
-    15: "Polygon",
-    21: "Point",
-    23: "LineString",
-    25: "Polygon",
-}
-SUPPORTED_SHAPE_TYPES = set(SHAPE_BASE_TYPE)
-MULTIPOINT_TYPES = {8, 18, 28}  # MultiPoint / MultiPointZ / MultiPointM（暂不支持渲染）
-
-
-def ring_signed_area(ring):
-    """鞋带公式计算环的有符号面积；绝对值为面积，符号指示环绕方向。"""
-    area = 0.0
-    n = len(ring)
-    for index in range(n):
-        x1, y1 = ring[index][0], ring[index][1]
-        x2, y2 = ring[(index + 1) % n][0], ring[(index + 1) % n][1]
-        area += x1 * y2 - x2 * y1
-    return area / 2.0
-
-
-def point_in_ring(point, ring):
-    """射线法判断点是否在（闭合）环内部。"""
-    x, y = point[0], point[1]
-    inside = False
-    n = len(ring)
-    for index in range(n):
-        x1, y1 = ring[index][0], ring[index][1]
-        x2, y2 = ring[(index + 1) % n][0], ring[(index + 1) % n][1]
-        if (y1 > y) != (y2 > y):
-            hit_x = (x2 - x1) * (y - y1) / (y2 - y1) + x1
-            if x < hit_x:
-                inside = not inside
-    return inside
-
-
-def _polygon_from_rings(rings):
-    """把一组闭合环组装成标准 GeoJSON Polygon/MultiPolygon，保留洞（内环）。
-
-    Shapefile 一个 Polygon 记录里的多个 parts，既可能是外环+洞环（内环），
-    也可能是多个相互分离的外环。这里按「环的包含关系」还原：面积最大的环
-    作为外环，被外环包含的较小环作为该外环的洞。这样导入后洞结构不再被
-    扁平化成独立多边形，前端可正确挖空显示。
-    """
-    if not rings:
-        raise ValueError("polygon geometry requires at least one ring")
-    ordered = sorted(rings, key=lambda ring: -abs(ring_signed_area(ring)))
-    polygons = []  # 每个元素: {"outer": 外环, "holes": [洞环, ...]}
-    for ring in ordered:
-        sample = ring[0]
-        target = None
-        for poly in polygons:
-            if point_in_ring(sample, poly["outer"]):
-                if target is None or abs(ring_signed_area(poly["outer"])) < abs(
-                    ring_signed_area(target["outer"])
-                ):
-                    target = poly
-        if target is None:
-            polygons.append({"outer": ring, "holes": []})
-        else:
-            target["holes"].append(ring)
-    if len(polygons) == 1:
-        poly = polygons[0]
-        return {"type": "Polygon", "coordinates": [poly["outer"]] + poly["holes"]}
-    return {
-        "type": "MultiPolygon",
-        "coordinates": [[poly["outer"]] + poly["holes"] for poly in polygons],
-    }
-
-
 def split_shape_parts(parts, points):
     result = []
     for index, start in enumerate(parts):
         end = parts[index + 1] if index + 1 < len(parts) else len(points)
-        # list(point) 会保留 [x, y] 或 [x, y, z] 的完整坐标（Z 类型时）。
-        result.append([list(point) for point in points[start:end]])
+        result.append([[float(x), float(y)] for x, y in points[start:end]])
     return result
 
 
@@ -589,12 +741,6 @@ def read_shp_records(shp_bytes):
     if len(shp_bytes) < 100:
         raise ValueError("SHP file is too short")
     declared_type = struct.unpack_from("<i", shp_bytes, 32)[0]
-    if declared_type in MULTIPOINT_TYPES:
-        raise ValueError(
-            "当前 Demo 暂不支持 MultiPoint 图层；请在 GIS 软件中把多点要素转为点/线后重新导出"
-        )
-    if declared_type not in SUPPORTED_SHAPE_TYPES:
-        raise ValueError(f"unsupported Shapefile geometry type: {declared_type}")
     features = []
     offset = 100
     while offset < len(shp_bytes):
@@ -610,22 +756,10 @@ def read_shp_records(shp_bytes):
             features.append(None)
             offset = content_end
             continue
-        if record_type not in SUPPORTED_SHAPE_TYPES:
-            raise ValueError(f"unsupported Shapefile geometry type: {record_type}")
-        has_z = record_type in {11, 13, 15}
-        if record_type in {1, 11, 21}:
-            # Point / PointZ / PointM
+        if record_type == 1:
             x, y = struct.unpack_from("<dd", shp_bytes, content_start + 4)
-            coordinates = [x, y]
-            if has_z:
-                if content_start + 28 > content_end:
-                    raise ValueError(f"SHP record {record_number} is truncated")
-                z, = struct.unpack_from("<d", shp_bytes, content_start + 20)
-                coordinates.append(z)
-            geometry = {"type": "Point", "coordinates": coordinates}
-        elif record_type in {3, 5, 13, 15, 23, 25}:
-            # PolyLine / Polygon（及 Z/M 变体）：几何头布局相同，
-            # Z 类型的 Z 数组位于点数组之后。
+            geometry = {"type": "Point", "coordinates": [x, y]}
+        elif record_type in {3, 5}:
             if content_start + 44 > content_end:
                 raise ValueError(f"SHP record {record_number} has an invalid header")
             part_count, point_count = struct.unpack_from("<ii", shp_bytes, content_start + 36)
@@ -645,18 +779,8 @@ def read_shp_records(shp_bytes):
                 struct.unpack_from("<dd", shp_bytes, points_offset + point_index * 16)
                 for point_index in range(point_count)
             ]
-            if has_z:
-                z_array_start = expected_end + 16  # 跳过 zmin/zmax
-                z_array_end = z_array_start + point_count * 8
-                if z_array_end > content_end:
-                    raise ValueError(f"SHP record {record_number} Z data is truncated")
-                z_values = [
-                    struct.unpack_from("<d", shp_bytes, z_array_start + point_index * 8)[0]
-                    for point_index in range(point_count)
-                ]
-                points = [(x, y, z) for (x, y), z in zip(points, z_values)]
             components = split_shape_parts(parts, points)
-            if SHAPE_BASE_TYPE[record_type] == "LineString":
+            if record_type == 3:
                 geometry = {
                     "type": "LineString" if len(components) == 1 else "MultiLineString",
                     "coordinates": components[0] if len(components) == 1 else components,
@@ -668,13 +792,17 @@ def read_shp_records(shp_bytes):
                 for ring in rings:
                     if ring[0] != ring[-1]:
                         ring.append(ring[0][:])
-                # 先按环的闭合形状组装几何；洞结构（内环）由 build_polygon_geometry
-                # 在 Polygon 层面进一步处理。
-                geometry = _polygon_from_rings(rings)
+                # The simple renderer and demo store rings as independent polygon parts.
+                geometry = {
+                    "type": "Polygon" if len(rings) == 1 else "MultiPolygon",
+                    "coordinates": rings if len(rings) == 1 else [[ring] for ring in rings],
+                }
         else:
             raise ValueError(f"unsupported Shapefile geometry type: {record_type}")
         features.append({"type": "Feature", "geometry": geometry, "properties": {}})
         offset = content_end
+    if declared_type not in {1, 3, 5, 8, 11, 13, 15, 18}:
+        raise ValueError(f"unsupported Shapefile geometry type: {declared_type}")
     return declared_type, features
 
 
@@ -729,8 +857,8 @@ def convert_shapefile_zip(file_name, zip_bytes):
             if Path(item.filename).stem.lower() == stem
         }
         shp_type, raw_features = read_shp_records(archive.read(shp_item))
-        if shp_type not in SUPPORTED_SHAPE_TYPES:
-            raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles (incl. Z/M)")
+        if shp_type not in {1, 3, 5}:
+            raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles")
         dbf_encoding = "utf-8"
         if matching.get(".cpg"):
             dbf_encoding = read_cpg_encoding(archive.read(matching[".cpg"]))
@@ -745,13 +873,13 @@ def convert_shapefile_zip(file_name, zip_bytes):
         features = [feature for feature in raw_features if feature is not None]
         payload = normalise_feature_collection({"type": "FeatureCollection", "features": features})
         prj_item = matching.get(".prj")
+        crs_text = archive.read(prj_item).decode("utf-8", errors="replace") if prj_item else ""
         crs_name = None
-        crs_kind = "unknown"
-        crs_wkt = None
-        if prj_item:
-            crs_wkt = archive.read(prj_item).decode("utf-8", errors="replace")
-            crs_name, crs_kind, _epsg = parse_prj_crs(crs_wkt)
-        return payload, crs_name, Path(shp_item.filename).name, "Shapefile", crs_kind, crs_wkt
+        if crs_text:
+            crs_name = "PRJ attached"
+            if "WGS_1984" in crs_text or "WGS 84" in crs_text:
+                crs_name = "WGS 84 (detected from .prj)"
+        return payload, crs_name, Path(shp_item.filename).name, "Shapefile"
 
 
 def convert_shapefile_parts(file_name, main_bytes, sidecars):
@@ -761,8 +889,8 @@ def convert_shapefile_parts(file_name, main_bytes, sidecars):
     if ".shx" not in files or ".dbf" not in files:
         raise ValueError("Shapefile import requires matching .shx and .dbf files")
     shape_type, raw_features = read_shp_records(main_bytes)
-    if shape_type not in SUPPORTED_SHAPE_TYPES:
-        raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles (incl. Z/M)")
+    if shape_type not in {1, 3, 5}:
+        raise ValueError("this demo supports Point, PolyLine, and Polygon Shapefiles")
     encoding = read_cpg_encoding(files[".cpg"]) if ".cpg" in files else "utf-8"
     dbf_records = read_dbf_records(files[".dbf"], encoding)
     if len(dbf_records) != len(raw_features):
@@ -773,12 +901,12 @@ def convert_shapefile_parts(file_name, main_bytes, sidecars):
     features = [feature for feature in raw_features if feature is not None]
     payload = normalise_feature_collection({"type": "FeatureCollection", "features": features})
     crs_name = None
-    crs_kind = "unknown"
-    crs_wkt = None
     if ".prj" in files:
-        crs_wkt = files[".prj"].decode("utf-8", errors="replace")
-        crs_name, crs_kind, _epsg = parse_prj_crs(crs_wkt)
-    return payload, crs_name, f"{base_name}.shp", crs_kind, crs_wkt
+        crs_text = files[".prj"].decode("utf-8", errors="replace")
+        crs_name = "PRJ attached"
+        if "WGS_1984" in crs_text or "WGS 84" in crs_text:
+            crs_name = "WGS 84 (detected from .prj)"
+    return payload, crs_name, f"{base_name}.shp"
 
 
 def write_json_atomic(path, payload):
@@ -890,26 +1018,6 @@ def read_geojson():
     return read_dataset()[1]
 
 
-def read_layers(dataset_ids):
-    """读取多个数据集并合并为一个图层集合。
-
-    每个要素的 properties.layer 覆盖为所在数据集名称（前端按 layer 分组
-    显示/隐藏），并保留 dataset_id 便于溯源。
-    """
-    features = []
-    for dataset_id in dataset_ids:
-        dataset, payload = read_dataset(dataset_id)
-        layer_name = dataset.get("name") or dataset.get("file_name") or dataset_id
-        for feature in payload.get("features", []):
-            item = dict(feature)
-            props = dict(item.get("properties") or {})
-            props["layer"] = layer_name
-            props["dataset_id"] = dataset_id
-            item["properties"] = props
-            features.append(item)
-    return {"type": "FeatureCollection", "features": features}
-
-
 class GisDemoHandler(SimpleHTTPRequestHandler):
     server_version = "GisVectorDemo/0.3"
 
@@ -949,12 +1057,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/api/layers":
-            query = parse_qs(urlsplit(self.path).query)
-            ids = [item for item in (query.get("ids") or [""])[0].split(",") if item]
-            if ids:
-                self.send_json(read_layers(ids))
-            else:
-                self.send_json(read_geojson())
+            self.send_json(read_geojson())
             return
 
         if path == "/api/export":
@@ -1014,6 +1117,114 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlsplit(self.path).path
         try:
+            if path == "/api/spatial/measure":
+                request = self.read_json_body()
+                operation = str(request.get("operation") or "").lower()
+                dataset, data = read_dataset()
+                geometry, feature_id = analysis_geometry(request, data)
+                geographic = dataset_is_geographic(dataset, data)
+                if operation == "distance":
+                    value = geometry_length(geometry, geographic)
+                    unit = "m" if geographic else "map units"
+                elif operation == "area":
+                    value = geometry_area(geometry, geographic)
+                    unit = "m²" if geographic else "map units²"
+                else:
+                    raise ValueError("operation must be distance or area")
+                self.send_json({
+                    "ok": True,
+                    "operation": operation,
+                    "value": value,
+                    "unit": unit,
+                    "feature_id": feature_id,
+                    "geographic": geographic,
+                    "coordinate_system": "WGS 84 经纬度" if geographic else "平面坐标",
+                })
+                return
+
+            if path == "/api/spatial/buffer":
+                request = self.read_json_body()
+                dataset, data = read_dataset()
+                source = resolve_analysis_feature(data, request.get("feature_id"))
+                try:
+                    distance = float(request.get("distance"))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("distance must be a number") from exc
+                if not math.isfinite(distance) or distance <= 0:
+                    raise ValueError("distance must be greater than zero")
+                if distance > 1e8:
+                    raise ValueError("distance is too large")
+                geographic = dataset_is_geographic(dataset, data)
+                if geographic:
+                    center = local_projection_center(source["geometry"])
+                    projected = map_coordinates(
+                        source["geometry"].get("coordinates"),
+                        lambda point: azimuthal_equidistant_forward(point, center),
+                    )
+                    projected_geometry = {
+                        "type": source["geometry"]["type"],
+                        "coordinates": projected,
+                    }
+                    buffered_projected = buffer_geometry(projected_geometry, distance)
+                    buffered_coordinates = map_coordinates(
+                        buffered_projected["coordinates"],
+                        lambda point: azimuthal_equidistant_inverse(point, center),
+                    )
+                    buffered_geometry = {
+                        "type": buffered_projected["type"],
+                        "coordinates": buffered_coordinates,
+                    }
+                    distance_unit = "m"
+                else:
+                    buffered_geometry = buffer_geometry(source["geometry"], distance)
+                    distance_unit = "map units"
+                buffer_id = f"buffer-{uuid.uuid4().hex[:10]}"
+                source_name = (source.get("properties") or {}).get("name") or source["id"]
+                buffer_feature = {
+                    "type": "Feature",
+                    "id": buffer_id,
+                    "properties": {
+                        "name": f"缓冲区 · {source_name}",
+                        "layer": "空间分析",
+                        "kind": "buffer",
+                        "analysis": "buffer",
+                        "source_id": source["id"],
+                        "distance": distance,
+                        "distance_unit": distance_unit,
+                    },
+                    "geometry": buffered_geometry,
+                }
+                validate_feature(buffer_feature)
+                data["features"].append(buffer_feature)
+                write_geojson(data, dataset["id"])
+                self.send_json({
+                    "ok": True,
+                    "feature": buffer_feature,
+                    "source_id": source["id"],
+                    "distance": distance,
+                    "unit": distance_unit,
+                    "geographic": geographic,
+                })
+                return
+
+            if path == "/api/spatial/intersects":
+                request = self.read_json_body()
+                dataset, data = read_dataset()
+                source = resolve_analysis_feature(data, request.get("feature_id"))
+                matches = [
+                    feature for feature in data.get("features", [])
+                    if feature.get("id") != source.get("id") and
+                    geometries_intersect(source["geometry"], feature["geometry"])
+                ]
+                self.send_json({
+                    "ok": True,
+                    "source_id": source["id"],
+                    "matches": matches,
+                    "count": len(matches),
+                    "coordinate_system": "WGS 84 经纬度" if dataset_is_geographic(dataset, data) else "平面坐标",
+                })
+                return
+
             if path == "/api/features":
                 payload = self.read_json_body()
                 active_id = get_active_id()
@@ -1052,8 +1263,6 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                 suffix = Path(original_name).suffix.lower()
                 source_format = "GeoJSON"
                 crs_name = None
-                crs_kind = "unknown"
-                crs_wkt = None
                 source_note = "JSON 文件直接存储"
                 if suffix == ".zip":
                     try:
@@ -1062,9 +1271,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                         raise ValueError("invalid base64 Shapefile ZIP content") from exc
                     if len(zip_bytes) > MAX_IMPORT_BYTES:
                         raise ValueError(f"Shapefile ZIP cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB")
-                    geojson, crs_name, source_name, source_format, crs_kind, crs_wkt = convert_shapefile_zip(
-                        original_name, zip_bytes
-                    )
+                    geojson, crs_name, source_name, source_format = convert_shapefile_zip(original_name, zip_bytes)
                     source_note = f"从 ZIP 内的 {source_name} 读取并转换为 GeoJSON"
                 elif suffix == ".shp":
                     try:
@@ -1083,7 +1290,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                                     f"Shapefile component cannot exceed {MAX_IMPORT_BYTES // (1024 * 1024)} MB"
                                 )
                             sidecars[sidecar_name] = sidecar_content
-                        geojson, crs_name, shp_name, crs_kind, crs_wkt = convert_shapefile_parts(
+                        geojson, crs_name, shp_name = convert_shapefile_parts(
                             original_name,
                             main_bytes,
                             sidecars,
@@ -1093,35 +1300,10 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     source_format = "Shapefile"
                     source_note = f"从 {shp_name} 转换为 GeoJSON"
                 else:
-                    if suffix in {".prj", ".cpg", ".shx", ".dbf"}:
-                        raise ValueError(
-                            f"{suffix} 是 Shapefile 配套文件，不能单独导入；"
-                            "请与同名的 .shp/.shx/.dbf 成套上传（.prj/.cpg 可选）"
-                        )
                     if suffix not in {".geojson", ".json"}:
                         raise ValueError("only .geojson, .json, or Shapefile .zip files are supported")
                     geojson = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
                     geojson = normalise_feature_collection(geojson)
-
-                if crs_kind == "projected":
-                    converted, converted_crs = project_geojson_to_wgs84(
-                        geojson,
-                        crs_wkt,
-                        extract_epsg_from_label(crs_name),
-                        crs_name,
-                    )
-                    if converted is not None:
-                        geojson = converted
-                        crs_kind = "geographic"
-                        crs_name = converted_crs
-                        source_note = (
-                            f"{source_note}；已从投影坐标自动转换为 WGS 84 经纬度，可叠加在线底图"
-                        )
-                    else:
-                        source_note = (
-                            f"{source_note}；检测为投影坐标系，但自动转换不可用"
-                            "（未安装 pyproj 或无法识别源坐标系），当前以平面坐标显示"
-                        )
 
                 dataset_id = f"ds-{uuid.uuid4().hex[:10]}"
                 stored_name = f"{dataset_id}.geojson"
@@ -1136,7 +1318,6 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
                     source_format=source_format,
                     crs_name=crs_name,
                     source_note=source_note,
-                    crs_kind=crs_kind,
                 )
                 catalog = read_catalog()
                 catalog["datasets"].append(imported)
