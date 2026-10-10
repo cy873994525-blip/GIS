@@ -7,7 +7,7 @@
 | 组 | 成员 | 负责内容 | 主要文件 |
 |---|---|---|---|
 | **A 组 · 后端文件数据模块与 API 基础框架** | **陈怡（Chen Yi）** | GeoJSON/JSON 与 Shapefile（ZIP/成套文件）解析与统一转 GeoJSON、数据集目录与切换、导入/导出 API、`.prj`/CRS 识别、投影坐标自动转 WGS 84（T1）、多图层叠加接口 `/api/layers?ids=`、配套文件误导入提示 | `server.py`、`data/`、README 中「A 组」小节 |
-| **B 组 · 地图显示与界面模块** | （成员待补充） | ArcGIS 风格工作台 UI、图层树与样式控制、Canvas 矢量绘制、地图缩放漫游、比例尺/指北针/坐标状态 | `static/app.js`、`static/index.html`、`static/styles.css` |
+| **B 组 · 地图显示与界面模块** | （陈静） | ArcGIS 风格工作台 UI、图层树与样式控制、Canvas 矢量绘制、地图缩放漫游、比例尺/指北针/坐标状态 | `static/app.js`、`static/index.html`、`static/styles.css` |
 | **C 组 · 交互编辑、属性与地图展示模块** | （成员待补充） | 画布点线面绘制与几何编辑、属性表、在线底图叠加、前端图层显隐与数据集「显示」开关（复用 A 组导入/图层接口） | `static/app.js`、`static/index.html`、`static/styles.css` |
 
 > 后端几何/坐标系解析与数据接口均属 A 组；前端复用 A 组导入与多图层接口，不重复归功。
