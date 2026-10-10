@@ -1336,6 +1336,31 @@ section {
   margin: 0;
 }
 
+.bulk-editor {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.bulk-editor[hidden] {
+  display: none;
+}
+
+.bulk-editor label {
+  margin-bottom: 0;
+}
+
+.bulk-editor select,
+.bulk-editor input {
+  width: 100%;
+  margin-top: 5px;
+  font-size: 12px;
+}
+
 .editor-field-name {
   font-family: Consolas, monospace;
   font-size: 11px;

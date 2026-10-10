@@ -66,10 +66,10 @@
             <input id="nameInput" type="text" value="新要素" maxlength="40" placeholder="例如：北门">
           </label>
           <label>
-            图层
+            原始图层字段
             <input id="layerInput" type="text" list="layerOptions" value="兴趣点" maxlength="20">
           </label>
-          <p class="form-tip">先设置属性，再选择“画点 / 画线 / 画面”。图层既可以输入已有图层名，也可以直接输入新名称。</p>
+          <p class="form-tip">先设置属性，再选择“画点 / 画线 / 画面”。地图按数据集分组显示；这里的图层字段写入源文件。画线、画面可双击或按 Enter 完成。</p>
         </section>
 
         <section>
@@ -103,6 +103,7 @@
             <button data-mode="edit" class="tool">编辑几何</button>
             <button id="undoGeometryBtn" class="draft-button" disabled>撤销几何</button>
             <button id="endEditBtn" class="draft-button" disabled>结束编辑</button>
+            <button id="snapBtn" class="tool active" type="button" aria-pressed="true" title="绘制和拖动节点时吸附到已有要素的节点或边">吸附：开</button>
           </div>
           <div class="tool-group view-tools">
             <span class="toolbar-label">视图</span>
@@ -138,7 +139,7 @@
               <tbody id="attributeBody"></tbody>
             </table>
           </div>
-          <p class="form-tip">完整的多字段属性表在地图下方的抽屉里。</p>
+          <p class="form-tip">Shift 加选、Alt 减选；多选后可批量修改共有字段。完整属性表在地图下方。</p>
           <div id="selectionEditor" class="selection-editor is-empty">
             <div class="editor-heading">
               <div>
@@ -149,6 +150,15 @@
             </div>
             <div id="editFieldList" class="edit-field-list">
               <p class="empty-layer">点选一个要素后编辑属性。</p>
+            </div>
+            <div id="bulkEditor" class="bulk-editor" hidden>
+              <label>统一修改字段
+                <select id="bulkFieldSelect" aria-label="批量修改字段"></select>
+              </label>
+              <label>新值
+                <input id="bulkValueInput" type="text" placeholder="输入新值；留空可清空字段">
+              </label>
+              <button id="bulkUpdateBtn" class="primary" type="button">应用到选中要素</button>
             </div>
             <div id="editorMeta" class="editor-meta">点选一行要素开始编辑。</div>
             <div class="editor-actions">
@@ -164,11 +174,11 @@
             <span class="section-kicker">QUICK GUIDE</span>
           </div>
           <ul class="checklist">
-            <li><span>01</span>点选或框选要素查看属性</li>
-            <li><span>02</span>滚轮缩放，漫游模式拖动地图</li>
-            <li><span>03</span>绘制后点击“完成绘制”提交</li>
-            <li><span>04</span>“编辑几何”可拖动节点、整体平移要素</li>
-            <li><span>05</span>底部属性表双击单元格即可改属性</li>
+            <li><span>01</span>点选 / 框选，Shift 加选、Alt 减选</li>
+            <li><span>02</span>画线画面双击或 Enter 完成，Esc 取消</li>
+            <li><span>03</span>吸附可让新节点贴合已有节点或边</li>
+            <li><span>04</span>多选后批量改属性；删要素前确认</li>
+            <li><span>05</span>编辑几何可拖节点；属性表可双击修改</li>
           </ul>
         </section>
       </aside>
