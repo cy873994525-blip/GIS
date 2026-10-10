@@ -1244,6 +1244,7 @@ def main():
     print("Press Ctrl+C to stop.")
     server.serve_forever()
 
-
+from d_spatial import install_d_spatial
+install_d_spatial(GisDemoHandler, read_dataset, write_geojson, validate_feature, STATIC_DIR)
 if __name__ == "__main__":
     main()
