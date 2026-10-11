@@ -8,7 +8,7 @@
 |---|---|---|---|
 | **A 组 · 后端文件数据模块与 API 基础框架** | **陈怡（Chen Yi）** | GeoJSON/JSON 与 Shapefile（ZIP/成套文件）解析与统一转 GeoJSON、数据集目录与切换、导入/导出 API、`.prj`/CRS 识别、投影坐标自动转 WGS 84（T1）、多图层叠加接口 `/api/layers?ids=`、配套文件误导入提示 | `server.py`、`data/`、README 中「A 组」小节 |
 | **B 组 · 地图显示与界面模块** |陈静 （Chen Jing） | ArcGIS 风格工作台 UI、图层树与样式控制、Canvas 矢量绘制、地图缩放漫游、比例尺/指北针/坐标状态 | `static/app.js`、`static/index.html`、`static/styles.css` |
-| **C 组 · 交互编辑、属性与地图展示模块** | （成员待补充） | 画布点线面绘制与几何编辑、属性表、在线底图叠加、前端图层显隐与数据集「显示」开关（复用 A 组导入/图层接口） | `static/app.js`、`static/index.html`、`static/styles.css` |
+| **C 组 · 交互编辑、属性与地图展示模块** | **邓雨婷** | 画布点线面绘制与几何编辑、属性表、在线底图叠加、前端图层显隐与数据集「显示」开关（复用 A 组导入/图层接口） | `static/app.js`、`static/index.html`、`static/styles.css` |
 
 > 后端几何/坐标系解析与数据接口均属 A 组；前端复用 A 组导入与多图层接口，不重复归功。
 
@@ -261,8 +261,6 @@ Y 范围约为 2367106 至 6385320
 - 端到端（启动 `server.py`，通过 `/api/datasets/import` 导入“带洞 Polygon + CGCS2000 投影 `.prj`”的 ZIP）8/8：导入成功、`format=Shapefile`、`feature_count=1`、`geometry_types=[Polygon]`、`crs_kind=projected`、crs 名称含 CGCS2000、导入后 GeoJSON 保留 2 个环（外环+洞）。
 
 ## C 组：交互编辑、属性与地图展示模块
-
-**C 组：邓雨婷。**
 
 本组负责浏览器端的矢量数据交互编辑、属性管理和地图展示。前期完善画点线面之后的编辑链路：底部属性表、行内改值与字段增删、点选 / 框选、几何节点拖拽和整体平移；随后接入真实在线底图，完善地图缩放、数据叠加和示例入口。主要改动位于前端 `static/`，另有一处 Python 3.8 兼容修复（见下文 5.4）。要素的写入仍统一走已有的 `PUT /api/features/{id}` 和 `POST /api/save`；GeoJSON / Shapefile 文件解析属于 A 组后端模块，C 组复用其导入接口，不重复归功。
 
