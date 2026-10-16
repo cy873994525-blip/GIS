@@ -31,7 +31,7 @@ import uuid
 import zipfile
 import base64
 from urllib.parse import parse_qs, unquote, urlsplit
-
+from route_api import handle_routing_request
 
 # 兼容层：str.removeprefix / str.removesuffix 是 Python 3.9 才有的，
 # 本机与部分演示环境只有 3.8（本机为 3.8.8），直接用会让
@@ -947,6 +947,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
         return json.loads(raw or "{}")
 
     def do_GET(self):
+        if handle_routing_request(self, "GET"):
+            return
         path = urlsplit(self.path).path
         if path == "/api/layers":
             query = parse_qs(urlsplit(self.path).query)
@@ -1012,6 +1014,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        if handle_routing_request(self, "POST"):
+            return
         path = urlsplit(self.path).path
         try:
             if path == "/api/features":
@@ -1165,6 +1169,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             self.send_error_json(str(exc), status=status)
 
     def do_DELETE(self):
+        if handle_routing_request(self, "DELETE"):
+            return
         path = urlsplit(self.path).path
         try:
             if path.startswith("/api/datasets/"):
