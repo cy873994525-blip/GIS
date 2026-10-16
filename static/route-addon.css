@@ -1,0 +1,32 @@
+/* Standalone shortest-path add-on: no existing CSS selectors are redefined. */
+.route-addon-btn { color:#8e4e35; border:1px solid #d7ab91; background:#fff4eb; font-weight:700; }
+.route-addon-btn.active { background:#fbdcc8; border-color:#d88965; }
+#mapCanvas.mode-route { cursor: crosshair; }
+#routeAddonPanel[hidden] { display:none!important; }
+#routeAddonPanel {
+  position:absolute;z-index:14;top:16px;left:16px;
+  width:min(340px,calc(100% - 36px));box-sizing:border-box;
+  border:1px solid #d8e4e0;border-radius:14px;
+  background:rgba(255,253,249,.98); color:#214348;
+  box-shadow:0 16px 44px rgba(32,63,67,.18);padding:16px;
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;
+}
+.route-addon-head {display:flex;align-items:center;justify-content:space-between;gap:6px}
+.route-addon-head h3 {margin:0;font-size:18px;color:#244649}
+.route-addon-head small {font-size:10px;color:#7b8f92;font-weight:600;margin-left:5px}
+.route-addon-close {padding:2px 9px!important;font-size:21px;line-height:1.2}
+.route-addon-help {color:#6e8584;font-size:12px;line-height:1.6;margin:12px 0}
+.route-addon-place {padding:8px 10px;background:#f7faf9;border:1px solid #e0e8e5;border-radius:7px;margin-bottom:7px;display:flex;gap:8px;align-items:center;font-size:12px}
+.route-addon-place strong {font-weight:550;flex:1;text-align:right;font-size:11px;overflow-wrap:anywhere}
+.route-addon-dot {width:10px;height:10px;border-radius:50%;background:#148678;border:2px solid #a7dfd7;flex:none}
+.route-addon-dot.end {background:#e66d4c;border-color:#fac6b8}
+.route-addon-actions {display:flex;gap:8px;margin-top:12px}
+#routeAddonPanel button {cursor:pointer}
+.route-addon-solve {background:#247b73!important;color:white!important;border-color:#247b73!important;flex:1;font-weight:700}
+.route-addon-solve:disabled {opacity:.45;cursor:not-allowed!important}
+.route-addon-result {margin-top:12px;padding:10px;background:#edf7f3;border:1px solid #dcebe4;border-radius:8px;font-size:12px;line-height:1.6;color:#37685e}
+.route-addon-result.error {background:#fff1ec;color:#a0442e;border-color:#f1c8b8}
+.route-addon-data {border-top:1px solid #e4eae7;margin-top:12px;padding-top:10px;font-size:11px;color:#677e7d}
+.route-addon-data button,.route-addon-data label {display:inline-block;font-size:11px;padding:5px 8px;border:1px solid #d2dcd9;border-radius:6px;color:#346e68;background:white;margin:7px 4px 0 0;cursor:pointer}
+.route-addon-data p {font-size:10px;line-height:1.5;color:#7e9090;margin:9px 0 0}
+.route-addon-data a {color:#247b73}
