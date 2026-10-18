@@ -6,7 +6,7 @@ const vm = require("node:vm");
 
 // Only load the app's pure helpers; browser event registration and API requests stay out of this VM.
 const appSource = fs.readFileSync(path.join(__dirname, "..", "static", "app.js"), "utf8");
-const helperSource = appSource.split('canvas.addEventListener("mousedown"')[0];
+const helperSource = appSource.split('canvas.addEventListener("pointerdown"')[0];
 assert.notEqual(helperSource.length, appSource.length, "could not locate browser event registration");
 const canvas = { getContext: () => ({}) };
 const context = vm.createContext({

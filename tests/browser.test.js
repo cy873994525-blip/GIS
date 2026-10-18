@@ -68,6 +68,50 @@ test("C 组浏览器流程：字段默认值、绘制、属性、历史、排序
       .textContent.includes("服务："));
     const original = await rawData();
 
+    assert.equal(await page.locator(".map-north-arrow").count(), 1);
+    assert.equal(await page.locator("#mapScaleLabel").count(), 1);
+    await page.waitForFunction(() => document.getElementById("mapScaleLabel")
+      .textContent.trim() !== "—");
+    const layerCount = await page.locator("#layerList .layer-row").count();
+    assert.ok(layerCount > 0, "expected at least one visible data layer");
+    await page.locator("#layerList .layer-color-input").first().evaluate((input) => {
+      input.value = "#123456";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await page.locator("#layerList input[type=range]").first().evaluate((input) => {
+      input.value = "0.8";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    if (layerCount > 1) {
+      await page.locator("#layerList .layer-row").nth(1).evaluate((sourceRow) => {
+        const targetRow = document.querySelector("#layerList .layer-row");
+        const transfer = new DataTransfer();
+        transfer.setData("text/plain", sourceRow.dataset.layer);
+        targetRow.dispatchEvent(new DragEvent("drop", {
+          bubbles: true, cancelable: true, dataTransfer: transfer,
+        }));
+      });
+    }
+    const savedLayerPreferences = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem("gis-vector-demo-layer-preferences-v1")));
+    assert.ok(savedLayerPreferences.styles);
+    const styledLayer = Object.values(savedLayerPreferences.styles)
+      .find((style) => style.color === "#123456");
+    assert.ok(styledLayer, "custom layer color should be persisted");
+    assert.ok(savedLayerPreferences.order.length > 0);
+
+    await page.reload();
+    await page.waitForFunction(() => document.getElementById("backendStatus")
+      .textContent.includes("服务："));
+    const restoredPreferences = await page.evaluate(() =>
+      JSON.parse(localStorage.getItem("gis-vector-demo-layer-preferences-v1")));
+    assert.deepEqual(restoredPreferences, savedLayerPreferences);
+    const firstLayerColor = await page.locator("#layerList .layer-row").first().evaluate((row) => ({
+      name: row.dataset.layer,
+      color: row.querySelector(".layer-color-input").value,
+    }));
+    assert.equal(firstLayerColor.color, restoredPreferences.styles[firstLayerColor.name].color);
+
     await page.locator("#addFieldBtn").click();
     await page.locator("#newFieldName").fill("score");
     await page.locator("#newFieldType").selectOption("number");
