@@ -75,6 +75,31 @@ test("finishing a sketch removes duplicate click vertices and closes polygons on
   assert.deepEqual(JSON.parse(JSON.stringify(polygon)), [[0, 0], [2, 0], [2, 2]]);
 });
 
+test("new polygons reject crossing edges and zero area without rejecting concave shapes", () => {
+  assert.match(evaluate('polygonDraftError([[0,0],[2,2],[0,2],[2,0]])'), /相交/);
+  assert.match(evaluate('polygonDraftError([[0,0],[1,0],[2,0]])'), /面积为零/);
+  assert.equal(evaluate('polygonDraftError([[0,0],[2,0],[2,2],[1,1],[0,2]])'), null);
+});
+
+test("attribute sorting is numeric, stable, and keeps empty values last", () => {
+  evaluate(`
+    state.data.features = [
+      { id: "ten", geometry: { type: "Point", coordinates: [0,0] }, properties: { score: 10 } },
+      { id: "empty", geometry: { type: "Point", coordinates: [0,0] }, properties: { score: null } },
+      { id: "two", geometry: { type: "Point", coordinates: [0,0] }, properties: { score: 2 } },
+      { id: "also-two", geometry: { type: "Point", coordinates: [0,0] }, properties: { score: 2 } }
+    ];
+    state.attributeFilter = "all";
+    state.attributeSearch = "";
+    state.attributeSort = { key: "field:score", direction: "asc" };
+  `);
+  assert.deepEqual(Array.from(evaluate('attributeRows().map((feature) => feature.id)')),
+    ["two", "also-two", "ten", "empty"]);
+  evaluate('state.attributeSort.direction = "desc"');
+  assert.deepEqual(Array.from(evaluate('attributeRows().map((feature) => feature.id)')),
+    ["ten", "two", "also-two", "empty"]);
+});
+
 test("only features from the active dataset may be edited", () => {
   evaluate('state.activeDataset = { id: "active", name: "Active layer" }');
   assert.equal(evaluate('isEditableFeature({properties:{dataset_id:"active"}})'), true);
@@ -162,7 +187,8 @@ test("field edits preserve numeric and boolean types and reject invalid values",
   evaluate('state.activeFieldTypes = { mixed: "text", score: "number" }; state.declaredFieldTypes = { score: "number" }');
   assert.equal(evaluate('fieldTypeForFeature({ properties: { mixed: 2 } }, "mixed")'), "number");
   assert.equal(evaluate('fieldTypeForFeature({ properties: { score: null } }, "score")'), "number");
-  assert.equal(evaluate('makeFeature({ type: "Point", coordinates: [1, 2] }).properties.score'), null);
+  evaluate('state.declaredFieldDefaults = { score: 5 }');
+  assert.equal(evaluate('makeFeature({ type: "Point", coordinates: [1, 2] }).properties.score'), 5);
 });
 
 test("new fields persist their declared type and default value", async () => {
@@ -188,6 +214,7 @@ test("new fields persist their declared type and default value", async () => {
   await evaluate('addField("score", "number", "0")');
   const saved = JSON.parse(requests.find((request) => request.path === "/api/save").options.body);
   assert.equal(saved.field_types.score, "number");
+  assert.equal(saved.field_defaults.score, 0);
   assert.equal(saved.features[0].properties.score, 0);
   assert.equal(evaluate("state.editHistory.length"), 1);
   await assert.rejects(evaluate('addField("bad", "number", "abc")'), /数字字段/);

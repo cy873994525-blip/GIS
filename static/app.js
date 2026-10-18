@@ -39,10 +39,12 @@ const state = {
   attributeFilter: "all",
   attributeSearch: "",
   attributePage: 1,
+  attributeSort: { key: null, direction: "asc" },
   // 几何编辑
   editFeatureId: null,
   editGeometry: null,
   declaredFieldTypes: {},
+  declaredFieldDefaults: {},
   activeFieldTypes: {},
   editHistory: [],
   redoHistory: [],
@@ -432,6 +434,7 @@ async function loadData() {
   ]);
   state.data = layerData;
   state.declaredFieldTypes = activeRaw ? (activeRaw.field_types || {}) : {};
+  state.declaredFieldDefaults = activeRaw ? (activeRaw.field_defaults || {}) : {};
   state.activeFieldTypes = activeRaw
     ? { ...inferFieldTypes(activeRaw.features), ...state.declaredFieldTypes }
     : {};
@@ -837,17 +840,54 @@ function attributeRows() {
         .some((value) => formatCellValue(value).toLowerCase().includes(keyword));
     });
   }
-  return rows;
+  const { key, direction } = state.attributeSort;
+  if (!key) return rows;
+  const valueFor = (feature) => key === "id" ? feature.id :
+    key === "geometry" ? feature.geometry.type : (feature.properties || {})[key.slice(6)];
+  const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+  return rows.map((feature, index) => ({ feature, index })).sort((a, b) => {
+    const left = valueFor(a.feature);
+    const right = valueFor(b.feature);
+    const leftEmpty = left === null || left === undefined || left === "";
+    const rightEmpty = right === null || right === undefined || right === "";
+    if (leftEmpty !== rightEmpty) return leftEmpty ? 1 : -1;
+    let order = 0;
+    if (!leftEmpty) {
+      order = typeof left === "number" && typeof right === "number"
+        ? left - right
+        : collator.compare(formatCellValue(left), formatCellValue(right));
+    }
+    return order ? (direction === "asc" ? order : -order) : a.index - b.index;
+  }).map((entry) => entry.feature);
 }
 
-function makeHeaderCell(label, field) {
+function toggleAttributeSort(key) {
+  state.attributeSort = state.attributeSort.key === key
+    ? { key, direction: state.attributeSort.direction === "asc" ? "desc" : "asc" }
+    : { key, direction: "asc" };
+  state.attributePage = 1;
+  renderAttributeTable();
+}
+
+function makeHeaderCell(label, field, sortKey) {
   const th = document.createElement("th");
   const inner = document.createElement("span");
   inner.className = "th-inner";
-  const text = document.createElement("span");
-  text.textContent = label;
-  if (field) text.title = `字段：${field}`;
-  inner.appendChild(text);
+  const sort = document.createElement("button");
+  sort.type = "button";
+  sort.className = "column-sort";
+  sort.dataset.sortKey = sortKey;
+  sort.title = `按“${field || label}”排序`;
+  sort.textContent = label;
+  const indicator = document.createElement("span");
+  indicator.className = "sort-indicator";
+  const active = state.attributeSort.key === sortKey;
+  indicator.textContent = active ? (state.attributeSort.direction === "asc" ? "▲" : "▼") : "↕";
+  sort.appendChild(indicator);
+  sort.addEventListener("click", () => toggleAttributeSort(sortKey));
+  th.setAttribute("aria-sort", active
+    ? (state.attributeSort.direction === "asc" ? "ascending" : "descending") : "none");
+  inner.appendChild(sort);
   if (field && !DISPLAY_ONLY_FIELDS.has(field) && state.data.features.some((feature) =>
     isEditableFeature(feature) && Object.prototype.hasOwnProperty.call(feature.properties || {}, field))) {
     const remove = document.createElement("button");
@@ -883,9 +923,10 @@ function renderAttributeTable() {
 
   head.innerHTML = "";
   const headRow = document.createElement("tr");
-  headRow.appendChild(makeHeaderCell("ID", null));
-  for (const field of fields) headRow.appendChild(makeHeaderCell(fieldLabel(field), field));
-  headRow.appendChild(makeHeaderCell("几何类型", null));
+  headRow.appendChild(makeHeaderCell("ID", null, "id"));
+  for (const field of fields) headRow.appendChild(makeHeaderCell(fieldLabel(field), field,
+    `field:${field}`));
+  headRow.appendChild(makeHeaderCell("几何类型", null, "geometry"));
   head.appendChild(headRow);
 
   body.innerHTML = "";
@@ -899,6 +940,16 @@ function renderAttributeTable() {
     const idCell = document.createElement("td");
     idCell.className = "cell-id";
     idCell.textContent = feature.id;
+    const locate = document.createElement("button");
+    locate.type = "button";
+    locate.className = "row-locate";
+    locate.textContent = "定位";
+    locate.title = `将地图定位到 ${feature.id}`;
+    locate.addEventListener("click", (event) => {
+      event.stopPropagation();
+      focusFeature(feature);
+    });
+    idCell.appendChild(locate);
     row.appendChild(idCell);
 
     for (const field of fields) {
@@ -1122,6 +1173,7 @@ async function addField(field, kind, defaultRaw) {
   const defaultValue = coerceFieldValue(defaultRaw, undefined, kind);
   await persistActiveFeatures((nextData) => {
     nextData.field_types = { ...(nextData.field_types || {}), [field]: kind };
+    nextData.field_defaults = { ...(nextData.field_defaults || {}), [field]: defaultValue };
     for (const feature of nextData.features) {
       if (!feature.properties) feature.properties = {};
       feature.properties[field] = defaultValue;
@@ -1141,6 +1193,7 @@ async function removeField(field) {
         if (feature.properties) delete feature.properties[field];
       }
       if (data.field_types) delete data.field_types[field];
+      if (data.field_defaults) delete data.field_defaults[field];
     }, `已从当前数据集删除字段“${field}”。`);
   } catch (error) {
     setNotice(`删除字段失败：${error.message}`);
@@ -1805,20 +1858,31 @@ function getDataBounds() {
 }
 
 function fitView() {
-  const dataBounds = getDataBounds();
-  const lowerLeft = projectWorld([dataBounds.minX, dataBounds.minY]);
-  const upperRight = projectWorld([dataBounds.maxX, dataBounds.maxY]);
-  const padding = 72;
+  fitBounds(getDataBounds(), 72, MAX_TILE_ZOOM);
+}
+
+function fitBounds(bounds, padding, maximumZoom) {
+  const lowerLeft = projectWorld([bounds.minX, bounds.minY]);
+  const upperRight = projectWorld([bounds.maxX, bounds.maxY]);
   const minimumSpan = state.geographic ? 0.01 : 1;
-  const width = Math.max(minimumSpan, upperRight[0] - lowerLeft[0]);
-  const height = Math.max(minimumSpan, upperRight[1] - lowerLeft[1]);
+  const width = Math.max(minimumSpan, Math.abs(upperRight[0] - lowerLeft[0]));
+  const height = Math.max(minimumSpan, Math.abs(upperRight[1] - lowerLeft[1]));
   const minimumScale = state.geographic ? TILE_SIZE / 360 : 0.00001;
-  const maximumScale = state.geographic ? TILE_SIZE * 2 ** MAX_TILE_ZOOM / 360 : 3.5;
+  const maximumScale = state.geographic ? TILE_SIZE * 2 ** maximumZoom / 360 : 3.5;
   state.scale = Math.max(minimumScale, Math.min(maximumScale,
     Math.min((state.viewWidth - padding * 2) / width, (state.viewHeight - padding * 2) / height)));
   state.offsetX = state.viewWidth / 2 - (lowerLeft[0] + upperRight[0]) / 2 * state.scale;
   state.offsetY = state.viewHeight / 2 - (lowerLeft[1] + upperRight[1]) / 2 * state.scale;
   draw();
+}
+
+function focusFeature(feature) {
+  const layer = (feature.properties || {}).layer || "未命名";
+  state.visibleLayers.add(layer);
+  renderLayers();
+  selectFeatures([feature.id]);
+  fitBounds(getBounds(feature), 92, 15);
+  setNotice(`已定位到 ${feature.properties.name || feature.id}。`);
 }
 
 function applySelection(ids, operation = "replace") {
@@ -2087,7 +2151,8 @@ function makeFeature(geometry) {
   const properties = { name, layer, kind: geometry.type.toLowerCase() };
   for (const [field, kind] of Object.entries(state.declaredFieldTypes)) {
     if (!Object.prototype.hasOwnProperty.call(properties, field)) {
-      properties[field] = kind === "text" ? "" : null;
+      properties[field] = Object.prototype.hasOwnProperty.call(state.declaredFieldDefaults, field)
+        ? deepCopy(state.declaredFieldDefaults[field]) : kind === "text" ? "" : null;
     }
   }
   return {
@@ -2161,6 +2226,67 @@ function normaliseDraftCoordinates(draft, polygon = false) {
   return coordinates;
 }
 
+function polygonDraftError(points) {
+  if (points.length < 3) return "画面至少需要 3 个节点。";
+  if (points.some((point) => !Number.isFinite(point[0]) || !Number.isFinite(point[1]))) {
+    return "面节点坐标必须是有效数字。";
+  }
+  const cross = (a, b, c) =>
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  const onSegment = (a, b, p) => p[0] >= Math.min(a[0], b[0]) &&
+    p[0] <= Math.max(a[0], b[0]) && p[1] >= Math.min(a[1], b[1]) &&
+    p[1] <= Math.max(a[1], b[1]);
+  const intersects = (a, b, c, d) => {
+    if (Math.max(a[0], b[0]) < Math.min(c[0], d[0]) ||
+        Math.max(c[0], d[0]) < Math.min(a[0], b[0]) ||
+        Math.max(a[1], b[1]) < Math.min(c[1], d[1]) ||
+        Math.max(c[1], d[1]) < Math.min(a[1], b[1])) return false;
+    const tolerance = Math.max(
+      Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]),
+      Math.abs(d[0] - c[0]), Math.abs(d[1] - c[1]),
+    ) ** 2 * 1e-12;
+    const o1 = cross(a, b, c);
+    const o2 = cross(a, b, d);
+    const o3 = cross(c, d, a);
+    const o4 = cross(c, d, b);
+    if (Math.abs(o1) <= tolerance && onSegment(a, b, c)) return true;
+    if (Math.abs(o2) <= tolerance && onSegment(a, b, d)) return true;
+    if (Math.abs(o3) <= tolerance && onSegment(c, d, a)) return true;
+    if (Math.abs(o4) <= tolerance && onSegment(c, d, b)) return true;
+    return (o1 > tolerance) !== (o2 > tolerance) &&
+      (o3 > tolerance) !== (o4 > tolerance);
+  };
+  for (let index = 0; index < points.length; index += 1) {
+    const next = (index + 1) % points.length;
+    if (points[index][0] === points[next][0] && points[index][1] === points[next][1]) {
+      return `第 ${index + 1} 条边长度为零，请调整节点。`;
+    }
+    for (let other = index + 2; other < points.length; other += 1) {
+      if (index === 0 && other === points.length - 1) continue;
+      if (intersects(points[index], points[next], points[other],
+          points[(other + 1) % points.length])) {
+        return `第 ${index + 1} 与第 ${other + 1} 条边相交，请调整节点。`;
+      }
+    }
+  }
+  const origin = points[0];
+  let doubleArea = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const a = points[index];
+    const b = points[(index + 1) % points.length];
+    doubleArea += (a[0] - origin[0]) * (b[1] - origin[1]) -
+      (b[0] - origin[0]) * (a[1] - origin[1]);
+  }
+  const xs = points.map((point) => point[0]);
+  const ys = points.map((point) => point[1]);
+  const maxArea = (Math.max(...xs) - Math.min(...xs)) *
+    (Math.max(...ys) - Math.min(...ys));
+  if (Math.abs(doubleArea) <= maxArea * 1e-12) {
+    return "面面积为零或过小，请让至少三个节点不共线。";
+  }
+  return null;
+}
+
 async function finishDraft() {
   const coordinates = normaliseDraftCoordinates(state.draft, state.mode === "polygon");
   const draftSize = coordinates.length;
@@ -2175,6 +2301,11 @@ async function finishDraft() {
   }
 
   if (state.mode === "polygon" && draftSize >= 3) {
+    const issue = polygonDraftError(coordinates);
+    if (issue) {
+      setNotice(`画面未保存：${issue}（可撤销节点后重画）`);
+      return;
+    }
     const ring = [...coordinates, coordinates[0]];
     await addFeature({ type: "Polygon", coordinates: [ring] });
     state.draft = [];

@@ -118,6 +118,18 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def field_value_matches_type(value, kind):
+    if value is None:
+        return True
+    if kind == "text":
+        return isinstance(value, str)
+    if kind == "number":
+        return type(value) in (int, float) and (
+            not isinstance(value, float) or math.isfinite(value)
+        )
+    return isinstance(value, bool)
+
+
 def validate_feature_collection(payload):
     if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
         raise ValueError("payload must be a GeoJSON FeatureCollection")
@@ -132,6 +144,13 @@ def validate_feature_collection(payload):
         for name, kind in field_types.items()
     ):
         raise ValueError("field_types must map field names to text, number or boolean")
+    field_defaults = payload.get("field_defaults", {})
+    if not isinstance(field_defaults, dict) or any(name not in field_types for name in field_defaults):
+        raise ValueError("field_defaults must refer to declared field_types")
+    for name, value in field_defaults.items():
+        kind = field_types[name]
+        if not field_value_matches_type(value, kind):
+            raise ValueError(f"default for field {name} must be {kind}")
     for feature in features:
         validate_feature(feature)
         properties = feature.get("properties", {})
@@ -139,15 +158,7 @@ def validate_feature_collection(payload):
             if name not in properties or properties[name] is None:
                 continue
             value = properties[name]
-            if kind == "text":
-                valid = isinstance(value, str)
-            elif kind == "number":
-                valid = type(value) in (int, float) and (
-                    not isinstance(value, float) or math.isfinite(value)
-                )
-            else:
-                valid = isinstance(value, bool)
-            if not valid:
+            if not field_value_matches_type(value, kind):
                 raise ValueError(f"field {name} must contain {kind} values")
     return payload
 

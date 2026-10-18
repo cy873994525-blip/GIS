@@ -37,6 +37,17 @@ class FieldTypeValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "field_types"):
             server.validate_feature_collection(self.make_data("x", "unsupported"))
 
+    def test_default_must_match_declared_type(self):
+        payload = self.make_data(1)
+        payload["field_defaults"] = {"score": 5}
+        server.validate_feature_collection(payload)
+        payload["field_defaults"] = {"score": "bad"}
+        with self.assertRaisesRegex(ValueError, "default for field score"):
+            server.validate_feature_collection(payload)
+        payload["field_defaults"] = {"missing": 1}
+        with self.assertRaisesRegex(ValueError, "field_defaults"):
+            server.validate_feature_collection(payload)
+
     def test_declared_types_survive_storage_and_reject_bad_write(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
@@ -51,11 +62,13 @@ class FieldTypeValidationTests(unittest.TestCase):
                 server.ensure_storage()
                 payload = server.read_geojson()
                 payload["field_types"] = {"score": "number"}
+                payload["field_defaults"] = {"score": 3}
                 for feature in payload["features"]:
                     feature["properties"]["score"] = 1
                 server.write_geojson(payload)
                 restored = server.read_geojson()
                 self.assertEqual(restored["field_types"]["score"], "number")
+                self.assertEqual(restored["field_defaults"]["score"], 3)
                 self.assertEqual(restored["features"][0]["properties"]["score"], 1)
                 restored["features"][0]["properties"]["score"] = "bad"
                 with self.assertRaisesRegex(ValueError, "field score must contain number"):
