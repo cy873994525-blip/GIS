@@ -2,6 +2,7 @@ const canvas = document.getElementById("mapCanvas");
 const ctx = canvas.getContext("2d");
 const tileLayer = document.getElementById("baseMapTiles");
 const visibleTiles = new Map();
+let drawFramePending = false;
 const MAX_MERCATOR_LAT = 85.05112878;
 const TILE_SIZE = 256;
 const MAX_TILE_ZOOM = 19;
@@ -58,6 +59,8 @@ const state = {
   geographic: false,
   baseMapEnabled: true,
   baseMapErrorShown: false,
+  layerOrder: [],
+  layerStyles: {},
   snapEnabled: true,
   snapTarget: null,
 };
@@ -84,6 +87,65 @@ const layerColors = {
   "功能区": "#6b7d38",
   "自定义": "#176d6a",
 };
+
+const LAYER_PREFERENCES_KEY = "gis-vector-demo-layer-preferences-v1";
+
+function loadLayerPreferences() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYER_PREFERENCES_KEY) || "{}");
+    if (Array.isArray(saved.order)) state.layerOrder = saved.order.filter((name) => typeof name === "string");
+    if (saved.styles && typeof saved.styles === "object") state.layerStyles = saved.styles;
+  } catch (error) {
+    // Invalid local preferences should not prevent the map from loading.
+  }
+}
+
+function saveLayerPreferences() {
+  try {
+    localStorage.setItem(LAYER_PREFERENCES_KEY, JSON.stringify({
+      order: state.layerOrder,
+      styles: state.layerStyles,
+    }));
+  } catch (error) {
+    // Keep the current-session style when browser storage is unavailable.
+  }
+}
+
+function ensureLayerPreferences(names) {
+  const available = new Set(names);
+  const remembered = state.layerOrder.filter((name) => available.has(name));
+  const newNames = names.filter((name) => !remembered.includes(name))
+    .sort((a, b) => a.localeCompare(b, "zh-CN"));
+  state.layerOrder = [...remembered, ...newNames];
+  for (const name of names) {
+    const existing = state.layerStyles[name];
+    state.layerStyles[name] = {
+      color: /^#[0-9a-f]{6}$/i.test(existing?.color || "")
+        ? existing.color
+        : layerColors[name] || layerColors["自定义"],
+      opacity: Number.isFinite(Number(existing?.opacity))
+        ? Math.max(0.15, Math.min(1, Number(existing.opacity)))
+        : 0.62,
+    };
+  }
+  saveLayerPreferences();
+}
+
+function layerStyle(name) {
+  if (!state.layerStyles[name]) {
+    state.layerStyles[name] = { color: layerColors[name] || layerColors["自定义"], opacity: 0.62 };
+  }
+  return state.layerStyles[name];
+}
+
+function rgbaFromHex(hex, alpha) {
+  const value = String(hex || "").replace("#", "");
+  if (!/^[0-9a-f]{6}$/i.test(value)) return `rgba(23, 109, 106, ${alpha})`;
+  const channels = [0, 2, 4].map((index) => parseInt(value.slice(index, index + 2), 16));
+  return `rgba(${channels.join(", ")}, ${alpha})`;
+}
+
+loadLayerPreferences();
 
 const hints = {
   pan: "当前：漫游。拖拽移动地图，滚轮缩放。",
@@ -601,12 +663,22 @@ function renderLayers() {
     counts[name] = (counts[name] || 0) + 1;
   }
 
+  const names = Object.keys(counts);
+  ensureLayerPreferences(names);
+
   const layerList = document.getElementById("layerList");
   layerList.innerHTML = "";
 
-  Object.keys(counts).sort().forEach((name) => {
+  state.layerOrder.filter((name) => counts[name]).forEach((name) => {
     const row = document.createElement("div");
     row.className = "layer-row";
+    row.draggable = true;
+    row.dataset.layer = name;
+
+    const dragHandle = document.createElement("span");
+    dragHandle.className = "layer-drag-handle";
+    dragHandle.textContent = "⋮⋮";
+    dragHandle.title = "拖动调整图层顺序";
 
     const label = document.createElement("label");
     const input = document.createElement("input");
@@ -622,7 +694,7 @@ function renderLayers() {
     });
     const swatch = document.createElement("i");
     swatch.className = "layer-swatch";
-    swatch.style.background = layerColors[name] || layerColors["自定义"];
+    swatch.style.background = layerStyle(name).color;
     const labelText = document.createElement("span");
     labelText.textContent = name;
     label.append(input, swatch, labelText);
@@ -631,7 +703,62 @@ function renderLayers() {
     count.className = "layer-count";
     count.textContent = `${counts[name]} 个`;
 
-    row.append(label, count);
+    const styleControls = document.createElement("div");
+    styleControls.className = "layer-style-controls";
+
+    const colorInput = document.createElement("input");
+    colorInput.type = "color";
+    colorInput.className = "layer-color-input";
+    colorInput.value = layerStyle(name).color;
+    colorInput.title = "设置图层颜色";
+    colorInput.setAttribute("aria-label", `${name} 图层颜色`);
+    colorInput.addEventListener("input", () => {
+      layerStyle(name).color = colorInput.value;
+      swatch.style.background = colorInput.value;
+      saveLayerPreferences();
+      draw();
+    });
+
+    const opacityInput = document.createElement("input");
+    opacityInput.type = "range";
+    opacityInput.min = "0.15";
+    opacityInput.max = "1";
+    opacityInput.step = "0.05";
+    opacityInput.value = String(layerStyle(name).opacity);
+    opacityInput.title = "设置图层透明度";
+    opacityInput.setAttribute("aria-label", `${name} 图层透明度`);
+    opacityInput.addEventListener("input", () => {
+      layerStyle(name).opacity = Number(opacityInput.value);
+      saveLayerPreferences();
+      draw();
+    });
+    styleControls.append(colorInput, opacityInput);
+
+    row.append(dragHandle, label, count, styleControls);
+    row.addEventListener("dragstart", (event) => {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", name);
+      row.classList.add("is-dragging");
+    });
+    row.addEventListener("dragend", () => row.classList.remove("is-dragging"));
+    row.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      row.classList.add("is-drop-target");
+    });
+    row.addEventListener("dragleave", () => row.classList.remove("is-drop-target"));
+    row.addEventListener("drop", (event) => {
+      event.preventDefault();
+      row.classList.remove("is-drop-target");
+      const source = event.dataTransfer.getData("text/plain");
+      if (!source || source === name) return;
+      const order = state.layerOrder.filter((layerName) => layerName !== source);
+      const targetIndex = order.indexOf(name);
+      order.splice(targetIndex < 0 ? order.length : targetIndex, 0, source);
+      state.layerOrder = order;
+      saveLayerPreferences();
+      renderLayers();
+      draw();
+    });
     layerList.appendChild(row);
   });
 
@@ -1612,13 +1739,16 @@ function drawFeature(feature) {
     ? state.editGeometry
     : feature.geometry;
   const selected = state.selectedIds.has(feature.id);
-  const color = layerColors[layer] || layerColors["自定义"];
+  const style = layerStyle(layer);
+  const color = style.color;
+  const opacity = style.opacity;
 
   ctx.save();
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
   ctx.strokeStyle = selected ? "#f2c94c" : color;
-  ctx.fillStyle = selected ? "rgba(242, 201, 76, 0.35)" : `${color}40`;
+  ctx.fillStyle = selected ? "rgba(242, 201, 76, 0.35)" : rgbaFromHex(color, opacity * 0.56);
+  ctx.globalAlpha = selected ? 1 : opacity;
   ctx.lineWidth = selected ? 5 : 2.4;
 
   if (geom.type === "Point") {
@@ -1735,17 +1865,67 @@ function drawSelectionBox() {
   ctx.restore();
 }
 
+function niceScaleDistance(rawDistance) {
+  if (!Number.isFinite(rawDistance) || rawDistance <= 0) return 1;
+  const exponent = Math.floor(Math.log10(rawDistance));
+  const base = rawDistance / (10 ** exponent);
+  const step = base >= 5 ? 5 : base >= 2 ? 2 : 1;
+  return step * (10 ** exponent);
+}
+
+function updateMapOverlays() {
+  const scaleBar = document.getElementById("mapScaleBar");
+  const scaleLabel = document.getElementById("mapScaleLabel");
+  const zoomLabel = document.getElementById("mapZoomLabel");
+  if (!scaleBar || !scaleLabel || !zoomLabel) return;
+
+  const barPixels = 112;
+  let distance = barPixels / Math.max(state.scale, 0.000001);
+  let unit = "地图单位";
+  if (state.geographic) {
+    const centerWorld = screenToWorld(state.viewWidth / 2, state.viewHeight / 2);
+    const latitude = Math.max(-85, Math.min(85, centerWorld[1]));
+    const zoom = Math.log2(Math.max(state.scale, TILE_SIZE / 360) * 360 / TILE_SIZE);
+    const metersPerPixel = 156543.03392 * Math.cos(latitude * Math.PI / 180) / (2 ** zoom);
+    distance = niceScaleDistance(barPixels * metersPerPixel);
+    unit = distance >= 1000 ? "km" : "m";
+    scaleLabel.textContent = distance >= 1000
+      ? `${(distance / 1000).toFixed(distance >= 10000 ? 0 : 1)} km`
+      : `${Math.round(distance)} m`;
+    scaleBar.style.width = `${Math.max(34, Math.min(132, distance / metersPerPixel))}px`;
+  } else {
+    distance = niceScaleDistance(distance);
+    scaleLabel.textContent = `${Number.isInteger(distance) ? distance : distance.toFixed(1)} ${unit}`;
+    scaleBar.style.width = `${Math.max(34, Math.min(132, distance * state.scale))}px`;
+  }
+  zoomLabel.textContent = `缩放 ${state.scale.toFixed(2)}×`;
+}
+
 function draw() {
+  if (drawFramePending) return;
+  drawFramePending = true;
+  requestAnimationFrame(() => {
+    drawFramePending = false;
+    drawFrame();
+  });
+}
+
+function drawFrame() {
   renderBasemapTiles();
   ctx.clearRect(0, 0, state.viewWidth, state.viewHeight);
   if (!state.geographic) drawGrid();
-  for (const feature of state.data.features) {
-    drawFeature(feature);
-  }
+  const orderIndex = new Map(state.layerOrder.map((name, index) => [name, index]));
+  const orderedFeatures = [...state.data.features].sort((a, b) => {
+    const layerA = a.properties.layer || "未命名";
+    const layerB = b.properties.layer || "未命名";
+    return (orderIndex.get(layerB) ?? 0) - (orderIndex.get(layerA) ?? 0);
+  });
+  for (const feature of orderedFeatures) drawFeature(feature);
   drawDraft();
   drawSelectionBox();
   drawEditHandles();
   drawSnapIndicator();
+  updateMapOverlays();
 }
 
 function distancePointToSegment(p, a, b) {
@@ -2382,8 +2562,9 @@ function handleEditMouseDown(event, world) {
   }
 }
 
-canvas.addEventListener("mousedown", (event) => {
+canvas.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
+  canvas.setPointerCapture(event.pointerId);
   const rect = canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
@@ -2401,7 +2582,7 @@ canvas.addEventListener("mousedown", (event) => {
   }
 });
 
-canvas.addEventListener("mousemove", (event) => {
+canvas.addEventListener("pointermove", (event) => {
   const rect = canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
@@ -2471,7 +2652,7 @@ canvas.addEventListener("mousemove", (event) => {
   }
 });
 
-canvas.addEventListener("mouseup", async (event) => {
+canvas.addEventListener("pointerup", async (event) => {
   const rect = canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
@@ -2514,6 +2695,7 @@ canvas.addEventListener("mouseup", async (event) => {
   }
 
   state.dragging = false;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
 });
 
 canvas.addEventListener("click", async (event) => {
@@ -2604,7 +2786,7 @@ canvas.addEventListener("wheel", (event) => {
   zoomAt(x, y, event.deltaY < 0 ? 1.12 : 0.88);
 });
 
-canvas.addEventListener("mouseleave", () => {
+canvas.addEventListener("pointerleave", () => {
   if (state.snapTarget) {
     state.snapTarget = null;
     draw();
@@ -2618,6 +2800,22 @@ canvas.addEventListener("mouseleave", () => {
     syncGeometryControls();
     draw();
   }
+});
+
+canvas.addEventListener("pointercancel", () => {
+  if (state.vertexDrag && state.editGeometry) {
+    state.editGeometry.coordinates = deepCopy(state.vertexDrag.origin);
+    state.vertexDrag = null;
+  }
+  if (state.featureDrag && state.editGeometry) {
+    state.editGeometry.coordinates = deepCopy(state.featureDrag.origin);
+    state.featureDrag = null;
+  }
+  state.dragging = false;
+  state.boxStart = null;
+  state.boxEnd = null;
+  state.snapTarget = null;
+  draw();
 });
 
 window.addEventListener("keydown", (event) => {

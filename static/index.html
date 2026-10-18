@@ -127,6 +127,12 @@
           <canvas id="mapCanvas" aria-label="地图画布"></canvas>
           <div class="map-badge"><span class="live-dot"></span><span id="mapBadgeText">模拟平面坐标系</span></div>
           <div id="coordinateReadout" class="coordinate-readout">坐标 —</div>
+          <div class="map-north-arrow" aria-label="指北针" title="北"><span>N</span><i></i></div>
+          <div class="map-scale-control" aria-label="比例尺">
+            <span id="mapScaleLabel">—</span>
+            <i id="mapScaleBar"></i>
+          </div>
+          <div id="mapZoomLabel" class="map-zoom-label">缩放 —</div>
           <a id="mapAttribution" class="map-attribution" href="https://www.amap.com/" target="_blank" rel="noopener noreferrer" hidden>© 高德地图</a>
         </div>
         <div id="hint" class="hint">当前：漫游。拖拽移动地图，滚轮缩放。</div>
