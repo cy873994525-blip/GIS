@@ -175,6 +175,7 @@ def validate_feature(feature):
     geometry_type = feature["geometry"].get("type")
     if geometry_type not in {
         "Point",
+        "MultiPoint",
         "LineString",
         "Polygon",
         "MultiLineString",
@@ -203,6 +204,12 @@ def validate_geometry_coordinates(geometry_type, coordinates):
         return
     if geometry_type == "Point":
         validate_position(coordinates)
+        return
+    if geometry_type == "MultiPoint":
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError("MultiPoint must contain at least one position")
+        for position in coordinates:
+            validate_position(position)
         return
     if geometry_type == "LineString":
         if not isinstance(coordinates, list) or len(coordinates) < 2:
@@ -537,15 +544,17 @@ SHAPE_BASE_TYPE = {
     1: "Point",
     3: "LineString",
     5: "Polygon",
+    8: "MultiPoint",
     11: "Point",
     13: "LineString",
     15: "Polygon",
+    18: "MultiPoint",
     21: "Point",
     23: "LineString",
     25: "Polygon",
+    28: "MultiPoint",
 }
 SUPPORTED_SHAPE_TYPES = set(SHAPE_BASE_TYPE)
-MULTIPOINT_TYPES = {8, 18, 28}  # MultiPoint / MultiPointZ / MultiPointM（暂不支持渲染）
 
 
 def ring_signed_area(ring):
@@ -621,10 +630,6 @@ def read_shp_records(shp_bytes):
     if len(shp_bytes) < 100:
         raise ValueError("SHP file is too short")
     declared_type = struct.unpack_from("<i", shp_bytes, 32)[0]
-    if declared_type in MULTIPOINT_TYPES:
-        raise ValueError(
-            "当前 Demo 暂不支持 MultiPoint 图层；请在 GIS 软件中把多点要素转为点/线后重新导出"
-        )
     if declared_type not in SUPPORTED_SHAPE_TYPES:
         raise ValueError(f"unsupported Shapefile geometry type: {declared_type}")
     features = []
@@ -644,7 +649,7 @@ def read_shp_records(shp_bytes):
             continue
         if record_type not in SUPPORTED_SHAPE_TYPES:
             raise ValueError(f"unsupported Shapefile geometry type: {record_type}")
-        has_z = record_type in {11, 13, 15}
+        has_z = record_type in {11, 13, 15, 18}
         if record_type in {1, 11, 21}:
             # Point / PointZ / PointM
             x, y = struct.unpack_from("<dd", shp_bytes, content_start + 4)
@@ -655,6 +660,30 @@ def read_shp_records(shp_bytes):
                 z, = struct.unpack_from("<d", shp_bytes, content_start + 20)
                 coordinates.append(z)
             geometry = {"type": "Point", "coordinates": coordinates}
+        elif record_type in {8, 18, 28}:
+            # MultiPoint / MultiPointZ / MultiPointM：box + numPoints + points
+            if content_start + 40 > content_end:
+                raise ValueError(f"SHP record {record_number} has an invalid header")
+            num_points, = struct.unpack_from("<i", shp_bytes, content_start + 36)
+            points_offset = content_start + 40
+            expected_end = points_offset + num_points * 16
+            if expected_end > content_end:
+                raise ValueError(f"SHP record {record_number} coordinate data is truncated")
+            points = [
+                list(struct.unpack_from("<dd", shp_bytes, points_offset + index * 16))
+                for index in range(num_points)
+            ]
+            if has_z:
+                z_array_start = expected_end + 16  # 跳过 zmin/zmax
+                z_array_end = z_array_start + num_points * 8
+                if z_array_end > content_end:
+                    raise ValueError(f"SHP record {record_number} Z data is truncated")
+                z_values = [
+                    struct.unpack_from("<d", shp_bytes, z_array_start + index * 8)[0]
+                    for index in range(num_points)
+                ]
+                points = [point + [z] for point, z in zip(points, z_values)]
+            geometry = {"type": "MultiPoint", "coordinates": points}
         elif record_type in {3, 5, 13, 15, 23, 25}:
             # PolyLine / Polygon（及 Z/M 变体）：几何头布局相同，
             # Z 类型的 Z 数组位于点数组之后。

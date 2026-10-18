@@ -1408,6 +1408,10 @@ function extractVertices(geometry) {
     push([], true);
     return vertices;
   }
+  if (geometry.type === "MultiPoint") {
+    coordinates.forEach((_, index) => push([index], true));
+    return vertices;
+  }
   if (geometry.type === "LineString") {
     coordinates.forEach((_, index) => push([index], true));
     return vertices;
@@ -1589,6 +1593,13 @@ function hitTestEdge(worldPoint) {
 // 线至少 2 个点；面环至少 4 个位置（3 个不重复点 + 闭合重复点）。
 function vertexRemovalBlocker(geometry, path) {
   if (!path.length) return "点要素只有一个节点，无法删除。";
+  if (geometry.type === "MultiPoint") {
+    const points = geometry.coordinates;
+    if (points.length - 1 < 1) {
+      return "多点要素至少需要 1 个点，不能再删了。";
+    }
+    return null;
+  }
   const ringPath = path.slice(0, -1);
   const ring = resolveRing(geometry, ringPath);
   const isRing = geometry.type === "Polygon" || geometry.type === "MultiPolygon";
@@ -1760,6 +1771,19 @@ function drawFeature(feature) {
     ctx.strokeStyle = "#ffffff";
     ctx.lineWidth = 2;
     ctx.stroke();
+  }
+
+  if (geom.type === "MultiPoint") {
+    for (const coord of geom.coordinates) {
+      const p = worldToScreen(coord);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, selected ? 8 : 6, 0, Math.PI * 2);
+      ctx.fillStyle = selected ? "#f2c94c" : color;
+      ctx.fill();
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
   }
 
   if (geom.type === "LineString") {
@@ -1974,6 +1998,14 @@ function hitTest(worldPoint) {
       const point = worldToScreen(geom.coordinates);
       if (Math.hypot(cursor.x - point.x, cursor.y - point.y) <= 12) return feature;
     }
+    if (geom.type === "MultiPoint") {
+      if (geom.coordinates.some((coord) => {
+        const point = worldToScreen(coord);
+        return Math.hypot(cursor.x - point.x, cursor.y - point.y) <= 12;
+      })) {
+        return feature;
+      }
+    }
     if (geom.type === "LineString") {
       for (let s = 1; s < geom.coordinates.length; s++) {
         if (nearSegment(geom.coordinates[s - 1], geom.coordinates[s])) {
@@ -2009,6 +2041,7 @@ function getBounds(feature) {
   const coords = [];
   const geom = feature.geometry;
   if (geom.type === "Point") coords.push(geom.coordinates);
+  if (geom.type === "MultiPoint") coords.push(...geom.coordinates);
   if (geom.type === "LineString") coords.push(...geom.coordinates);
   if (geom.type === "Polygon") coords.push(...geom.coordinates[0]);
   if (geom.type === "MultiLineString") coords.push(...geom.coordinates.flat());
@@ -2123,6 +2156,9 @@ function featureIntersectsBox(feature, box) {
       bounds.maxY < box.minY || bounds.minY > box.maxY) return false;
   const geometry = feature.geometry;
   if (geometry.type === "Point") return coordinateInBox(geometry.coordinates, box);
+  if (geometry.type === "MultiPoint") {
+    return geometry.coordinates.some((coord) => coordinateInBox(coord, box));
+  }
   for (const line of geometryLines(geometry)) {
     if (line.some((coord) => coordinateInBox(coord, box))) return true;
     for (let index = 1; index < line.length; index += 1) {
