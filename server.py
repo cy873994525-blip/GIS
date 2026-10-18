@@ -813,6 +813,267 @@ def convert_shapefile_parts(file_name, main_bytes, sidecars):
     return payload, crs_name, f"{base_name}.shp", crs_kind, crs_wkt
 
 
+# ---------------------------------------------------------------------------
+# Shapefile 导出（GeoJSON → .shp/.shx/.dbf/.prj 打包 ZIP）
+# ---------------------------------------------------------------------------
+# 仅依赖 Python 标准库。支持 Point(1)、PolyLine(3)、Polygon(5)、MultiPoint(8)，
+# 坐标取前两维（忽略 Z）。属性写入 dBase III（.dbf），字符字段按 UTF-8 编码
+# 并附带 .cpg=UTF-8，可被本模块的 read_dbf_records 读回（roundtrip）。
+SHAPE_EXPORT_TYPES = {1: "Point", 3: "PolyLine", 5: "Polygon", 8: "MultiPoint"}
+PRJ_WGS84_WKT = (
+    'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",'
+    'SPHEROID["WGS_1984",6378137.0,298.257223563]],'
+    'PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]'
+)
+
+
+def _feature_base_kind(geometry):
+    """返回要素几何的导出基类：Point / MultiPoint / Line / Polygon。"""
+    geom_type = (geometry or {}).get("type")
+    if geom_type == "Point":
+        return "Point"
+    if geom_type == "MultiPoint":
+        return "MultiPoint"
+    if geom_type in {"LineString", "MultiLineString"}:
+        return "Line"
+    if geom_type in {"Polygon", "MultiPolygon"}:
+        return "Polygon"
+    raise ValueError(f"不支持导出的几何类型: {geom_type}")
+
+
+def _walk_xy(coordinates):
+    """递归产出所有 (x, y) 坐标对（只取前两维）。"""
+    if (
+        isinstance(coordinates, list)
+        and len(coordinates) >= 2
+        and all(isinstance(item, (int, float)) for item in coordinates[:2])
+    ):
+        yield (coordinates[0], coordinates[1])
+    elif isinstance(coordinates, list):
+        for child in coordinates:
+            yield from _walk_xy(child)
+
+
+def _bbox_of_payload(payload):
+    xs, ys = [], []
+    for feature in payload.get("features", []):
+        for x, y in _walk_xy((feature.get("geometry") or {}).get("coordinates")):
+            xs.append(x)
+            ys.append(y)
+    if not xs:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _line_parts_for(geometry):
+    """把线/面几何转成 parts 列表（每个 part 是一组 [x, y] 坐标）。"""
+    geom_type = geometry["type"]
+    coords = geometry["coordinates"]
+    if geom_type == "LineString":
+        return [[(p[0], p[1]) for p in coords]]
+    if geom_type == "MultiLineString":
+        return [[(p[0], p[1]) for p in part] for part in coords]
+    if geom_type == "Polygon":
+        return [[(p[0], p[1]) for p in ring] for ring in coords]
+    if geom_type == "MultiPolygon":
+        return [
+            [(p[0], p[1]) for p in ring]
+            for poly in coords
+            for ring in poly
+        ]
+    raise ValueError(f"不支持导出的几何类型: {geom_type}")
+
+
+def _shapefile_type_for(geoms):
+    kinds = {_feature_base_kind(geom) for geom in geoms}
+    if len(kinds) > 1:
+        raise ValueError("混合几何类型（点/线/面）不能导出为单个 Shapefile 图层；请先按类型拆分数据集")
+    kind = kinds.pop() if kinds else "Point"
+    return {"Point": 1, "MultiPoint": 8, "Line": 3, "Polygon": 5}[kind]
+
+
+def _encode_shp_record_content(shp_type, geometry):
+    """编码单个 Shapefile 记录内容（含类型号），返回 bytes。"""
+    kind = _feature_base_kind(geometry)
+    if shp_type == 1:  # Point
+        x, y = geometry["coordinates"][0], geometry["coordinates"][1]
+        return struct.pack("<idd", 1, x, y)
+    if shp_type == 8:  # MultiPoint
+        points = [(p[0], p[1]) for p in geometry["coordinates"]]
+        if not points:
+            return struct.pack("<ii", 8, 0)
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        header = struct.pack("<i4di", 8, min(xs), min(ys), max(xs), max(ys), len(points))
+        return header + b"".join(struct.pack("<dd", x, y) for x, y in points)
+    if shp_type in (3, 5):  # PolyLine / Polygon
+        parts = _line_parts_for(geometry)
+        points = [(x, y) for part in parts for x, y in part]
+        if not points:
+            raise ValueError("线/面要素没有有效坐标")
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        num_parts = len(parts)
+        num_points = len(points)
+        header = struct.pack(
+            "<i4dii",
+            shp_type,
+            min(xs), min(ys), max(xs), max(ys),
+            num_parts,
+            num_points,
+        )
+        parts_bytes = b"".join(struct.pack("<i", index) for index in range(num_parts))
+        points_bytes = b"".join(struct.pack("<dd", x, y) for x, y in points)
+        return header + parts_bytes + points_bytes
+    raise ValueError(f"不支持导出的 Shapefile 类型: {shp_type}")
+
+
+def _shp_file_bytes(shp_type, records):
+    """records: [(geometry, props)]，返回 .shp 与 .shx 字节。"""
+    contents = []
+    for geometry, _props in records:
+        contents.append(_encode_shp_record_content(shp_type, geometry))
+
+    shp_body = bytearray()
+    shx_body = bytearray()
+    offset_words = 50  # 从文件头之后开始计（shp 记录偏移以 16-bit word 计）
+    total_words = 50
+    for content in contents:
+        content_words = len(content) // 2
+        record_number = len(shx_body) // 8 + 1
+        shp_body.extend(struct.pack(">ii", record_number, content_words))
+        shp_body.extend(content)
+        shx_body.extend(struct.pack(">ii", offset_words, content_words))
+        offset_words += 4 + content_words
+        total_words += 4 + content_words
+
+    shp_header = bytearray(100)
+    struct.pack_into(">i", shp_header, 0, 9994)
+    struct.pack_into(">i", shp_header, 24, total_words)
+    struct.pack_into("<i", shp_header, 28, 1000)
+    struct.pack_into("<i", shp_header, 32, shp_type)
+    xs, ys = [], []
+    for geometry, _props in records:
+        for x, y in _walk_xy(geometry["coordinates"]):
+            xs.append(x)
+            ys.append(y)
+    if xs:
+        struct.pack_into("<4d", shp_header, 36, min(xs), min(ys), max(xs), max(ys))
+    shp_bytes = bytes(shp_header) + bytes(shp_body)
+
+    shx_header = bytearray(100)
+    struct.pack_into(">i", shx_header, 0, 9994)
+    struct.pack_into(">i", shx_header, 24, 50 + len(shx_body) // 8)
+    struct.pack_into("<i", shx_header, 28, 1000)
+    struct.pack_into("<i", shx_header, 32, shp_type)
+    struct.pack_into("<4d", shx_header, 36, min(xs), min(ys), max(xs), max(ys))
+    shx_bytes = bytes(shx_header) + bytes(shx_body)
+    return shp_bytes, shx_bytes
+
+
+def _dbf_field_lengths(values):
+    """按值推断 dBase 字段类型与长度。返回 (type_char, length, decimals)。"""
+    non_null = [v for v in values if v is not None]
+    if not non_null:
+        return "C", 1, 0
+    if all(isinstance(v, bool) for v in non_null):
+        return "L", 1, 0
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in non_null):
+        text_lengths = [len(f"{v:g}") for v in non_null]
+        decimals = max(
+            (len(f"{v:g}".split(".")[1]) if "." in f"{v:g}" else 0) for v in non_null
+        )
+        return "N", max(1, min(254, max(text_lengths))), decimals
+    texts = [str(v) for v in non_null]
+    # dBase 字段长度按字节计；中文字符经 UTF-8 编码后占 3 字节，需按字节数计算
+    return "C", max(1, min(254, max(len(t.encode("utf-8")) for t in texts))), 0
+
+
+def _encode_dbf(features):
+    """把要素属性写成 dBase III（UTF-8），返回 .dbf 字节。"""
+    field_names = []
+    for feature in features:
+        for name in (feature.get("properties") or {}):
+            if name not in field_names:
+                field_names.append(name)
+    if not field_names:
+        field_names = ["name"]
+    fields = []  # (原始字段名, dBase类型, 长度, 小数位)
+    for name in field_names:
+        values = [((feature.get("properties") or {}).get(name)) for feature in features]
+        type_char, length, decimals = _dbf_field_lengths(values)
+        fields.append((name, type_char, length, decimals))
+    record_count = len(features)
+    header_length = 32 + 32 * len(fields) + 1
+    record_length = 1 + sum(field[2] for field in fields)
+    header = bytearray(header_length)
+    header[0] = 0x03
+    header[1:4] = (2026 & 0xFF, 10, 18)  # 最后更新日期 YY MM DD
+    struct.pack_into("<I", header, 4, record_count)
+    struct.pack_into("<H", header, 8, header_length)
+    struct.pack_into("<H", header, 10, record_length)
+    offset = 32
+    for name, type_char, length, decimals in fields:
+        desc = bytearray(32)
+        raw_name = name.encode("utf-8")[:10]
+        if not raw_name:
+            raw_name = b"f1"
+        desc[: len(raw_name)] = raw_name
+        desc[11] = ord(type_char)
+        desc[16] = length
+        desc[17] = decimals
+        header[offset : offset + 32] = desc
+        offset += 32
+    header[offset] = 0x0D
+    dbf = bytes(header)
+    for feature in features:
+        properties = feature.get("properties") or {}
+        record = bytearray(record_length)
+        record[0] = 0x20
+        cursor = 1
+        for name, type_char, length, decimals in fields:
+            value = properties.get(name)
+            slot = record[cursor : cursor + length]
+            if type_char == "L":
+                slot[0] = 0x54 if value in (True, 1, "1", "true", "T", "t") else 0x46  # T/F
+            elif type_char == "N":
+                if value is None:
+                    slot[:] = b" " * length
+                else:
+                    text = f"{value:g}".encode("utf-8")
+                    slot[length - len(text) :] = text  # 右对齐
+            else:
+                if value is None:
+                    slot[:] = b" " * length
+                else:
+                    text = str(value).encode("utf-8")
+                    slot[: len(text)] = text
+            record[cursor : cursor + length] = slot
+            cursor += length
+        dbf += bytes(record)
+    dbf += b"\x1a"
+    return dbf
+
+
+def export_shapefile_zip(payload):
+    """把 FeatureCollection 导出为 Shapefile ZIP，返回 zip 字节。"""
+    features = [f for f in payload.get("features", []) if f.get("geometry")]
+    if not features:
+        raise ValueError("没有可导出的要素")
+    shp_type = _shapefile_type_for([f["geometry"] for f in features])
+    records = [(f["geometry"], f.get("properties") or {}) for f in features]
+    shp_bytes, shx_bytes = _shp_file_bytes(shp_type, records)
+    dbf_bytes = _encode_dbf(features)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("export.shp", shp_bytes)
+        archive.writestr("export.shx", shx_bytes)
+        archive.writestr("export.dbf", dbf_bytes)
+        archive.writestr("export.prj", PRJ_WGS84_WKT)
+        archive.writestr("export.cpg", "UTF-8")
+    return buffer.getvalue()
+
+
 def write_json_atomic(path, payload):
     temp_file = path.with_suffix(".tmp")
     temp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -993,6 +1254,24 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/export":
             active_dataset, payload = read_dataset()
+            query = parse_qs(urlsplit(self.path).query)
+            export_format = (query.get("format") or ["geojson"])[0].lower()
+            if export_format == "shapefile":
+                try:
+                    body = export_shapefile_zip(payload)
+                except ValueError as exc:
+                    self.send_error_json(str(exc))
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{active_dataset["id"]}-shapefile.zip"',
+                )
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/geo+json; charset=utf-8")
