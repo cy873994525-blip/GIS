@@ -21,7 +21,11 @@
       "path": "uploads/be24a7c373.geojson",
       "crs": "GCS_WGS_1984",
       "crs_kind": "geographic",
-      "source_note": "从 中国_省.shp 转换为 GeoJSON；WGS 84 经纬度，可叠加在线底图"
+      "source_note": "从 中国_省.shp 转换为 GeoJSON；WGS 84 经纬度，可叠加在线底图",
+      "field_types": {
+        "name": "text",
+        "gb": "text"
+      }
     },
     {
       "id": "3e2c715212",
@@ -43,7 +47,11 @@
       "path": "uploads/3e2c715212.geojson",
       "crs": "WGS 84",
       "crs_kind": "geographic",
-      "source_note": "34 个省级行政区首府 WGS84 坐标（手写），可直接叠加在线底图"
+      "source_note": "34 个省级行政区首府 WGS84 坐标（手写），可直接叠加在线底图",
+      "field_types": {
+        "name": "text",
+        "capital": "boolean"
+      }
     },
     {
       "id": "ds-b27af2a58c",
@@ -65,7 +73,10 @@
       "path": "uploads/ds-b27af2a58c.geojson",
       "crs": "WGS 84（已从 WGS1984_Albers 投影坐标转换）",
       "crs_kind": "geographic",
-      "source_note": "从 九段线_albers.shp 转换为 GeoJSON；已从投影坐标自动转换为 WGS 84 经纬度，可叠加在线底图"
+      "source_note": "从 九段线_albers.shp 转换为 GeoJSON；已从投影坐标自动转换为 WGS 84 经纬度，可叠加在线底图",
+      "field_types": {
+        "name": "text"
+      }
     }
   ]
 }
