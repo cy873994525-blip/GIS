@@ -262,6 +262,55 @@ Y 范围约为 2367106 至 6385320
 - 自测脚本 8/8：`.prj` 地理/投影/EPSG 识别、空 `.prj`、带洞 Polygon 保留内环、PointZ 保留 Z、MultiPoint 友好报错、样例 Point ZIP 回归；
 - 端到端（启动 `server.py`，通过 `/api/datasets/import` 导入“带洞 Polygon + CGCS2000 投影 `.prj`”的 ZIP）8/8：导入成功、`format=Shapefile`、`feature_count=1`、`geometry_types=[Polygon]`、`crs_kind=projected`、crs 名称含 CGCS2000、导入后 GeoJSON 保留 2 个环（外环+洞）。
 
+### A 组本次补充记录（2026-10-18）：本周完善项
+
+按 A 组完善清单逐项推进并全部完成，每项已独立 commit，验证通过。仓库已与本周其他成员（B/C/D 组）的 31 个提交合并，A 组核心（导入/投影/多图层/瓦片公式）未受影响。**本次记录更新时间：2026-10-18。**
+
+#### 1. Shapefile 导出（GeoJSON → .shp/.shx/.dbf/.prj ZIP）
+
+- 后端新增导出模块：`/api/export?format=shapefile` 返回四件套 ZIP，纯标准库实现。
+- 支持 Point(1)、PolyLine(3)、Polygon(5)、MultiPoint(8)；坐标取前两维（忽略 Z）；属性写入 dBase III（UTF-8，附 `.cpg`），可被本模块导入管线读回。
+- 混合几何类型（点/线/面混存）明确报错，提示先按类型拆分数据集。
+- 前端 `static/index.html` 新增「导出 Shapefile」按钮（保留原「导出 GeoJSON」）。
+- 验证：roundtrip（省界 34 面 / 省会 34 点，中文属性“河南省/北京”正常、几何类型读回一致）+ 混合几何报错用例。
+
+#### 2. MultiPoint 支持
+
+- 后端 `SHAPE_BASE_TYPE` 加入 8/18/28 → MultiPoint；`read_shp_records` 新增 MultiPoint 解析分支（box + numPoints + points，Z 变体 18 含 z 数组）。
+- `validate_feature` / `validate_geometry_coordinates` 支持 MultiPoint（每个点为合法 position）。
+- 前端 `static/app.js`：MultiPoint 渲染（点集绘制）、命中检测、框选、顶点编辑、删除约束（最少保留 1 点）全部支持。
+- 验证：导出→导入 roundtrip（类型保持、点数/中文属性/count 数值正常、单点退化仍为 MultiPoint）。
+
+#### 3. routing 与数据集管线衔接
+
+- `/api/routing/network?dataset_id=…` 与 `/api/routing/solve?dataset_id=…`：从 A 组数据集管线（含 T1 投影转换）加载路网。
+- 投影坐标系数据集 / 非线要素数据集给出明确错误提示；无 `dataset_id` 时行为不变（固定路网文件）。
+- 前端 `static/route-addon.js` 新增「用当前数据集作为路网」按钮。
+- 验证：端到端（线数据集导入 → 加载 → solve，临时数据集已清理）+ 面/点数据集拒绝用例。
+
+#### 4. catalog 记录字段类型
+
+- 新增 `infer_field_types()`：导入/保存时自动推断属性字段类型（text / number / boolean，与 C 组 `field_types` 命名一致），写入 catalog 元数据。
+- `read_catalog()` 对老记录惰性回填 `field_types`，一次补齐后不再重复读取。
+- 验证：省界 `{name:text, gb:text}`、省会 `{name:text, capital:boolean}`、混合字段回退 text 均正确。
+
+#### 5. A 组测试补充
+
+- 新增 `tests/test_a_group.py`（13 个用例，unittest，与 C 组 `test_field_types.py` 同模式，临时目录隔离）：
+  - T1 投影转换（真实 EPSG:2338 用例 + 不可识别 WKT 安全降级）
+  - Shapefile 解析（省界/省会数据集）
+  - 导出 roundtrip（中文属性 + 混合几何报错）
+  - MultiPoint 解析/校验/导出
+  - 字段类型推断、多图层接口 `read_layers`（layer/dataset_id 标注）
+- 全部通过（`python -m unittest discover -s tests -p "test_a_group.py" -v`）。
+
+#### 6. 仓库清理与存储评估
+
+- 根目录旧版 `app.js` / `index.html` / `styles.css`（早期 B/C 组副本，服务实际使用 `static/`）已移入 `archive/` 保留，避免新成员误改旧副本。
+- 存储现状：数据集以 GeoJSON 文件 + `catalog.json` 登记（当前各数据集 ≤ 517 要素），JSON 文件存储完全够用；若后续要素量大（≥ 数十万）或需多用户并发写，再评估 SQLite/PostGIS——接口层已按“数据集 id + payload”解耦，切换存储不影响前端。
+
+**验证汇总**：`python -m py_compile server.py route_api.py`、`node --check static/app.js static/route-addon.js`、`tests/test_a_group.py` 13/13、导出/MultiPoint/routing 端到端均通过；全部改动已 git commit（消息含“2026-10-18”）。
+
 ## C 组：交互编辑、属性与地图展示模块
 
 本组负责浏览器端的矢量数据交互编辑、属性管理和地图展示。前期完善画点线面之后的编辑链路：底部属性表、行内改值与字段增删、点选 / 框选、几何节点拖拽和整体平移；随后接入真实在线底图，完善地图缩放、数据叠加和示例入口。主要改动位于前端 `static/`，另有一处 Python 3.8 兼容修复（见下文 5.4）。要素的写入仍统一走已有的 `PUT /api/features/{id}` 和 `POST /api/save`；GeoJSON / Shapefile 文件解析属于 A 组后端模块，C 组复用其导入接口，不重复归功。
@@ -592,57 +641,6 @@ D 组在原有 GIS Demo 空间量算、缓冲区分析和空间相交查询功�
 针对 WGS 84 经纬度数据，采用 Haversine 球面距离计算道路长度，并使用优先队列优化的 Dijkstra 算法求解起终点之间的最短通行路径。前端新增独立的最短路径分析窗口，支持地图交互式起终点选择、路径求解、距离显示及结果高亮，同时支持自定义路网导入和示例数据恢复。
 
 模块采用独立化设计，在保留原有 GIS 数据编辑与空间分析功能的基础上，增加了空间网络分析能力，并通过浏览器交互验证及自动化测试，形成从道路数据加载、网络建模、路径求解到可视化展示的完整流程，使系统从基础空间量算与几何分析进一步扩展为支持道路网络分析的轻量化 GIS 工作台。
-
----
-
-## A 组补充记录（2026-10-18）：本周完善项
-
-按 A 组完善清单逐项推进并全部完成，每项已独立 commit，验证通过。仓库已与本周其他成员（B/C/D 组）的 31 个提交合并，A 组核心（导入/投影/多图层/瓦片公式）未受影响。
-
-### 1. Shapefile 导出（GeoJSON → .shp/.shx/.dbf/.prj ZIP）
-
-- 后端新增导出模块：`/api/export?format=shapefile` 返回四件套 ZIP，纯标准库实现。
-- 支持 Point(1)、PolyLine(3)、Polygon(5)、MultiPoint(8)；坐标取前两维（忽略 Z）；属性写入 dBase III（UTF-8，附 `.cpg`），可被本模块导入管线读回。
-- 混合几何类型（点/线/面混存）明确报错，提示先按类型拆分数据集。
-- 前端 `static/index.html` 新增「导出 Shapefile」按钮（保留原「导出 GeoJSON」）。
-- 验证：roundtrip（省界 34 面 / 省会 34 点，中文属性“河南省/北京”正常、几何类型读回一致）+ 混合几何报错用例。
-
-### 2. MultiPoint 支持
-
-- 后端 `SHAPE_BASE_TYPE` 加入 8/18/28 → MultiPoint；`read_shp_records` 新增 MultiPoint 解析分支（box + numPoints + points，Z 变体 18 含 z 数组）。
-- `validate_feature` / `validate_geometry_coordinates` 支持 MultiPoint（每个点为合法 position）。
-- 前端 `static/app.js`：MultiPoint 渲染（点集绘制）、命中检测、框选、顶点编辑、删除约束（最少保留 1 点）全部支持。
-- 验证：导出→导入 roundtrip（类型保持、点数/中文属性/count 数值正常、单点退化仍为 MultiPoint）。
-
-### 3. routing 与数据集管线衔接
-
-- `/api/routing/network?dataset_id=…` 与 `/api/routing/solve?dataset_id=…`：从 A 组数据集管线（含 T1 投影转换）加载路网。
-- 投影坐标系数据集 / 非线要素数据集给出明确错误提示；无 `dataset_id` 时行为不变（固定路网文件）。
-- 前端 `static/route-addon.js` 新增「用当前数据集作为路网」按钮。
-- 验证：端到端（线数据集导入 → 加载 → solve，临时数据集已清理）+ 面/点数据集拒绝用例。
-
-### 4. catalog 记录字段类型
-
-- 新增 `infer_field_types()`：导入/保存时自动推断属性字段类型（text / number / boolean，与 C 组 `field_types` 命名一致），写入 catalog 元数据。
-- `read_catalog()` 对老记录惰性回填 `field_types`，一次补齐后不再重复读取。
-- 验证：省界 `{name:text, gb:text}`、省会 `{name:text, capital:boolean}`、混合字段回退 text 均正确。
-
-### 5. A 组测试补充
-
-- 新增 `tests/test_a_group.py`（13 个用例，unittest，与 C 组 `test_field_types.py` 同模式，临时目录隔离）：
-  - T1 投影转换（真实 EPSG:2338 用例 + 不可识别 WKT 安全降级）
-  - Shapefile 解析（省界/省会数据集）
-  - 导出 roundtrip（中文属性 + 混合几何报错）
-  - MultiPoint 解析/校验/导出
-  - 字段类型推断、多图层接口 `read_layers`（layer/dataset_id 标注）
-- 全部通过（`python -m unittest discover -s tests -p "test_a_group.py" -v`）。
-
-### 6. 仓库清理与存储评估
-
-- 根目录旧版 `app.js` / `index.html` / `styles.css`（早期 B/C 组副本，服务实际使用 `static/`）已移入 `archive/` 保留，避免新成员误改旧副本。
-- 存储现状：数据集以 GeoJSON 文件 + `catalog.json` 登记（当前各数据集 ≤ 517 要素），JSON 文件存储完全够用；若后续要素量大（≥ 数十万）或需多用户并发写，再评估 SQLite/PostGIS——接口层已按“数据集 id + payload”解耦，切换存储不影响前端。
-
-**验证汇总**：`python -m py_compile server.py route_api.py`、`node --check static/app.js static/route-addon.js`、`tests/test_a_group.py` 13/13、导出/MultiPoint/routing 端到端均通过；全部改动已 git commit（消息含“2026-10-18”）。
 
 
 
