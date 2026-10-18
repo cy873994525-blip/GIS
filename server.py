@@ -126,8 +126,29 @@ def validate_feature_collection(payload):
         raise ValueError("features must be a list")
     if len(features) > MAX_FEATURES:
         raise ValueError(f"feature count cannot exceed {MAX_FEATURES}")
+    field_types = payload.get("field_types", {})
+    if not isinstance(field_types, dict) or any(
+        not isinstance(name, str) or not name or kind not in {"text", "number", "boolean"}
+        for name, kind in field_types.items()
+    ):
+        raise ValueError("field_types must map field names to text, number or boolean")
     for feature in features:
         validate_feature(feature)
+        properties = feature.get("properties", {})
+        for name, kind in field_types.items():
+            if name not in properties or properties[name] is None:
+                continue
+            value = properties[name]
+            if kind == "text":
+                valid = isinstance(value, str)
+            elif kind == "number":
+                valid = type(value) in (int, float) and (
+                    not isinstance(value, float) or math.isfinite(value)
+                )
+            else:
+                valid = isinstance(value, bool)
+            if not valid:
+                raise ValueError(f"field {name} must contain {kind} values")
     return payload
 
 

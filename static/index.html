@@ -20,6 +20,7 @@
         <div><strong id="selectionCount">0</strong><span>已选</span></div>
       </div>
       <div class="top-actions">
+        <span id="saveStatus" class="save-status" data-state="saved" role="status" aria-live="polite">自动保存</span>
         <button id="saveBtn" class="primary"><span class="button-icon">↥</span>保存</button>
         <a class="button" href="/api/export">导出 GeoJSON</a>
         <button id="resetBtn">重置数据</button>
@@ -101,9 +102,13 @@
           <div class="tool-group">
             <span class="toolbar-label">几何</span>
             <button data-mode="edit" class="tool">编辑几何</button>
-            <button id="undoGeometryBtn" class="draft-button" disabled>撤销几何</button>
             <button id="endEditBtn" class="draft-button" disabled>结束编辑</button>
             <button id="snapBtn" class="tool active" type="button" aria-pressed="true" title="绘制和拖动节点时吸附到已有要素的节点或边">吸附：开</button>
+          </div>
+          <div class="tool-group">
+            <span class="toolbar-label">历史</span>
+            <button id="undoEditBtn" type="button" title="撤销上一次已保存的编辑（Ctrl+Z）" disabled>撤销</button>
+            <button id="redoEditBtn" type="button" title="重做上一次撤销（Ctrl+Y 或 Ctrl+Shift+Z）" disabled>重做</button>
           </div>
           <div class="tool-group view-tools">
             <span class="toolbar-label">视图</span>
@@ -220,6 +225,30 @@
   </div>
 
   <datalist id="layerOptions"></datalist>
+
+  <dialog id="addFieldDialog" class="field-dialog" aria-labelledby="addFieldTitle">
+    <form id="addFieldForm">
+      <h2 id="addFieldTitle">新增属性字段</h2>
+      <p class="form-tip">类型会保存在当前数据集中；数字或布尔字段留空表示空值。</p>
+      <label>字段名
+        <input id="newFieldName" name="fieldName" type="text" maxlength="64" required placeholder="例如：面积、是否开放">
+      </label>
+      <label>字段类型
+        <select id="newFieldType" name="fieldType">
+          <option value="text">文本</option>
+          <option value="number">数字</option>
+          <option value="boolean">布尔（true / false）</option>
+        </select>
+      </label>
+      <label>默认值（可留空）
+        <input id="newFieldDefault" name="fieldDefault" type="text" placeholder="将填入当前数据集所有要素">
+      </label>
+      <div class="field-dialog-actions">
+        <button id="cancelFieldBtn" type="button">取消</button>
+        <button id="confirmFieldBtn" class="primary" type="submit">新增字段</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="/static/app.js"></script>
 </body>

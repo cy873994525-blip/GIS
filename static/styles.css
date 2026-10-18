@@ -102,6 +102,14 @@ button.active,
   white-space: nowrap;
 }
 
+.save-status {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.save-status[data-state="saving"] { color: var(--primary-dark); }
+.save-status[data-state="error"] { color: var(--danger); }
+
 .workspace {
   flex: 1;
   display: grid;
@@ -1041,6 +1049,27 @@ section {
 /* ============================================================
    交互编辑与属性模块
    ============================================================ */
+
+.field-dialog {
+  width: min(400px, calc(100vw - 32px));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.field-dialog::backdrop { background: rgba(17, 39, 47, 0.45); }
+
+.field-dialog .form-tip { margin: 0 0 18px; }
+
+.field-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
 
 /* 让 workspace 变成「主区 + 底部抽屉」两行。这里只加 grid-template-rows，
    不重新声明 display，760px 媒体查询里的 flex 布局因此不受影响。 */

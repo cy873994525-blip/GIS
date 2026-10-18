@@ -42,7 +42,11 @@ const state = {
   // 几何编辑
   editFeatureId: null,
   editGeometry: null,
-  geometryHistory: [],
+  declaredFieldTypes: {},
+  activeFieldTypes: {},
+  editHistory: [],
+  redoHistory: [],
+  historyBusy: false,
   vertexDrag: null,
   featureDrag: null,
   hoverVertexIndex: -1,
@@ -61,14 +65,15 @@ const ATTRIBUTE_PAGE_SIZE = 100;
 // 这两列由绘制/图层逻辑使用，排到属性表最前面；其余字段按首次出现顺序。
 const PINNED_FIELDS = ["name", "layer"];
 const DISPLAY_ONLY_FIELDS = new Set(["layer", "dataset_id"]);
-// 几何编辑的历史深度。
-const GEOMETRY_HISTORY_LIMIT = 30;
+// 同一数据集的已保存编辑历史；切换数据集或重置后清空。
+const EDIT_HISTORY_LIMIT = 30;
 
 const FIELD_LABELS = {
   name: "名称",
   layer: "图层",
   kind: "几何类别",
 };
+const FIELD_TYPE_LABELS = { text: "文本", number: "数字", boolean: "布尔", json: "JSON" };
 
 const layerColors = {
   "兴趣点": "#b6335c",
@@ -271,17 +276,44 @@ function resizeCanvas() {
 }
 
 async function api(path, options) {
-  const response = await fetch(path, options);
-  if (!response.ok) {
-    let message = await response.text();
-    try {
-      message = JSON.parse(message).error || message;
-    } catch (error) {
-      // Keep the raw response when the server does not return JSON.
-    }
-    throw new Error(message);
+  const savesData = options && ["POST", "PUT"].includes(options.method) &&
+    (path === "/api/save" || path === "/api/features" || path.startsWith("/api/features/"));
+  const status = document.getElementById("saveStatus");
+  if (savesData) {
+    state.isSaving = true;
+    status.textContent = "保存中…";
+    status.dataset.state = "saving";
+    syncHistoryControls();
   }
-  return response.json();
+  try {
+    const response = await fetch(path, options);
+    if (!response.ok) {
+      let message = await response.text();
+      try {
+        message = JSON.parse(message).error || message;
+      } catch (error) {
+        // Keep the raw response when the server does not return JSON.
+      }
+      throw new Error(message);
+    }
+    const result = await response.json();
+    if (savesData) {
+      status.textContent = "已保存";
+      status.dataset.state = "saved";
+    }
+    return result;
+  } catch (error) {
+    if (savesData) {
+      status.textContent = "保存失败";
+      status.dataset.state = "error";
+    }
+    throw error;
+  } finally {
+    if (savesData) {
+      state.isSaving = false;
+      syncHistoryControls();
+    }
+  }
 }
 
 function formatBytes(bytes) {
@@ -392,9 +424,17 @@ async function loadDatasets() {
 
 async function loadData() {
   const ids = [...state.visibleDatasetIds];
-  state.data = ids.length
-    ? await api(`/api/layers?ids=${encodeURIComponent(ids.join(","))}`)
-    : { type: "FeatureCollection", features: [] };
+  const [layerData, activeRaw] = await Promise.all([
+    ids.length
+      ? api(`/api/layers?ids=${encodeURIComponent(ids.join(","))}`)
+      : Promise.resolve({ type: "FeatureCollection", features: [] }),
+    state.activeDataset ? activeDatasetData() : Promise.resolve(null),
+  ]);
+  state.data = layerData;
+  state.declaredFieldTypes = activeRaw ? (activeRaw.field_types || {}) : {};
+  state.activeFieldTypes = activeRaw
+    ? { ...inferFieldTypes(activeRaw.features), ...state.declaredFieldTypes }
+    : {};
   state.selectedIds = new Set([...state.selectedIds].filter((id) =>
     state.data.features.some((feature) => feature.id === id)));
   state.geographic = false;
@@ -425,9 +465,11 @@ async function loadStatus() {
 async function activateDataset(datasetId) {
   try {
     await api(`/api/datasets/${encodeURIComponent(datasetId)}/activate`, { method: "POST" });
+    clearEditHistory();
     state.selectedIds.clear();
     state.visibleDatasetIds.add(datasetId);
-    await Promise.all([loadDatasets(), loadData(), loadStatus()]);
+    await loadDatasets();
+    await Promise.all([loadData(), loadStatus()]);
     syncMapMode();
     fitView();
     setNotice(`已切换到数据集“${state.activeDataset.name}”。`);
@@ -497,7 +539,9 @@ async function importDataset(file) {
     state.selectedIds.clear();
     const imported = result.dataset;
     state.visibleDatasetIds.add(imported.id);
-    await Promise.all([loadDatasets(), loadData(), loadStatus()]);
+    clearEditHistory();
+    await loadDatasets();
+    await Promise.all([loadData(), loadStatus()]);
     syncMapMode();
     fitView();
     setNotice(`已导入“${file.name}”，后端已登记文件元数据。`);
@@ -704,25 +748,58 @@ function formatCellValue(value) {
   return String(value);
 }
 
-// 保持字段原有的值类型：原本是数字且新文本仍能解析成有限数字时，继续存数字。
-function coerceFieldValue(raw, original) {
-  if (raw === formatCellValue(original)) return original;
-  const text = raw.trim();
-  if (original === null && text === "") return null;
-  if (typeof original === "number" && text !== "") {
-    const parsed = Number(text);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  if (typeof original === "boolean" && /^(true|false)$/i.test(text)) {
-    return text.toLowerCase() === "true";
-  }
-  if (original !== null && typeof original === "object") {
-    try {
-      return JSON.parse(text);
-    } catch (error) {
-      // Invalid JSON is kept as text so the value remains editable.
+function valueType(value) {
+  if (typeof value === "number") return "number";
+  if (typeof value === "boolean") return "boolean";
+  if (value !== null && typeof value === "object") return "json";
+  return "text";
+}
+
+function inferFieldTypes(features) {
+  const types = {};
+  for (const feature of features) {
+    for (const [field, value] of Object.entries(feature.properties || {})) {
+      if (value === null || value === undefined) continue;
+      const kind = valueType(value);
+      types[field] = types[field] && types[field] !== kind ? "text" : kind;
     }
   }
+  return types;
+}
+
+function fieldTypeForFeature(feature, field) {
+  if (state.declaredFieldTypes[field]) return state.declaredFieldTypes[field];
+  const value = (feature.properties || {})[field];
+  if (value !== null && value !== undefined) return valueType(value);
+  return state.activeFieldTypes[field] || "text";
+}
+
+// 新建字段采用持久化类型；旧数据按原值/同列值推断，拒绝把数字或布尔值意外改成文本。
+function coerceFieldValue(raw, original, kind = valueType(original)) {
+  if (raw === formatCellValue(original)) return original;
+  const text = raw.trim();
+  if (kind === "number") {
+    if (!text) return null;
+    const parsed = Number(text);
+    if (Number.isFinite(parsed)) return parsed;
+    throw new Error("数字字段只能填写有限数字，留空表示空值。");
+  }
+  if (kind === "boolean") {
+    if (!text) return null;
+    if (!/^(true|false)$/i.test(text)) throw new Error("布尔字段只能填写 true 或 false，留空表示空值。");
+    return text.toLowerCase() === "true";
+  }
+  if (kind === "json") {
+    if (!text) return null;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed !== null && typeof parsed === "object") return parsed;
+    } catch (error) {
+      // 下方统一给出输入错误提示。
+    }
+    throw new Error("JSON 字段需要填写合法的对象或数组，留空表示空值。");
+  }
+  if (original === null && !text) return null;
   return text;
 }
 
@@ -878,6 +955,7 @@ function beginCellEdit(cell, feature, field) {
   const input = document.createElement("input");
   input.type = "text";
   input.value = formatCellValue(original);
+  input.title = `字段类型：${FIELD_TYPE_LABELS[fieldTypeForFeature(feature, field)]}`;
   cell.classList.add("cell-editing");
   cell.textContent = "";
   cell.appendChild(input);
@@ -888,9 +966,23 @@ function beginCellEdit(cell, feature, field) {
   const finish = async (commit) => {
     if (settled) return;
     settled = true;
-    const nextValue = coerceFieldValue(input.value, original);
+    if (!commit) {
+      cell.classList.remove("cell-editing");
+      renderAttributeTable();
+      return;
+    }
+    let nextValue;
+    try {
+      nextValue = coerceFieldValue(input.value, original, fieldTypeForFeature(feature, field));
+      if (field === "name" && !String(nextValue).trim()) throw new Error("名称不能为空。");
+    } catch (error) {
+      settled = false;
+      setNotice(`字段“${field}”：${error.message}`);
+      input.focus();
+      return;
+    }
     cell.classList.remove("cell-editing");
-    if (!commit || nextValue === original) {
+    if (nextValue === original) {
       renderAttributeTable();
       return;
     }
@@ -917,47 +1009,124 @@ function beginCellEdit(cell, feature, field) {
   input.addEventListener("blur", () => finish(true));
 }
 
+function syncHistoryControls() {
+  document.getElementById("undoEditBtn").disabled = state.historyBusy ||
+    state.isSaving || !state.editHistory.length;
+  document.getElementById("redoEditBtn").disabled = state.historyBusy ||
+    state.isSaving || !state.redoHistory.length;
+}
+
+function clearEditHistory() {
+  state.editHistory = [];
+  state.redoHistory = [];
+  syncHistoryControls();
+}
+
+function recordEdit(before, after, label, selectedBefore = [...state.selectedIds],
+    selectedAfter = [...state.selectedIds]) {
+  if (JSON.stringify(before) === JSON.stringify(after)) return;
+  state.editHistory.push({
+    datasetId: state.activeDataset.id,
+    before: deepCopy(before),
+    after: deepCopy(after),
+    label,
+    selectedBefore,
+    selectedAfter,
+  });
+  if (state.editHistory.length > EDIT_HISTORY_LIMIT) state.editHistory.shift();
+  state.redoHistory = [];
+  syncHistoryControls();
+}
+
+async function replayEdit(direction) {
+  const undo = direction === "undo";
+  const source = undo ? state.editHistory : state.redoHistory;
+  const target = undo ? state.redoHistory : state.editHistory;
+  if (state.historyBusy || state.isSaving || !source.length) return;
+  const entry = source[source.length - 1];
+  if (!state.activeDataset || entry.datasetId !== state.activeDataset.id) {
+    clearEditHistory();
+    setNotice("数据集已切换，旧编辑历史已清空。");
+    return;
+  }
+  state.historyBusy = true;
+  syncHistoryControls();
+  try {
+    const current = await activeDatasetData();
+    const expected = undo ? entry.after : entry.before;
+    if (JSON.stringify(current) !== JSON.stringify(expected)) {
+      clearEditHistory();
+      setNotice("数据集已在其他位置变化，旧编辑历史已清空；请刷新后再编辑。");
+      return;
+    }
+    await api("/api/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(undo ? entry.before : entry.after),
+    });
+    source.pop();
+    target.push(entry);
+    state.selectedIds = new Set(undo ? entry.selectedBefore : entry.selectedAfter);
+    await loadData();
+    if (state.mode === "edit") {
+      const feature = getSingleSelectedFeature();
+      if (feature && isEditableFeature(feature)) enterGeometryEdit(feature);
+    }
+    syncMapMode();
+    setNotice(`${undo ? "已撤销" : "已重做"}：${entry.label}。`);
+  } catch (error) {
+    setNotice(`${undo ? "撤销" : "重做"}失败：${error.message}`);
+  } finally {
+    state.historyBusy = false;
+    syncHistoryControls();
+    draw();
+  }
+}
+
 // /api/layers 是多个数据集的展示副本；写入只能使用当前数据集的原始 GeoJSON。
 async function persistActiveFeatures(transform, message) {
-  const nextData = deepCopy(await activeDatasetData());
+  const before = await activeDatasetData();
+  const nextData = deepCopy(before);
+  const selectedBefore = [...state.selectedIds];
   transform(nextData);
   await api("/api/save", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(nextData),
   });
+  recordEdit(before, nextData, message, selectedBefore,
+    selectedBefore.filter((id) => nextData.features.some((feature) => feature.id === id)));
   state.dirty = false;
   await loadData();
   syncMapMode();
   setNotice(message);
 }
 
-async function addField() {
-  const raw = window.prompt("新字段名（例如：备注 / code）", "");
-  if (raw === null) return;
-  const field = raw.trim();
+async function addField(field, kind, defaultRaw) {
+  field = field.trim();
   if (!field) {
-    setNotice("字段名不能为空。");
-    return;
+    throw new Error("字段名不能为空。");
   }
-  if (DISPLAY_ONLY_FIELDS.has(field)) {
-    setNotice(`字段“${field}”由数据集管理，不能手动新增。`);
-    return;
+  if (DISPLAY_ONLY_FIELDS.has(field) ||
+      ["name", "kind", "__proto__", "prototype", "constructor"].includes(field)) {
+    throw new Error(`字段名“${field}”不能手动新增。`);
   }
-  try {
-    if (collectFields((await activeDatasetData()).features).includes(field)) {
-      setNotice(`字段“${field}”在当前数据集已存在，直接双击单元格填写即可。`);
-      return;
+  if (!["text", "number", "boolean"].includes(kind)) {
+    throw new Error("请选择文本、数字或布尔字段类型。");
+  }
+  const data = await activeDatasetData();
+  if (collectFields(data.features).includes(field) ||
+      Object.prototype.hasOwnProperty.call(data.field_types || {}, field)) {
+    throw new Error(`字段“${field}”在当前数据集已存在。`);
+  }
+  const defaultValue = coerceFieldValue(defaultRaw, undefined, kind);
+  await persistActiveFeatures((nextData) => {
+    nextData.field_types = { ...(nextData.field_types || {}), [field]: kind };
+    for (const feature of nextData.features) {
+      if (!feature.properties) feature.properties = {};
+      feature.properties[field] = defaultValue;
     }
-    await persistActiveFeatures((data) => {
-      for (const feature of data.features) {
-        if (!feature.properties) feature.properties = {};
-        feature.properties[field] = "";
-      }
-    }, `已在当前数据集新增字段“${field}”。`);
-  } catch (error) {
-    setNotice(`新增字段失败：${error.message}`);
-  }
+  }, `已新增${{ text: "文本", number: "数字", boolean: "布尔" }[kind]}字段“${field}”。`);
 }
 
 async function removeField(field) {
@@ -971,6 +1140,7 @@ async function removeField(field) {
       for (const feature of data.features) {
         if (feature.properties) delete feature.properties[field];
       }
+      if (data.field_types) delete data.field_types[field];
     }, `已从当前数据集删除字段“${field}”。`);
   } catch (error) {
     setNotice(`删除字段失败：${error.message}`);
@@ -1001,7 +1171,6 @@ function enterGeometryEdit(feature) {
     type: feature.geometry.type,
     coordinates: deepCopy(feature.geometry.coordinates),
   };
-  state.geometryHistory = [];
   state.vertexDrag = null;
   state.featureDrag = null;
   state.hoverVertexIndex = -1;
@@ -1011,7 +1180,6 @@ function enterGeometryEdit(feature) {
 function exitGeometryEdit() {
   state.editFeatureId = null;
   state.editGeometry = null;
-  state.geometryHistory = [];
   state.vertexDrag = null;
   state.featureDrag = null;
   state.hoverVertexIndex = -1;
@@ -1021,7 +1189,6 @@ function exitGeometryEdit() {
 function syncGeometryControls() {
   const editing = Boolean(state.editFeatureId && state.editGeometry);
   document.getElementById("endEditBtn").disabled = !editing;
-  document.getElementById("undoGeometryBtn").disabled = !editing || !state.geometryHistory.length;
   canvas.classList.toggle("is-dragging-vertex", Boolean(state.vertexDrag || state.featureDrag));
   canvas.classList.toggle("is-over-vertex", state.hoverVertexIndex >= 0);
 }
@@ -1282,49 +1449,19 @@ function removeEditVertex(path) {
   ring.push(...distinct);
 }
 
-function pushGeometryHistory(geometry) {
-  state.geometryHistory.push(deepCopy(geometry));
-  if (state.geometryHistory.length > GEOMETRY_HISTORY_LIMIT) state.geometryHistory.shift();
-  syncGeometryControls();
-}
-
 // 每次改动在 mouseup 时立即落库，和删除 / 新增的既有行为保持一致。
 async function commitGeometryChange(previousGeometry, message) {
   const feature = getEditFeature();
   if (!feature || !state.editGeometry) return;
   try {
-    await updateFeature({ ...feature, geometry: deepCopy(state.editGeometry) });
-    pushGeometryHistory(previousGeometry);
-    setNotice(`${message}（节点数 ${extractVertices(state.editGeometry).length}，Ctrl+Z 可撤销）`);
+    await updateFeature({ ...feature, geometry: deepCopy(state.editGeometry) }, message);
+    setNotice(`${message}（节点数 ${extractVertices(state.editGeometry).length}，Ctrl+Z 撤销 / Ctrl+Y 重做）`);
   } catch (error) {
-    state.editGeometry = {
-      type: feature.geometry.type,
-      coordinates: deepCopy(feature.geometry.coordinates),
-    };
+    state.editGeometry = deepCopy(previousGeometry);
     setNotice(`几何保存失败：${error.message}`);
   }
   syncGeometryControls();
   draw();
-}
-
-async function undoGeometryEdit() {
-  const feature = getEditFeature();
-  if (!feature || !state.geometryHistory.length) {
-    setNotice("没有可撤销的几何改动。");
-    return;
-  }
-  const previous = state.geometryHistory.pop();
-  state.editGeometry = { type: previous.type, coordinates: deepCopy(previous.coordinates) };
-  syncGeometryControls();
-  draw();
-  try {
-    await updateFeature({ ...feature, geometry: deepCopy(state.editGeometry) });
-    setNotice("已撤销上一步几何编辑。");
-  } catch (error) {
-    state.geometryHistory.push(previous);
-    setNotice(`撤销失败：${error.message}`);
-  }
-  syncGeometryControls();
 }
 
 function cancelGeometryDrag() {
@@ -1834,7 +1971,8 @@ function renderEditor(selected) {
     // 已知字段显示「中文名 · 原始键」，导入的 DBF 字段没有中文名，只显示原始键，
     // 否则会出现 “NAME · NAME”。
     const human = FIELD_LABELS[field];
-    caption.textContent = human ? `${human} · ${field}` : field;
+    const typeLabel = FIELD_TYPE_LABELS[fieldTypeForFeature(feature, field)];
+    caption.textContent = `${human ? `${human} · ${field}` : field}（${typeLabel}）`;
     const input = document.createElement("input");
     input.type = "text";
     input.dataset.field = field;
@@ -1946,20 +2084,32 @@ function setMode(mode) {
 function makeFeature(geometry) {
   const layer = document.getElementById("layerInput").value;
   const name = document.getElementById("nameInput").value.trim() || "未命名要素";
+  const properties = { name, layer, kind: geometry.type.toLowerCase() };
+  for (const [field, kind] of Object.entries(state.declaredFieldTypes)) {
+    if (!Object.prototype.hasOwnProperty.call(properties, field)) {
+      properties[field] = kind === "text" ? "" : null;
+    }
+  }
   return {
     type: "Feature",
-    properties: { name, layer, kind: geometry.type.toLowerCase() },
+    properties,
     geometry,
   };
 }
 
 async function addFeature(geometry) {
+  const before = await activeDatasetData();
+  const selectedBefore = [...state.selectedIds];
   const feature = makeFeature(geometry);
   const result = await api("/api/features", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ feature }),
   });
+  const after = deepCopy(before);
+  after.features.push(result.feature);
+  recordEdit(before, after, `新增要素“${result.feature.properties.name}”`, selectedBefore,
+    [result.feature.id]);
   state.visibleDatasetIds.add(state.activeDataset.id);
   state.data.features.push(displayFeature(result.feature));
   state.visibleLayers.add(state.activeDataset.name);
@@ -1973,7 +2123,7 @@ async function addFeature(geometry) {
   draw();
 }
 
-async function updateFeature(feature) {
+async function updateFeature(feature, historyLabel = `修改要素 ${feature.id}`) {
   assertEditableSelection([feature]);
   const data = await activeDatasetData();
   const original = data.features.find((item) => item.id === feature.id);
@@ -1987,6 +2137,9 @@ async function updateFeature(feature) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ feature: { ...original, geometry: feature.geometry, properties } }),
   });
+  const after = deepCopy(data);
+  after.features[after.features.findIndex((item) => item.id === feature.id)] = result.feature;
+  recordEdit(data, after, historyLabel);
   const index = state.data.features.findIndex((item) => item.id === feature.id &&
     isEditableFeature(item));
   if (index !== -1) state.data.features[index] = displayFeature(result.feature);
@@ -2343,22 +2496,25 @@ window.addEventListener("keydown", (event) => {
       target instanceof HTMLSelectElement) {
     return;
   }
-  const isUndo = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z";
+  const modifier = event.ctrlKey || event.metaKey;
+  const key = event.key.toLowerCase();
+  const isUndo = modifier && !event.shiftKey && key === "z";
+  const isRedo = modifier && (key === "y" || (event.shiftKey && key === "z"));
   if (event.key === "Enter" && !(target instanceof HTMLButtonElement) &&
       ["line", "polygon"].includes(state.mode)) {
     event.preventDefault();
     finishDraft().catch((error) => setNotice(`绘制保存失败：${error.message}`));
     return;
   }
-  // 撤销优先作用在正在绘制、还没提交的草稿上；没有草稿时才撤销几何编辑。
+  // 未提交的草稿节点优先撤销；已保存的操作统一进入数据集编辑历史。
   if (isUndo && state.draft.length) {
     event.preventDefault();
     document.getElementById("undoDraftBtn").click();
     return;
   }
-  if (isUndo && state.geometryHistory.length) {
+  if (isUndo || isRedo) {
     event.preventDefault();
-    undoGeometryEdit();
+    replayEdit(isUndo ? "undo" : "redo");
     return;
   }
   if (event.key !== "Escape") return;
@@ -2391,7 +2547,8 @@ document.getElementById("undoDraftBtn").addEventListener("click", () => {
   draw();
 });
 document.getElementById("cancelDraftBtn").addEventListener("click", () => clearDraft());
-document.getElementById("undoGeometryBtn").addEventListener("click", () => undoGeometryEdit());
+document.getElementById("undoEditBtn").addEventListener("click", () => replayEdit("undo"));
+document.getElementById("redoEditBtn").addEventListener("click", () => replayEdit("redo"));
 document.getElementById("endEditBtn").addEventListener("click", () => setMode("select"));
 document.getElementById("snapBtn").addEventListener("click", (event) => {
   state.snapEnabled = !state.snapEnabled;
@@ -2458,18 +2615,24 @@ document.getElementById("attributeBody").addEventListener("keydown", (event) => 
 document.getElementById("updateFeatureBtn").addEventListener("click", async () => {
   const feature = getSingleSelectedFeature();
   if (!feature) return;
-  // 表单里的输入框是按要素真实字段动态生成的，这里照单全收。
-  const properties = { ...feature.properties };
-  for (const input of document.querySelectorAll("#editFieldList input[data-field]")) {
-    const field = input.dataset.field;
-    properties[field] = coerceFieldValue(input.value, feature.properties[field]);
-  }
-  if (properties.name !== undefined && !String(properties.name).trim()) {
-    setNotice("名称不能为空。");
-    return;
-  }
   try {
-    await updateFeature({ ...feature, properties });
+    // 表单里的输入框按真实字段生成；保存前逐项校验，避免混入错误类型。
+    const properties = { ...feature.properties };
+    for (const input of document.querySelectorAll("#editFieldList input[data-field]")) {
+      if (input.disabled) continue;
+      const field = input.dataset.field;
+      try {
+        properties[field] = coerceFieldValue(input.value, feature.properties[field],
+          fieldTypeForFeature(feature, field));
+      } catch (error) {
+        input.focus();
+        throw new Error(`字段“${field}”：${error.message}`);
+      }
+    }
+    if (properties.name !== undefined && !String(properties.name).trim()) {
+      throw new Error("名称不能为空。");
+    }
+    await updateFeature({ ...feature, properties }, `修改 ${feature.id} 的属性`);
     setNotice(`已保存 ${feature.id} 的属性修改。`);
   } catch (error) {
     setNotice(`属性更新失败：${error.message}`);
@@ -2493,6 +2656,14 @@ document.getElementById("bulkUpdateBtn").addEventListener("click", async () => {
     setNotice(`字段“${field}”不能为空。`);
     return;
   }
+  try {
+    for (const feature of selected) {
+      coerceFieldValue(raw, feature.properties[field], fieldTypeForFeature(feature, field));
+    }
+  } catch (error) {
+    setNotice(`批量修改字段“${field}”失败：${error.message}`);
+    return;
+  }
   if (!window.confirm(`将 ${selected.length} 个选中要素的“${field}”统一改为“${raw}”？`)) return;
   const selectedIds = new Set(selected.map((feature) => feature.id));
   const button = document.getElementById("bulkUpdateBtn");
@@ -2504,7 +2675,8 @@ document.getElementById("bulkUpdateBtn").addEventListener("click", async () => {
         throw new Error("所选要素已变化，请刷新后重新选择。");
       }
       for (const feature of matches) {
-        feature.properties[field] = coerceFieldValue(raw, feature.properties[field]);
+        feature.properties[field] = coerceFieldValue(raw, feature.properties[field],
+          fieldTypeForFeature(feature, field));
       }
     }, `已批量更新当前数据集 ${selected.length} 个要素的“${field}”。`);
   } catch (error) {
@@ -2522,7 +2694,7 @@ document.getElementById("deleteSelectionBtn").addEventListener("click", async ()
     setNotice(error.message);
     return;
   }
-  if (!window.confirm(`确定删除选中的 ${selected.length} 个要素及其属性吗？此操作不能撤销。`)) return;
+  if (!window.confirm(`确定删除选中的 ${selected.length} 个要素及其属性吗？删除后可通过“撤销”恢复。`)) return;
   const button = document.getElementById("deleteSelectionBtn");
   button.disabled = true;
   const selectedIds = new Set(selected.map((feature) => feature.id));
@@ -2546,6 +2718,7 @@ document.getElementById("saveBtn").addEventListener("click", () => {
 
 document.getElementById("resetBtn").addEventListener("click", async () => {
   await api("/api/reset", { method: "POST" });
+  clearEditHistory();
   state.selectedIds.clear();
   state.draft = [];
   state.draftHover = null;
@@ -2553,7 +2726,8 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
   exitGeometryEdit();
   state.attributePage = 1;
   syncDraftControls();
-  await Promise.all([loadDatasets(), loadStatus()]);
+  await loadDatasets();
+  await loadStatus();
   state.visibleDatasetIds.add(state.activeDataset.id);
   await loadData();
   syncMapMode();
@@ -2587,7 +2761,34 @@ document.getElementById("attributeSearch").addEventListener("input", (event) => 
   renderAttributeTable();
 });
 
-document.getElementById("addFieldBtn").addEventListener("click", () => addField());
+document.getElementById("addFieldBtn").addEventListener("click", () => {
+  if (!state.activeDataset) {
+    setNotice("请先选择数据集再新增字段。");
+    return;
+  }
+  document.getElementById("addFieldDialog").showModal();
+  document.getElementById("newFieldName").focus();
+});
+document.getElementById("cancelFieldBtn").addEventListener("click", () =>
+  document.getElementById("addFieldDialog").close());
+document.getElementById("addFieldForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = document.getElementById("confirmFieldBtn");
+  button.disabled = true;
+  try {
+    await addField(
+      document.getElementById("newFieldName").value,
+      document.getElementById("newFieldType").value,
+      document.getElementById("newFieldDefault").value,
+    );
+    document.getElementById("addFieldDialog").close();
+    document.getElementById("addFieldForm").reset();
+  } catch (error) {
+    setNotice(`新增字段失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
 document.getElementById("attributePrevBtn").addEventListener("click", () => {
   state.attributePage = Math.max(1, state.attributePage - 1);
   renderAttributeTable();
