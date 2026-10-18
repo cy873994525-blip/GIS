@@ -2,6 +2,7 @@ const canvas = document.getElementById("mapCanvas");
 const ctx = canvas.getContext("2d");
 const tileLayer = document.getElementById("baseMapTiles");
 const visibleTiles = new Map();
+let drawFramePending = false;
 const MAX_MERCATOR_LAT = 85.05112878;
 const TILE_SIZE = 256;
 const MAX_TILE_ZOOM = 19;
@@ -39,10 +40,16 @@ const state = {
   attributeFilter: "all",
   attributeSearch: "",
   attributePage: 1,
+  attributeSort: { key: null, direction: "asc" },
   // 几何编辑
   editFeatureId: null,
   editGeometry: null,
-  geometryHistory: [],
+  declaredFieldTypes: {},
+  declaredFieldDefaults: {},
+  activeFieldTypes: {},
+  editHistory: [],
+  redoHistory: [],
+  historyBusy: false,
   vertexDrag: null,
   featureDrag: null,
   hoverVertexIndex: -1,
@@ -52,20 +59,26 @@ const state = {
   geographic: false,
   baseMapEnabled: true,
   baseMapErrorShown: false,
+  layerOrder: [],
+  layerStyles: {},
+  snapEnabled: true,
+  snapTarget: null,
 };
 
 // 属性表每页渲染的行数。后端 MAX_FEATURES 是 10000，全量建 DOM 会把页面拖死。
 const ATTRIBUTE_PAGE_SIZE = 100;
 // 这两列由绘制/图层逻辑使用，排到属性表最前面；其余字段按首次出现顺序。
 const PINNED_FIELDS = ["name", "layer"];
-// 几何编辑的历史深度。
-const GEOMETRY_HISTORY_LIMIT = 30;
+const DISPLAY_ONLY_FIELDS = new Set(["layer", "dataset_id"]);
+// 同一数据集的已保存编辑历史；切换数据集或重置后清空。
+const EDIT_HISTORY_LIMIT = 30;
 
 const FIELD_LABELS = {
   name: "名称",
   layer: "图层",
   kind: "几何类别",
 };
+const FIELD_TYPE_LABELS = { text: "文本", number: "数字", boolean: "布尔", json: "JSON" };
 
 const layerColors = {
   "兴趣点": "#b6335c",
@@ -75,13 +88,72 @@ const layerColors = {
   "自定义": "#176d6a",
 };
 
+const LAYER_PREFERENCES_KEY = "gis-vector-demo-layer-preferences-v1";
+
+function loadLayerPreferences() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYER_PREFERENCES_KEY) || "{}");
+    if (Array.isArray(saved.order)) state.layerOrder = saved.order.filter((name) => typeof name === "string");
+    if (saved.styles && typeof saved.styles === "object") state.layerStyles = saved.styles;
+  } catch (error) {
+    // Invalid local preferences should not prevent the map from loading.
+  }
+}
+
+function saveLayerPreferences() {
+  try {
+    localStorage.setItem(LAYER_PREFERENCES_KEY, JSON.stringify({
+      order: state.layerOrder,
+      styles: state.layerStyles,
+    }));
+  } catch (error) {
+    // Keep the current-session style when browser storage is unavailable.
+  }
+}
+
+function ensureLayerPreferences(names) {
+  const available = new Set(names);
+  const remembered = state.layerOrder.filter((name) => available.has(name));
+  const newNames = names.filter((name) => !remembered.includes(name))
+    .sort((a, b) => a.localeCompare(b, "zh-CN"));
+  state.layerOrder = [...remembered, ...newNames];
+  for (const name of names) {
+    const existing = state.layerStyles[name];
+    state.layerStyles[name] = {
+      color: /^#[0-9a-f]{6}$/i.test(existing?.color || "")
+        ? existing.color
+        : layerColors[name] || layerColors["自定义"],
+      opacity: Number.isFinite(Number(existing?.opacity))
+        ? Math.max(0.15, Math.min(1, Number(existing.opacity)))
+        : 0.62,
+    };
+  }
+  saveLayerPreferences();
+}
+
+function layerStyle(name) {
+  if (!state.layerStyles[name]) {
+    state.layerStyles[name] = { color: layerColors[name] || layerColors["自定义"], opacity: 0.62 };
+  }
+  return state.layerStyles[name];
+}
+
+function rgbaFromHex(hex, alpha) {
+  const value = String(hex || "").replace("#", "");
+  if (!/^[0-9a-f]{6}$/i.test(value)) return `rgba(23, 109, 106, ${alpha})`;
+  const channels = [0, 2, 4].map((index) => parseInt(value.slice(index, index + 2), 16));
+  return `rgba(${channels.join(", ")}, ${alpha})`;
+}
+
+loadLayerPreferences();
+
 const hints = {
   pan: "当前：漫游。拖拽移动地图，滚轮缩放。",
-  select: "当前：点选。点击要素可以查看属性。",
-  box: "当前：框选。按住拖拽形成选择框。",
-  point: "当前：画点。点击地图新增点要素。",
-  line: "当前：画线。连续点击添加节点，可撤销节点，完成后生成线。",
-  polygon: "当前：画面。连续点击添加节点，可撤销节点，完成后生成面。",
+  select: "当前：点选。Shift 加选，Alt 减选，Ctrl 切换选中状态。",
+  box: "当前：框选。拖拽选择相交要素；Shift 加选，Alt 减选。",
+  point: "当前：画点。点击地图新增点；吸附开启时贴合已有节点或边。",
+  line: "当前：画线。连续点击添加节点，双击或按 Enter 完成。",
+  polygon: "当前：画面。连续点击添加节点，双击、按 Enter 或点击起点完成。",
   edit: "当前：编辑几何。选中一个要素后，拖节点改形状，拖要素本体整体平移，双击边插入节点，Alt+点击删除节点。",
 };
 
@@ -178,8 +250,8 @@ function isGeographicDataset() {
   const crsList = state.datasets
     .filter((dataset) => state.visibleDatasetIds.has(dataset.id))
     .map((dataset) => dataset.crs || "Unknown");
-  const crs = crsList.length ? crsList.join(" ") : "Unknown";
-  return crs === "Unknown" || /WGS[ _]?84|EPSG:?4326|CRS:?84/i.test(crs);
+  return crsList.every((crs) =>
+    crs === "Unknown" || /WGS[ _-]?(?:19)?84|EPSG:?4326|CRS:?84/i.test(crs));
 }
 
 function syncMapMode() {
@@ -268,17 +340,44 @@ function resizeCanvas() {
 }
 
 async function api(path, options) {
-  const response = await fetch(path, options);
-  if (!response.ok) {
-    let message = await response.text();
-    try {
-      message = JSON.parse(message).error || message;
-    } catch (error) {
-      // Keep the raw response when the server does not return JSON.
-    }
-    throw new Error(message);
+  const savesData = options && ["POST", "PUT"].includes(options.method) &&
+    (path === "/api/save" || path === "/api/features" || path.startsWith("/api/features/"));
+  const status = document.getElementById("saveStatus");
+  if (savesData) {
+    state.isSaving = true;
+    status.textContent = "保存中…";
+    status.dataset.state = "saving";
+    syncHistoryControls();
   }
-  return response.json();
+  try {
+    const response = await fetch(path, options);
+    if (!response.ok) {
+      let message = await response.text();
+      try {
+        message = JSON.parse(message).error || message;
+      } catch (error) {
+        // Keep the raw response when the server does not return JSON.
+      }
+      throw new Error(message);
+    }
+    const result = await response.json();
+    if (savesData) {
+      status.textContent = "已保存";
+      status.dataset.state = "saved";
+    }
+    return result;
+  } catch (error) {
+    if (savesData) {
+      status.textContent = "保存失败";
+      status.dataset.state = "error";
+    }
+    throw error;
+  } finally {
+    if (savesData) {
+      state.isSaving = false;
+      syncHistoryControls();
+    }
+  }
 }
 
 function formatBytes(bytes) {
@@ -389,8 +488,20 @@ async function loadDatasets() {
 
 async function loadData() {
   const ids = [...state.visibleDatasetIds];
-  const query = ids.length ? `?ids=${encodeURIComponent(ids.join(","))}` : "";
-  state.data = await api(`/api/layers${query}`);
+  const [layerData, activeRaw] = await Promise.all([
+    ids.length
+      ? api(`/api/layers?ids=${encodeURIComponent(ids.join(","))}`)
+      : Promise.resolve({ type: "FeatureCollection", features: [] }),
+    state.activeDataset ? activeDatasetData() : Promise.resolve(null),
+  ]);
+  state.data = layerData;
+  state.declaredFieldTypes = activeRaw ? (activeRaw.field_types || {}) : {};
+  state.declaredFieldDefaults = activeRaw ? (activeRaw.field_defaults || {}) : {};
+  state.activeFieldTypes = activeRaw
+    ? { ...inferFieldTypes(activeRaw.features), ...state.declaredFieldTypes }
+    : {};
+  state.selectedIds = new Set([...state.selectedIds].filter((id) =>
+    state.data.features.some((feature) => feature.id === id)));
   state.geographic = false;
   const layers = new Set(state.data.features.map((f) => f.properties.layer || "未命名"));
   state.visibleLayers = layers;
@@ -419,9 +530,11 @@ async function loadStatus() {
 async function activateDataset(datasetId) {
   try {
     await api(`/api/datasets/${encodeURIComponent(datasetId)}/activate`, { method: "POST" });
+    clearEditHistory();
     state.selectedIds.clear();
     state.visibleDatasetIds.add(datasetId);
-    await Promise.all([loadDatasets(), loadData(), loadStatus()]);
+    await loadDatasets();
+    await Promise.all([loadData(), loadStatus()]);
     syncMapMode();
     fitView();
     setNotice(`已切换到数据集“${state.activeDataset.name}”。`);
@@ -489,11 +602,13 @@ async function importDataset(file) {
       body: JSON.stringify({ file_name: file.name, content, sidecars }),
     });
     state.selectedIds.clear();
-    await Promise.all([loadDatasets(), loadData(), loadStatus()]);
-    syncMapMode();
-    fitView();
     const imported = result.dataset;
     state.visibleDatasetIds.add(imported.id);
+    clearEditHistory();
+    await loadDatasets();
+    await Promise.all([loadData(), loadStatus()]);
+    syncMapMode();
+    fitView();
     setNotice(`已导入“${file.name}”，后端已登记文件元数据。`);
     setImportStatus(
       `导入成功：${imported.feature_count} 个要素，${imported.format || "GeoJSON"}。`,
@@ -548,12 +663,22 @@ function renderLayers() {
     counts[name] = (counts[name] || 0) + 1;
   }
 
+  const names = Object.keys(counts);
+  ensureLayerPreferences(names);
+
   const layerList = document.getElementById("layerList");
   layerList.innerHTML = "";
 
-  Object.keys(counts).sort().forEach((name) => {
+  state.layerOrder.filter((name) => counts[name]).forEach((name) => {
     const row = document.createElement("div");
     row.className = "layer-row";
+    row.draggable = true;
+    row.dataset.layer = name;
+
+    const dragHandle = document.createElement("span");
+    dragHandle.className = "layer-drag-handle";
+    dragHandle.textContent = "⋮⋮";
+    dragHandle.title = "拖动调整图层顺序";
 
     const label = document.createElement("label");
     const input = document.createElement("input");
@@ -569,7 +694,7 @@ function renderLayers() {
     });
     const swatch = document.createElement("i");
     swatch.className = "layer-swatch";
-    swatch.style.background = layerColors[name] || layerColors["自定义"];
+    swatch.style.background = layerStyle(name).color;
     const labelText = document.createElement("span");
     labelText.textContent = name;
     label.append(input, swatch, labelText);
@@ -578,7 +703,62 @@ function renderLayers() {
     count.className = "layer-count";
     count.textContent = `${counts[name]} 个`;
 
-    row.append(label, count);
+    const styleControls = document.createElement("div");
+    styleControls.className = "layer-style-controls";
+
+    const colorInput = document.createElement("input");
+    colorInput.type = "color";
+    colorInput.className = "layer-color-input";
+    colorInput.value = layerStyle(name).color;
+    colorInput.title = "设置图层颜色";
+    colorInput.setAttribute("aria-label", `${name} 图层颜色`);
+    colorInput.addEventListener("input", () => {
+      layerStyle(name).color = colorInput.value;
+      swatch.style.background = colorInput.value;
+      saveLayerPreferences();
+      draw();
+    });
+
+    const opacityInput = document.createElement("input");
+    opacityInput.type = "range";
+    opacityInput.min = "0.15";
+    opacityInput.max = "1";
+    opacityInput.step = "0.05";
+    opacityInput.value = String(layerStyle(name).opacity);
+    opacityInput.title = "设置图层透明度";
+    opacityInput.setAttribute("aria-label", `${name} 图层透明度`);
+    opacityInput.addEventListener("input", () => {
+      layerStyle(name).opacity = Number(opacityInput.value);
+      saveLayerPreferences();
+      draw();
+    });
+    styleControls.append(colorInput, opacityInput);
+
+    row.append(dragHandle, label, count, styleControls);
+    row.addEventListener("dragstart", (event) => {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", name);
+      row.classList.add("is-dragging");
+    });
+    row.addEventListener("dragend", () => row.classList.remove("is-dragging"));
+    row.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      row.classList.add("is-drop-target");
+    });
+    row.addEventListener("dragleave", () => row.classList.remove("is-drop-target"));
+    row.addEventListener("drop", (event) => {
+      event.preventDefault();
+      row.classList.remove("is-drop-target");
+      const source = event.dataTransfer.getData("text/plain");
+      if (!source || source === name) return;
+      const order = state.layerOrder.filter((layerName) => layerName !== source);
+      const targetIndex = order.indexOf(name);
+      order.splice(targetIndex < 0 ? order.length : targetIndex, 0, source);
+      state.layerOrder = order;
+      saveLayerPreferences();
+      renderLayers();
+      draw();
+    });
     layerList.appendChild(row);
   });
 
@@ -604,8 +784,41 @@ function selectedFeatures() {
   return state.data.features.filter((feature) => state.selectedIds.has(feature.id));
 }
 
+function isEditableFeature(feature) {
+  return Boolean(state.activeDataset &&
+    (feature.properties || {}).dataset_id === state.activeDataset.id);
+}
+
+function assertEditableSelection(features) {
+  if (!features.every(isEditableFeature)) {
+    throw new Error("请先切换到要编辑的要素所在数据集；不能跨数据集批量修改或删除。");
+  }
+}
+
+function displayFeature(rawFeature) {
+  return {
+    ...rawFeature,
+    properties: {
+      ...rawFeature.properties,
+      layer: state.activeDataset.name,
+      dataset_id: state.activeDataset.id,
+    },
+  };
+}
+
+async function activeDatasetData() {
+  if (!state.activeDataset) throw new Error("请先选择数据集。");
+  const result = await api(`/api/datasets/${encodeURIComponent(state.activeDataset.id)}`);
+  return result.data;
+}
+
 function selectFeatures(ids) {
-  state.selectedIds = new Set(ids);
+  const nextIds = new Set(ids);
+  if (nextIds.size !== state.selectedIds.size ||
+      [...nextIds].some((id) => !state.selectedIds.has(id))) {
+    document.getElementById("bulkValueInput").value = "";
+  }
+  state.selectedIds = nextIds;
   // 编辑几何模式下，选中项就是编辑目标。表格点行、框选都会走到这里。
   if (state.mode === "edit") {
     const target = getSingleSelectedFeature();
@@ -665,25 +878,58 @@ function formatCellValue(value) {
   return String(value);
 }
 
-// 保持字段原有的值类型：原本是数字且新文本仍能解析成有限数字时，继续存数字。
-function coerceFieldValue(raw, original) {
-  if (raw === formatCellValue(original)) return original;
-  const text = raw.trim();
-  if (original === null && text === "") return null;
-  if (typeof original === "number" && text !== "") {
-    const parsed = Number(text);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  if (typeof original === "boolean" && /^(true|false)$/i.test(text)) {
-    return text.toLowerCase() === "true";
-  }
-  if (original !== null && typeof original === "object") {
-    try {
-      return JSON.parse(text);
-    } catch (error) {
-      // Invalid JSON is kept as text so the value remains editable.
+function valueType(value) {
+  if (typeof value === "number") return "number";
+  if (typeof value === "boolean") return "boolean";
+  if (value !== null && typeof value === "object") return "json";
+  return "text";
+}
+
+function inferFieldTypes(features) {
+  const types = {};
+  for (const feature of features) {
+    for (const [field, value] of Object.entries(feature.properties || {})) {
+      if (value === null || value === undefined) continue;
+      const kind = valueType(value);
+      types[field] = types[field] && types[field] !== kind ? "text" : kind;
     }
   }
+  return types;
+}
+
+function fieldTypeForFeature(feature, field) {
+  if (state.declaredFieldTypes[field]) return state.declaredFieldTypes[field];
+  const value = (feature.properties || {})[field];
+  if (value !== null && value !== undefined) return valueType(value);
+  return state.activeFieldTypes[field] || "text";
+}
+
+// 新建字段采用持久化类型；旧数据按原值/同列值推断，拒绝把数字或布尔值意外改成文本。
+function coerceFieldValue(raw, original, kind = valueType(original)) {
+  if (raw === formatCellValue(original)) return original;
+  const text = raw.trim();
+  if (kind === "number") {
+    if (!text) return null;
+    const parsed = Number(text);
+    if (Number.isFinite(parsed)) return parsed;
+    throw new Error("数字字段只能填写有限数字，留空表示空值。");
+  }
+  if (kind === "boolean") {
+    if (!text) return null;
+    if (!/^(true|false)$/i.test(text)) throw new Error("布尔字段只能填写 true 或 false，留空表示空值。");
+    return text.toLowerCase() === "true";
+  }
+  if (kind === "json") {
+    if (!text) return null;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed !== null && typeof parsed === "object") return parsed;
+    } catch (error) {
+      // 下方统一给出输入错误提示。
+    }
+    throw new Error("JSON 字段需要填写合法的对象或数组，留空表示空值。");
+  }
+  if (original === null && !text) return null;
   return text;
 }
 
@@ -721,23 +967,61 @@ function attributeRows() {
         .some((value) => formatCellValue(value).toLowerCase().includes(keyword));
     });
   }
-  return rows;
+  const { key, direction } = state.attributeSort;
+  if (!key) return rows;
+  const valueFor = (feature) => key === "id" ? feature.id :
+    key === "geometry" ? feature.geometry.type : (feature.properties || {})[key.slice(6)];
+  const collator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+  return rows.map((feature, index) => ({ feature, index })).sort((a, b) => {
+    const left = valueFor(a.feature);
+    const right = valueFor(b.feature);
+    const leftEmpty = left === null || left === undefined || left === "";
+    const rightEmpty = right === null || right === undefined || right === "";
+    if (leftEmpty !== rightEmpty) return leftEmpty ? 1 : -1;
+    let order = 0;
+    if (!leftEmpty) {
+      order = typeof left === "number" && typeof right === "number"
+        ? left - right
+        : collator.compare(formatCellValue(left), formatCellValue(right));
+    }
+    return order ? (direction === "asc" ? order : -order) : a.index - b.index;
+  }).map((entry) => entry.feature);
 }
 
-function makeHeaderCell(label, field) {
+function toggleAttributeSort(key) {
+  state.attributeSort = state.attributeSort.key === key
+    ? { key, direction: state.attributeSort.direction === "asc" ? "desc" : "asc" }
+    : { key, direction: "asc" };
+  state.attributePage = 1;
+  renderAttributeTable();
+}
+
+function makeHeaderCell(label, field, sortKey) {
   const th = document.createElement("th");
   const inner = document.createElement("span");
   inner.className = "th-inner";
-  const text = document.createElement("span");
-  text.textContent = label;
-  if (field) text.title = `字段：${field}`;
-  inner.appendChild(text);
-  if (field) {
+  const sort = document.createElement("button");
+  sort.type = "button";
+  sort.className = "column-sort";
+  sort.dataset.sortKey = sortKey;
+  sort.title = `按“${field || label}”排序`;
+  sort.textContent = label;
+  const indicator = document.createElement("span");
+  indicator.className = "sort-indicator";
+  const active = state.attributeSort.key === sortKey;
+  indicator.textContent = active ? (state.attributeSort.direction === "asc" ? "▲" : "▼") : "↕";
+  sort.appendChild(indicator);
+  sort.addEventListener("click", () => toggleAttributeSort(sortKey));
+  th.setAttribute("aria-sort", active
+    ? (state.attributeSort.direction === "asc" ? "ascending" : "descending") : "none");
+  inner.appendChild(sort);
+  if (field && !DISPLAY_ONLY_FIELDS.has(field) && state.data.features.some((feature) =>
+    isEditableFeature(feature) && Object.prototype.hasOwnProperty.call(feature.properties || {}, field))) {
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "field-remove";
     remove.textContent = "×";
-    remove.title = `删除字段“${field}”（对全部要素生效）`;
+    remove.title = `从当前数据集删除字段“${field}”`;
     remove.addEventListener("click", (event) => {
       event.stopPropagation();
       removeField(field);
@@ -766,9 +1050,10 @@ function renderAttributeTable() {
 
   head.innerHTML = "";
   const headRow = document.createElement("tr");
-  headRow.appendChild(makeHeaderCell("ID", null));
-  for (const field of fields) headRow.appendChild(makeHeaderCell(fieldLabel(field), field));
-  headRow.appendChild(makeHeaderCell("几何类型", null));
+  headRow.appendChild(makeHeaderCell("ID", null, "id"));
+  for (const field of fields) headRow.appendChild(makeHeaderCell(fieldLabel(field), field,
+    `field:${field}`));
+  headRow.appendChild(makeHeaderCell("几何类型", null, "geometry"));
   head.appendChild(headRow);
 
   body.innerHTML = "";
@@ -777,11 +1062,21 @@ function renderAttributeTable() {
     row.dataset.id = feature.id;
     row.tabIndex = 0;
     row.classList.toggle("active", state.selectedIds.has(feature.id));
-    row.title = "单击选中；Ctrl 加选，Shift 范围选；双击单元格编辑属性";
+    row.title = "单击或按 Enter 选中；Ctrl 加选，Shift 范围选；双击单元格编辑属性";
 
     const idCell = document.createElement("td");
     idCell.className = "cell-id";
     idCell.textContent = feature.id;
+    const locate = document.createElement("button");
+    locate.type = "button";
+    locate.className = "row-locate";
+    locate.textContent = "定位";
+    locate.title = `将地图定位到 ${feature.id}`;
+    locate.addEventListener("click", (event) => {
+      event.stopPropagation();
+      focusFeature(feature);
+    });
+    idCell.appendChild(locate);
     row.appendChild(idCell);
 
     for (const field of fields) {
@@ -827,11 +1122,18 @@ function renderAttributeTable() {
 
 // 双击单元格 → 原地换成输入框 → Enter/失焦提交，Esc 取消。
 function beginCellEdit(cell, feature, field) {
+  if (!isEditableFeature(feature) || DISPLAY_ONLY_FIELDS.has(field)) {
+    setNotice(DISPLAY_ONLY_FIELDS.has(field)
+      ? "数据集名称和来源 ID 为只读信息。"
+      : "请先切换到这个要素所在数据集再编辑。");
+    return;
+  }
   if (cell.classList.contains("cell-editing")) return;
   const original = (feature.properties || {})[field];
   const input = document.createElement("input");
   input.type = "text";
   input.value = formatCellValue(original);
+  input.title = `字段类型：${FIELD_TYPE_LABELS[fieldTypeForFeature(feature, field)]}`;
   cell.classList.add("cell-editing");
   cell.textContent = "";
   cell.appendChild(input);
@@ -842,9 +1144,23 @@ function beginCellEdit(cell, feature, field) {
   const finish = async (commit) => {
     if (settled) return;
     settled = true;
-    const nextValue = coerceFieldValue(input.value, original);
+    if (!commit) {
+      cell.classList.remove("cell-editing");
+      renderAttributeTable();
+      return;
+    }
+    let nextValue;
+    try {
+      nextValue = coerceFieldValue(input.value, original, fieldTypeForFeature(feature, field));
+      if (field === "name" && !String(nextValue).trim()) throw new Error("名称不能为空。");
+    } catch (error) {
+      settled = false;
+      setNotice(`字段“${field}”：${error.message}`);
+      input.focus();
+      return;
+    }
     cell.classList.remove("cell-editing");
-    if (!commit || nextValue === original) {
+    if (nextValue === original) {
       renderAttributeTable();
       return;
     }
@@ -871,56 +1187,141 @@ function beginCellEdit(cell, feature, field) {
   input.addEventListener("blur", () => finish(true));
 }
 
-// 字段级的批量改动（新增/删除字段）影响所有要素，用 /api/save 整份落库更合适。
-async function persistAllFeatures(nextData, message) {
+function syncHistoryControls() {
+  document.getElementById("undoEditBtn").disabled = state.historyBusy ||
+    state.isSaving || !state.editHistory.length;
+  document.getElementById("redoEditBtn").disabled = state.historyBusy ||
+    state.isSaving || !state.redoHistory.length;
+}
+
+function clearEditHistory() {
+  state.editHistory = [];
+  state.redoHistory = [];
+  syncHistoryControls();
+}
+
+function recordEdit(before, after, label, selectedBefore = [...state.selectedIds],
+    selectedAfter = [...state.selectedIds]) {
+  if (JSON.stringify(before) === JSON.stringify(after)) return;
+  state.editHistory.push({
+    datasetId: state.activeDataset.id,
+    before: deepCopy(before),
+    after: deepCopy(after),
+    label,
+    selectedBefore,
+    selectedAfter,
+  });
+  if (state.editHistory.length > EDIT_HISTORY_LIMIT) state.editHistory.shift();
+  state.redoHistory = [];
+  syncHistoryControls();
+}
+
+async function replayEdit(direction) {
+  const undo = direction === "undo";
+  const source = undo ? state.editHistory : state.redoHistory;
+  const target = undo ? state.redoHistory : state.editHistory;
+  if (state.historyBusy || state.isSaving || !source.length) return;
+  const entry = source[source.length - 1];
+  if (!state.activeDataset || entry.datasetId !== state.activeDataset.id) {
+    clearEditHistory();
+    setNotice("数据集已切换，旧编辑历史已清空。");
+    return;
+  }
+  state.historyBusy = true;
+  syncHistoryControls();
+  try {
+    const current = await activeDatasetData();
+    const expected = undo ? entry.after : entry.before;
+    if (JSON.stringify(current) !== JSON.stringify(expected)) {
+      clearEditHistory();
+      setNotice("数据集已在其他位置变化，旧编辑历史已清空；请刷新后再编辑。");
+      return;
+    }
+    await api("/api/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(undo ? entry.before : entry.after),
+    });
+    source.pop();
+    target.push(entry);
+    state.selectedIds = new Set(undo ? entry.selectedBefore : entry.selectedAfter);
+    await loadData();
+    if (state.mode === "edit") {
+      const feature = getSingleSelectedFeature();
+      if (feature && isEditableFeature(feature)) enterGeometryEdit(feature);
+    }
+    syncMapMode();
+    setNotice(`${undo ? "已撤销" : "已重做"}：${entry.label}。`);
+  } catch (error) {
+    setNotice(`${undo ? "撤销" : "重做"}失败：${error.message}`);
+  } finally {
+    state.historyBusy = false;
+    syncHistoryControls();
+    draw();
+  }
+}
+
+// /api/layers 是多个数据集的展示副本；写入只能使用当前数据集的原始 GeoJSON。
+async function persistActiveFeatures(transform, message) {
+  const before = await activeDatasetData();
+  const nextData = deepCopy(before);
+  const selectedBefore = [...state.selectedIds];
+  transform(nextData);
   await api("/api/save", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(nextData),
   });
-  state.data = nextData;
+  recordEdit(before, nextData, message, selectedBefore,
+    selectedBefore.filter((id) => nextData.features.some((feature) => feature.id === id)));
   state.dirty = false;
-  renderLayers();
-  renderAttributes();
-  draw();
+  await loadData();
+  syncMapMode();
   setNotice(message);
 }
 
-async function addField() {
-  const raw = window.prompt("新字段名（例如：备注 / code）", "");
-  if (raw === null) return;
-  const field = raw.trim();
+async function addField(field, kind, defaultRaw) {
+  field = field.trim();
   if (!field) {
-    setNotice("字段名不能为空。");
-    return;
+    throw new Error("字段名不能为空。");
   }
-  if (collectFields(state.data.features).includes(field)) {
-    setNotice(`字段“${field}”已经存在，直接双击单元格填写即可。`);
-    return;
+  if (DISPLAY_ONLY_FIELDS.has(field) ||
+      ["name", "kind", "__proto__", "prototype", "constructor"].includes(field)) {
+    throw new Error(`字段名“${field}”不能手动新增。`);
   }
-  const nextData = deepCopy(state.data);
-  for (const feature of nextData.features) {
-    if (!feature.properties) feature.properties = {};
-    feature.properties[field] = "";
+  if (!["text", "number", "boolean"].includes(kind)) {
+    throw new Error("请选择文本、数字或布尔字段类型。");
   }
-  try {
-    await persistAllFeatures(nextData, `已新增字段“${field}”，双击单元格即可填写。`);
-  } catch (error) {
-    setNotice(`新增字段失败：${error.message}`);
+  const data = await activeDatasetData();
+  if (collectFields(data.features).includes(field) ||
+      Object.prototype.hasOwnProperty.call(data.field_types || {}, field)) {
+    throw new Error(`字段“${field}”在当前数据集已存在。`);
   }
+  const defaultValue = coerceFieldValue(defaultRaw, undefined, kind);
+  await persistActiveFeatures((nextData) => {
+    nextData.field_types = { ...(nextData.field_types || {}), [field]: kind };
+    nextData.field_defaults = { ...(nextData.field_defaults || {}), [field]: defaultValue };
+    for (const feature of nextData.features) {
+      if (!feature.properties) feature.properties = {};
+      feature.properties[field] = defaultValue;
+    }
+  }, `已新增${{ text: "文本", number: "数字", boolean: "布尔" }[kind]}字段“${field}”。`);
 }
 
 async function removeField(field) {
+  if (DISPLAY_ONLY_FIELDS.has(field)) return;
   const warning = PINNED_FIELDS.includes(field)
     ? `“${field}”是绘制和图层功能用到的字段，删除后相关要素会回退到默认值。确定删除吗？`
-    : `确定从全部 ${state.data.features.length} 个要素中删除字段“${field}”吗？`;
+    : `确定从当前数据集的全部要素中删除字段“${field}”吗？`;
   if (!window.confirm(warning)) return;
-  const nextData = deepCopy(state.data);
-  for (const feature of nextData.features) {
-    if (feature.properties) delete feature.properties[field];
-  }
   try {
-    await persistAllFeatures(nextData, `已从全部要素中删除字段“${field}”。`);
+    await persistActiveFeatures((data) => {
+      for (const feature of data.features) {
+        if (feature.properties) delete feature.properties[field];
+      }
+      if (data.field_types) delete data.field_types[field];
+      if (data.field_defaults) delete data.field_defaults[field];
+    }, `已从当前数据集删除字段“${field}”。`);
   } catch (error) {
     setNotice(`删除字段失败：${error.message}`);
   }
@@ -940,12 +1341,16 @@ function getEditFeature() {
 }
 
 function enterGeometryEdit(feature) {
+  if (!isEditableFeature(feature)) {
+    exitGeometryEdit();
+    setNotice("请先切换到这个要素所在数据集再编辑几何。");
+    return;
+  }
   state.editFeatureId = feature.id;
   state.editGeometry = {
     type: feature.geometry.type,
     coordinates: deepCopy(feature.geometry.coordinates),
   };
-  state.geometryHistory = [];
   state.vertexDrag = null;
   state.featureDrag = null;
   state.hoverVertexIndex = -1;
@@ -955,7 +1360,6 @@ function enterGeometryEdit(feature) {
 function exitGeometryEdit() {
   state.editFeatureId = null;
   state.editGeometry = null;
-  state.geometryHistory = [];
   state.vertexDrag = null;
   state.featureDrag = null;
   state.hoverVertexIndex = -1;
@@ -965,7 +1369,6 @@ function exitGeometryEdit() {
 function syncGeometryControls() {
   const editing = Boolean(state.editFeatureId && state.editGeometry);
   document.getElementById("endEditBtn").disabled = !editing;
-  document.getElementById("undoGeometryBtn").disabled = !editing || !state.geometryHistory.length;
   canvas.classList.toggle("is-dragging-vertex", Boolean(state.vertexDrag || state.featureDrag));
   canvas.classList.toggle("is-over-vertex", state.hoverVertexIndex >= 0);
 }
@@ -1082,6 +1485,58 @@ function projectPointOnSegment(point, a, b) {
   return [a[0] + t * dx, a[1] + t * dy];
 }
 
+function findSnapTarget(x, y, excludedFeatureId = null) {
+  if (!state.snapEnabled) return null;
+  const cursor = [x, y];
+  const tolerance = 11;
+  let nearestVertex = null;
+  let nearestEdge = null;
+  for (const feature of state.data.features) {
+    if (feature.id === excludedFeatureId ||
+        !state.visibleLayers.has(feature.properties.layer || "未命名")) continue;
+    for (const vertex of extractVertices(feature.geometry)) {
+      const screen = worldToScreen(vertex.coord);
+      const distance = Math.hypot(x - screen.x, y - screen.y);
+      if (distance <= tolerance && (!nearestVertex || distance < nearestVertex.distance)) {
+        nearestVertex = { kind: "节点", coord: vertex.coord, x: screen.x, y: screen.y, distance };
+      }
+    }
+    for (const line of geometryLines(feature.geometry)) {
+      for (let index = 1; index < line.length; index += 1) {
+        const a = worldToScreen(line[index - 1]);
+        const b = worldToScreen(line[index]);
+        const projected = projectPointOnSegment(cursor, [a.x, a.y], [b.x, b.y]);
+        const distance = Math.hypot(x - projected[0], y - projected[1]);
+        if (distance <= tolerance && (!nearestEdge || distance < nearestEdge.distance)) {
+          nearestEdge = {
+            kind: "边", coord: screenToWorld(projected[0], projected[1]),
+            x: projected[0], y: projected[1], distance,
+          };
+        }
+      }
+    }
+  }
+  return nearestVertex || nearestEdge;
+}
+
+function drawSnapIndicator() {
+  if (!state.snapTarget) return;
+  const { x, y, kind } = state.snapTarget;
+  ctx.save();
+  ctx.strokeStyle = "#d65d3d";
+  ctx.fillStyle = "#ffffff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  if (kind === "节点") ctx.rect(x - 6, y - 6, 12, 12);
+  else ctx.arc(x, y, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.font = "11px Microsoft YaHei, Arial";
+  ctx.fillStyle = "#9c3f29";
+  ctx.fillText(`吸附${kind}`, x + 10, y - 10);
+  ctx.restore();
+}
+
 function translateCoordinates(value, dx, dy) {
   if (!Array.isArray(value)) return;
   if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
@@ -1094,12 +1549,13 @@ function translateCoordinates(value, dx, dy) {
 
 function hitTestVertex(worldPoint) {
   if (!isEditMode()) return null;
-  const tolerance = 9 / state.scale;
+  const cursor = worldToScreen(worldPoint);
   const vertices = extractVertices(state.editGeometry);
   for (let index = vertices.length - 1; index >= 0; index -= 1) {
     const vertex = vertices[index];
     if (!vertex.editable) continue;
-    if (Math.hypot(worldPoint[0] - vertex.coord[0], worldPoint[1] - vertex.coord[1]) <= tolerance) {
+    const point = worldToScreen(vertex.coord);
+    if (Math.hypot(cursor.x - point.x, cursor.y - point.y) <= 9) {
       return { index, vertex };
     }
   }
@@ -1108,19 +1564,20 @@ function hitTestVertex(worldPoint) {
 
 function hitTestEdge(worldPoint) {
   if (!isEditMode()) return null;
-  const tolerance = 10 / state.scale;
+  const cursor = worldToScreen(worldPoint);
   let best = null;
   for (const entry of editableRings(state.editGeometry)) {
     for (let index = 0; index < entry.ring.length - 1; index += 1) {
-      const a = entry.ring[index];
-      const b = entry.ring[index + 1];
-      const distance = distancePointToSegment(worldPoint, a, b);
-      if (distance <= tolerance && (!best || distance < best.distance)) {
+      const a = worldToScreen(entry.ring[index]);
+      const b = worldToScreen(entry.ring[index + 1]);
+      const projected = projectPointOnSegment([cursor.x, cursor.y], [a.x, a.y], [b.x, b.y]);
+      const distance = Math.hypot(cursor.x - projected[0], cursor.y - projected[1]);
+      if (distance <= 10 && (!best || distance < best.distance)) {
         best = {
           distance,
           ringPath: entry.path,
           insertIndex: index + 1,
-          coord: projectPointOnSegment(worldPoint, a, b),
+          coord: screenToWorld(projected[0], projected[1]),
         };
       }
     }
@@ -1172,49 +1629,19 @@ function removeEditVertex(path) {
   ring.push(...distinct);
 }
 
-function pushGeometryHistory(geometry) {
-  state.geometryHistory.push(deepCopy(geometry));
-  if (state.geometryHistory.length > GEOMETRY_HISTORY_LIMIT) state.geometryHistory.shift();
-  syncGeometryControls();
-}
-
 // 每次改动在 mouseup 时立即落库，和删除 / 新增的既有行为保持一致。
 async function commitGeometryChange(previousGeometry, message) {
   const feature = getEditFeature();
   if (!feature || !state.editGeometry) return;
   try {
-    await updateFeature({ ...feature, geometry: deepCopy(state.editGeometry) });
-    pushGeometryHistory(previousGeometry);
-    setNotice(`${message}（节点数 ${extractVertices(state.editGeometry).length}，Ctrl+Z 可撤销）`);
+    await updateFeature({ ...feature, geometry: deepCopy(state.editGeometry) }, message);
+    setNotice(`${message}（节点数 ${extractVertices(state.editGeometry).length}，Ctrl+Z 撤销 / Ctrl+Y 重做）`);
   } catch (error) {
-    state.editGeometry = {
-      type: feature.geometry.type,
-      coordinates: deepCopy(feature.geometry.coordinates),
-    };
+    state.editGeometry = deepCopy(previousGeometry);
     setNotice(`几何保存失败：${error.message}`);
   }
   syncGeometryControls();
   draw();
-}
-
-async function undoGeometryEdit() {
-  const feature = getEditFeature();
-  if (!feature || !state.geometryHistory.length) {
-    setNotice("没有可撤销的几何改动。");
-    return;
-  }
-  const previous = state.geometryHistory.pop();
-  state.editGeometry = { type: previous.type, coordinates: deepCopy(previous.coordinates) };
-  syncGeometryControls();
-  draw();
-  try {
-    await updateFeature({ ...feature, geometry: deepCopy(state.editGeometry) });
-    setNotice("已撤销上一步几何编辑。");
-  } catch (error) {
-    state.geometryHistory.push(previous);
-    setNotice(`撤销失败：${error.message}`);
-  }
-  syncGeometryControls();
 }
 
 function cancelGeometryDrag() {
@@ -1224,6 +1651,7 @@ function cancelGeometryDrag() {
   state.vertexDrag = null;
   state.featureDrag = null;
   state.dragging = false;
+  state.snapTarget = null;
   syncGeometryControls();
   setNotice("已放弃本次几何改动。");
   draw();
@@ -1265,6 +1693,7 @@ function syncDraftControls() {
 function clearDraft(message = "已取消当前绘制。 ") {
   state.draft = [];
   state.draftHover = null;
+  state.snapTarget = null;
   syncDraftControls();
   if (message) setNotice(message);
   draw();
@@ -1310,13 +1739,16 @@ function drawFeature(feature) {
     ? state.editGeometry
     : feature.geometry;
   const selected = state.selectedIds.has(feature.id);
-  const color = layerColors[layer] || layerColors["自定义"];
+  const style = layerStyle(layer);
+  const color = style.color;
+  const opacity = style.opacity;
 
   ctx.save();
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
   ctx.strokeStyle = selected ? "#f2c94c" : color;
-  ctx.fillStyle = selected ? "rgba(242, 201, 76, 0.35)" : `${color}40`;
+  ctx.fillStyle = selected ? "rgba(242, 201, 76, 0.35)" : rgbaFromHex(color, opacity * 0.56);
+  ctx.globalAlpha = selected ? 1 : opacity;
   ctx.lineWidth = selected ? 5 : 2.4;
 
   if (geom.type === "Point") {
@@ -1433,16 +1865,67 @@ function drawSelectionBox() {
   ctx.restore();
 }
 
+function niceScaleDistance(rawDistance) {
+  if (!Number.isFinite(rawDistance) || rawDistance <= 0) return 1;
+  const exponent = Math.floor(Math.log10(rawDistance));
+  const base = rawDistance / (10 ** exponent);
+  const step = base >= 5 ? 5 : base >= 2 ? 2 : 1;
+  return step * (10 ** exponent);
+}
+
+function updateMapOverlays() {
+  const scaleBar = document.getElementById("mapScaleBar");
+  const scaleLabel = document.getElementById("mapScaleLabel");
+  const zoomLabel = document.getElementById("mapZoomLabel");
+  if (!scaleBar || !scaleLabel || !zoomLabel) return;
+
+  const barPixels = 112;
+  let distance = barPixels / Math.max(state.scale, 0.000001);
+  let unit = "地图单位";
+  if (state.geographic) {
+    const centerWorld = screenToWorld(state.viewWidth / 2, state.viewHeight / 2);
+    const latitude = Math.max(-85, Math.min(85, centerWorld[1]));
+    const zoom = Math.log2(Math.max(state.scale, TILE_SIZE / 360) * 360 / TILE_SIZE);
+    const metersPerPixel = 156543.03392 * Math.cos(latitude * Math.PI / 180) / (2 ** zoom);
+    distance = niceScaleDistance(barPixels * metersPerPixel);
+    unit = distance >= 1000 ? "km" : "m";
+    scaleLabel.textContent = distance >= 1000
+      ? `${(distance / 1000).toFixed(distance >= 10000 ? 0 : 1)} km`
+      : `${Math.round(distance)} m`;
+    scaleBar.style.width = `${Math.max(34, Math.min(132, distance / metersPerPixel))}px`;
+  } else {
+    distance = niceScaleDistance(distance);
+    scaleLabel.textContent = `${Number.isInteger(distance) ? distance : distance.toFixed(1)} ${unit}`;
+    scaleBar.style.width = `${Math.max(34, Math.min(132, distance * state.scale))}px`;
+  }
+  zoomLabel.textContent = `缩放 ${state.scale.toFixed(2)}×`;
+}
+
 function draw() {
+  if (drawFramePending) return;
+  drawFramePending = true;
+  requestAnimationFrame(() => {
+    drawFramePending = false;
+    drawFrame();
+  });
+}
+
+function drawFrame() {
   renderBasemapTiles();
   ctx.clearRect(0, 0, state.viewWidth, state.viewHeight);
   if (!state.geographic) drawGrid();
-  for (const feature of state.data.features) {
-    drawFeature(feature);
-  }
+  const orderIndex = new Map(state.layerOrder.map((name, index) => [name, index]));
+  const orderedFeatures = [...state.data.features].sort((a, b) => {
+    const layerA = a.properties.layer || "未命名";
+    const layerB = b.properties.layer || "未命名";
+    return (orderIndex.get(layerB) ?? 0) - (orderIndex.get(layerA) ?? 0);
+  });
+  for (const feature of orderedFeatures) drawFeature(feature);
   drawDraft();
   drawSelectionBox();
   drawEditHandles();
+  drawSnapIndicator();
+  updateMapOverlays();
 }
 
 function distancePointToSegment(p, a, b) {
@@ -1474,19 +1957,26 @@ function pointInPolygon(point, ring) {
 }
 
 function hitTest(worldPoint) {
-  const tolerance = 12 / state.scale;
+  const cursor = worldToScreen(worldPoint);
+  const nearSegment = (a, b) => {
+    const start = worldToScreen(a);
+    const end = worldToScreen(b);
+    return distancePointToSegment([cursor.x, cursor.y],
+      [start.x, start.y], [end.x, end.y]) <= 12;
+  };
   for (let i = state.data.features.length - 1; i >= 0; i--) {
     const feature = state.data.features[i];
     const layer = feature.properties.layer || "未命名";
     if (!state.visibleLayers.has(layer)) continue;
 
     const geom = feature.geometry;
-    if (geom.type === "Point" && Math.hypot(worldPoint[0] - geom.coordinates[0], worldPoint[1] - geom.coordinates[1]) <= tolerance) {
-      return feature;
+    if (geom.type === "Point") {
+      const point = worldToScreen(geom.coordinates);
+      if (Math.hypot(cursor.x - point.x, cursor.y - point.y) <= 12) return feature;
     }
     if (geom.type === "LineString") {
       for (let s = 1; s < geom.coordinates.length; s++) {
-        if (distancePointToSegment(worldPoint, geom.coordinates[s - 1], geom.coordinates[s]) <= tolerance) {
+        if (nearSegment(geom.coordinates[s - 1], geom.coordinates[s])) {
           return feature;
         }
       }
@@ -1494,7 +1984,7 @@ function hitTest(worldPoint) {
     if (geom.type === "MultiLineString") {
       for (const line of geom.coordinates) {
         for (let s = 1; s < line.length; s++) {
-          if (distancePointToSegment(worldPoint, line[s - 1], line[s]) <= tolerance) {
+          if (nearSegment(line[s - 1], line[s])) {
             return feature;
           }
         }
@@ -1504,7 +1994,9 @@ function hitTest(worldPoint) {
       const polygons = geom.type === "Polygon" ? [geom.coordinates] : geom.coordinates;
       if (polygons.some((polygon) => {
         const ring = polygon[0];
-        return pointInPolygon(worldPoint, ring) || distancePointToRing(worldPoint, ring) <= tolerance;
+        return (pointInPolygon(worldPoint, ring) &&
+          !polygon.slice(1).some((hole) => pointInPolygon(worldPoint, hole))) ||
+          ring.some((coord, index) => index > 0 && nearSegment(ring[index - 1], coord));
       })) {
         return feature;
       }
@@ -1546,15 +2038,17 @@ function getDataBounds() {
 }
 
 function fitView() {
-  const dataBounds = getDataBounds();
-  const lowerLeft = projectWorld([dataBounds.minX, dataBounds.minY]);
-  const upperRight = projectWorld([dataBounds.maxX, dataBounds.maxY]);
-  const padding = 72;
+  fitBounds(getDataBounds(), 72, MAX_TILE_ZOOM);
+}
+
+function fitBounds(bounds, padding, maximumZoom) {
+  const lowerLeft = projectWorld([bounds.minX, bounds.minY]);
+  const upperRight = projectWorld([bounds.maxX, bounds.maxY]);
   const minimumSpan = state.geographic ? 0.01 : 1;
-  const width = Math.max(minimumSpan, upperRight[0] - lowerLeft[0]);
-  const height = Math.max(minimumSpan, upperRight[1] - lowerLeft[1]);
+  const width = Math.max(minimumSpan, Math.abs(upperRight[0] - lowerLeft[0]));
+  const height = Math.max(minimumSpan, Math.abs(upperRight[1] - lowerLeft[1]));
   const minimumScale = state.geographic ? TILE_SIZE / 360 : 0.00001;
-  const maximumScale = state.geographic ? TILE_SIZE * 2 ** MAX_TILE_ZOOM / 360 : 3.5;
+  const maximumScale = state.geographic ? TILE_SIZE * 2 ** maximumZoom / 360 : 3.5;
   state.scale = Math.max(minimumScale, Math.min(maximumScale,
     Math.min((state.viewWidth - padding * 2) / width, (state.viewHeight - padding * 2) / height)));
   state.offsetX = state.viewWidth / 2 - (lowerLeft[0] + upperRight[0]) / 2 * state.scale;
@@ -1562,54 +2056,156 @@ function fitView() {
   draw();
 }
 
-function selectByBox(a, b) {
-  const minX = Math.min(a[0], b[0]);
-  const minY = Math.min(a[1], b[1]);
-  const maxX = Math.max(a[0], b[0]);
-  const maxY = Math.max(a[1], b[1]);
-  state.selectedIds.clear();
+function focusFeature(feature) {
+  const layer = (feature.properties || {}).layer || "未命名";
+  state.visibleLayers.add(layer);
+  renderLayers();
+  selectFeatures([feature.id]);
+  fitBounds(getBounds(feature), 92, 15);
+  setNotice(`已定位到 ${feature.properties.name || feature.id}。`);
+}
 
-  for (const feature of state.data.features) {
-    const layer = feature.properties.layer || "未命名";
-    if (!state.visibleLayers.has(layer)) continue;
-    const bounds = getBounds(feature);
-    const intersects = bounds.maxX >= minX && bounds.minX <= maxX && bounds.maxY >= minY && bounds.minY <= maxY;
-    if (intersects) state.selectedIds.add(feature.id);
+function applySelection(ids, operation = "replace") {
+  const next = operation === "replace" ? new Set() : new Set(state.selectedIds);
+  for (const id of ids) {
+    if (operation === "remove") next.delete(id);
+    else if (operation === "toggle") {
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+    } else next.add(id);
   }
-  renderAttributes();
+  selectFeatures(next);
+}
+
+function selectionOperation(event) {
+  if (event.altKey) return "remove";
+  if (event.ctrlKey || event.metaKey) return "toggle";
+  if (event.shiftKey) return "add";
+  return "replace";
+}
+
+function geometryLines(geometry) {
+  if (geometry.type === "LineString") return [geometry.coordinates];
+  if (geometry.type === "MultiLineString" || geometry.type === "Polygon") return geometry.coordinates;
+  if (geometry.type === "MultiPolygon") return geometry.coordinates.flat();
+  return [];
+}
+
+function coordinateInBox(coord, box) {
+  return coord[0] >= box.minX && coord[0] <= box.maxX &&
+    coord[1] >= box.minY && coord[1] <= box.maxY;
+}
+
+// Liang-Barsky 线段裁剪：比仅比较 bbox 更准确，斜线的 bbox 可能碰到框而线本身没碰到。
+function segmentIntersectsBox(a, b, box) {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const p = [-dx, dx, -dy, dy];
+  const q = [a[0] - box.minX, box.maxX - a[0], a[1] - box.minY, box.maxY - a[1]];
+  let start = 0;
+  let end = 1;
+  for (let index = 0; index < 4; index += 1) {
+    if (Math.abs(p[index]) < 1e-12) {
+      if (q[index] < 0) return false;
+      continue;
+    }
+    const ratio = q[index] / p[index];
+    if (p[index] < 0) start = Math.max(start, ratio);
+    else end = Math.min(end, ratio);
+    if (start > end) return false;
+  }
+  return true;
+}
+
+function featureIntersectsBox(feature, box) {
+  const bounds = getBounds(feature);
+  if (bounds.maxX < box.minX || bounds.minX > box.maxX ||
+      bounds.maxY < box.minY || bounds.minY > box.maxY) return false;
+  const geometry = feature.geometry;
+  if (geometry.type === "Point") return coordinateInBox(geometry.coordinates, box);
+  for (const line of geometryLines(geometry)) {
+    if (line.some((coord) => coordinateInBox(coord, box))) return true;
+    for (let index = 1; index < line.length; index += 1) {
+      if (segmentIntersectsBox(line[index - 1], line[index], box)) return true;
+    }
+  }
+  if (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon") return false;
+  const corners = [
+    [box.minX, box.minY], [box.minX, box.maxY],
+    [box.maxX, box.minY], [box.maxX, box.maxY],
+  ];
+  const polygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+  return polygons.some((polygon) => corners.some((corner) =>
+    pointInPolygon(corner, polygon[0]) &&
+    !polygon.slice(1).some((hole) => pointInPolygon(corner, hole))));
+}
+
+function selectByBox(a, b, operation = "replace") {
+  const box = {
+    minX: Math.min(a[0], b[0]), minY: Math.min(a[1], b[1]),
+    maxX: Math.max(a[0], b[0]), maxY: Math.max(a[1], b[1]),
+  };
+  const hits = state.data.features.filter((feature) =>
+    state.visibleLayers.has(feature.properties.layer || "未命名") &&
+    featureIntersectsBox(feature, box));
+  applySelection(hits.map((feature) => feature.id), operation);
+  setNotice(`框选命中 ${hits.length} 个要素；当前选中 ${state.selectedIds.size} 个。`);
 }
 
 function renderEditor(selected) {
   const editor = document.getElementById("selectionEditor");
   const fieldList = document.getElementById("editFieldList");
+  const bulkEditor = document.getElementById("bulkEditor");
+  const bulkFieldSelect = document.getElementById("bulkFieldSelect");
   const updateButton = document.getElementById("updateFeatureBtn");
   const stateLabel = document.getElementById("editorState");
   const typeChip = document.getElementById("editorType");
   const meta = document.getElementById("editorMeta");
   const feature = selected.length === 1 ? selected[0] : null;
+  const editable = selected.every(isEditableFeature);
 
-  editor.classList.toggle("is-empty", !feature);
-  updateButton.disabled = !feature;
+  editor.classList.toggle("is-empty", !selected.length);
+  updateButton.disabled = !feature || !editable;
   fieldList.innerHTML = "";
+  bulkEditor.hidden = selected.length <= 1;
 
   if (!feature) {
-    stateLabel.textContent = selected.length > 1 ? "多选状态" : "未选择";
-    typeChip.textContent = "—";
-    meta.textContent = selected.length > 1
-      ? "已选择多个要素；请点选表格中的一行编辑单个要素。"
-      : "点选一行要素开始编辑。";
-    const empty = document.createElement("p");
-    empty.className = "empty-layer";
-    empty.textContent = selected.length > 1
-      ? "多选状态下可以批量删除，改属性请先单选一个要素。"
-      : "点选一个要素后编辑属性。";
-    fieldList.appendChild(empty);
+    if (selected.length > 1) {
+      const commonFields = collectFields(selected).filter((field) =>
+        !DISPLAY_ONLY_FIELDS.has(field) &&
+        selected.every((item) => Object.prototype.hasOwnProperty.call(item.properties || {}, field)));
+      bulkFieldSelect.replaceChildren();
+      for (const field of commonFields) {
+        const option = document.createElement("option");
+        option.value = field;
+        option.textContent = `${fieldLabel(field)} · ${field}`;
+        bulkFieldSelect.appendChild(option);
+      }
+      document.getElementById("bulkUpdateBtn").disabled = !commonFields.length || !editable;
+      stateLabel.textContent = `批量编辑 ${selected.length} 个要素`;
+      typeChip.textContent = "多选";
+      meta.textContent = !editable
+        ? "选中了其他数据集的要素；请切换到对应数据集后再修改。"
+        : commonFields.length
+        ? "选择共有字段并填写新值，再确认应用；单个要素可在属性表中双击修改。"
+        : "选中要素没有共有属性字段；可先在属性表中新增字段。";
+    } else {
+      stateLabel.textContent = "未选择";
+      typeChip.textContent = "—";
+      meta.textContent = "点选一行要素开始编辑。";
+      const empty = document.createElement("p");
+      empty.className = "empty-layer";
+      empty.textContent = "点选一个要素后编辑属性。";
+      fieldList.appendChild(empty);
+    }
     return;
   }
 
   stateLabel.textContent = "单要素编辑";
   typeChip.textContent = feature.geometry.type;
-  meta.textContent = `${feature.id} · ${formatFeatureCoordinates(feature)}`;
+  meta.textContent = editable
+    ? `${feature.id} · ${formatFeatureCoordinates(feature)}`
+    : `${feature.id} · 请先切换到对应数据集再编辑`;
 
   // 表单按要素的真实字段渲染：导入的 Shapefile 有哪几列 DBF 字段，这里就出几栏。
   for (const field of collectFields([feature])) {
@@ -1619,11 +2215,13 @@ function renderEditor(selected) {
     // 已知字段显示「中文名 · 原始键」，导入的 DBF 字段没有中文名，只显示原始键，
     // 否则会出现 “NAME · NAME”。
     const human = FIELD_LABELS[field];
-    caption.textContent = human ? `${human} · ${field}` : field;
+    const typeLabel = FIELD_TYPE_LABELS[fieldTypeForFeature(feature, field)];
+    caption.textContent = `${human ? `${human} · ${field}` : field}（${typeLabel}）`;
     const input = document.createElement("input");
     input.type = "text";
     input.dataset.field = field;
     input.value = formatCellValue(feature.properties[field]);
+    input.disabled = !editable || DISPLAY_ONLY_FIELDS.has(field);
     if (field === "layer") input.setAttribute("list", "layerOptions");
     label.append(caption, input);
     fieldList.appendChild(label);
@@ -1661,7 +2259,8 @@ function renderAttributes() {
   head.appendChild(headRow);
 
   body.innerHTML = "";
-  document.getElementById("deleteSelectionBtn").disabled = !selected.length;
+  document.getElementById("deleteSelectionBtn").disabled = !selected.length ||
+    !selected.every(isEditableFeature);
   updateStats();
   renderEditor(selected);
   renderAttributeTable();
@@ -1687,23 +2286,32 @@ function renderAttributes() {
 }
 
 function setMode(mode) {
+  if (state.draft.length && mode !== state.mode &&
+      !window.confirm(`当前还有 ${state.draft.length} 个未完成节点，切换工具会丢弃这次绘制。确定切换吗？`)) {
+    return;
+  }
   state.mode = mode;
   state.draft = [];
   state.draftHover = null;
   state.boxStart = null;
   state.boxEnd = null;
-  document.querySelectorAll(".tool").forEach((button) => {
+  state.snapTarget = null;
+  document.querySelectorAll(".tool[data-mode]").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === mode);
   });
-  canvas.className = `mode-${mode}`;
+  canvas.classList.remove("mode-pan", "mode-select", "mode-box", "mode-point", "mode-line", "mode-polygon", "mode-edit");
+  canvas.classList.add(`mode-${mode}`);
   syncDraftControls();
 
   // 编辑几何需要恰好一个选中要素作为编辑目标。
   if (mode === "edit") {
     const target = getSingleSelectedFeature();
-    if (target) {
+    if (target && isEditableFeature(target)) {
       enterGeometryEdit(target);
       setNotice(hints.edit);
+    } else if (target) {
+      exitGeometryEdit();
+      setNotice("请先切换到这个要素所在数据集再编辑几何。");
     } else {
       exitGeometryEdit();
       setNotice("当前：编辑几何。请先用“点选”选中一个要素，再切回“编辑几何”。");
@@ -1720,49 +2328,150 @@ function setMode(mode) {
 function makeFeature(geometry) {
   const layer = document.getElementById("layerInput").value;
   const name = document.getElementById("nameInput").value.trim() || "未命名要素";
+  const properties = { name, layer, kind: geometry.type.toLowerCase() };
+  for (const [field, kind] of Object.entries(state.declaredFieldTypes)) {
+    if (!Object.prototype.hasOwnProperty.call(properties, field)) {
+      properties[field] = Object.prototype.hasOwnProperty.call(state.declaredFieldDefaults, field)
+        ? deepCopy(state.declaredFieldDefaults[field]) : kind === "text" ? "" : null;
+    }
+  }
   return {
     type: "Feature",
-    properties: { name, layer, kind: geometry.type.toLowerCase() },
+    properties,
     geometry,
   };
 }
 
 async function addFeature(geometry) {
+  const before = await activeDatasetData();
+  const selectedBefore = [...state.selectedIds];
   const feature = makeFeature(geometry);
   const result = await api("/api/features", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ feature }),
   });
-  state.data.features.push(result.feature);
-  state.visibleLayers.add(result.feature.properties.layer || "未命名");
+  const after = deepCopy(before);
+  after.features.push(result.feature);
+  recordEdit(before, after, `新增要素“${result.feature.properties.name}”`, selectedBefore,
+    [result.feature.id]);
+  state.visibleDatasetIds.add(state.activeDataset.id);
+  state.data.features.push(displayFeature(result.feature));
+  state.visibleLayers.add(state.activeDataset.name);
   state.selectedIds = new Set([result.feature.id]);
   state.dirty = false;
+  renderDatasets();
   renderLayers();
   renderAttributes();
+  syncMapMode();
   setNotice(`已新增“${result.feature.properties.name}”，可继续绘制或保存。`);
   draw();
 }
 
-async function updateFeature(feature) {
+async function updateFeature(feature, historyLabel = `修改要素 ${feature.id}`) {
+  assertEditableSelection([feature]);
+  const data = await activeDatasetData();
+  const original = data.features.find((item) => item.id === feature.id);
+  if (!original) throw new Error("当前数据集中找不到这个要素，请刷新后重试。");
+  const properties = { ...(original.properties || {}) };
+  for (const [field, value] of Object.entries(feature.properties || {})) {
+    if (!DISPLAY_ONLY_FIELDS.has(field)) properties[field] = value;
+  }
   const result = await api(`/api/features/${encodeURIComponent(feature.id)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ feature }),
+    body: JSON.stringify({ feature: { ...original, geometry: feature.geometry, properties } }),
   });
-  const index = state.data.features.findIndex((item) => item.id === feature.id);
-  if (index !== -1) state.data.features[index] = result.feature;
-  state.visibleLayers.add(result.feature.properties.layer || "未命名");
+  const after = deepCopy(data);
+  after.features[after.features.findIndex((item) => item.id === feature.id)] = result.feature;
+  recordEdit(data, after, historyLabel);
+  const index = state.data.features.findIndex((item) => item.id === feature.id &&
+    isEditableFeature(item));
+  if (index !== -1) state.data.features[index] = displayFeature(result.feature);
+  state.visibleLayers.add(state.activeDataset.name);
   state.dirty = false;
   renderLayers();
   renderAttributes();
   draw();
 }
 
+function normaliseDraftCoordinates(draft, polygon = false) {
+  const coordinates = draft.filter((coord, index) =>
+    index === 0 || coord[0] !== draft[index - 1][0] || coord[1] !== draft[index - 1][1]);
+  if (polygon && coordinates.length > 1) {
+    const first = coordinates[0];
+    const last = coordinates[coordinates.length - 1];
+    if (first[0] === last[0] && first[1] === last[1]) coordinates.pop();
+  }
+  return coordinates;
+}
+
+function polygonDraftError(points) {
+  if (points.length < 3) return "画面至少需要 3 个节点。";
+  if (points.some((point) => !Number.isFinite(point[0]) || !Number.isFinite(point[1]))) {
+    return "面节点坐标必须是有效数字。";
+  }
+  const cross = (a, b, c) =>
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  const onSegment = (a, b, p) => p[0] >= Math.min(a[0], b[0]) &&
+    p[0] <= Math.max(a[0], b[0]) && p[1] >= Math.min(a[1], b[1]) &&
+    p[1] <= Math.max(a[1], b[1]);
+  const intersects = (a, b, c, d) => {
+    if (Math.max(a[0], b[0]) < Math.min(c[0], d[0]) ||
+        Math.max(c[0], d[0]) < Math.min(a[0], b[0]) ||
+        Math.max(a[1], b[1]) < Math.min(c[1], d[1]) ||
+        Math.max(c[1], d[1]) < Math.min(a[1], b[1])) return false;
+    const tolerance = Math.max(
+      Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]),
+      Math.abs(d[0] - c[0]), Math.abs(d[1] - c[1]),
+    ) ** 2 * 1e-12;
+    const o1 = cross(a, b, c);
+    const o2 = cross(a, b, d);
+    const o3 = cross(c, d, a);
+    const o4 = cross(c, d, b);
+    if (Math.abs(o1) <= tolerance && onSegment(a, b, c)) return true;
+    if (Math.abs(o2) <= tolerance && onSegment(a, b, d)) return true;
+    if (Math.abs(o3) <= tolerance && onSegment(c, d, a)) return true;
+    if (Math.abs(o4) <= tolerance && onSegment(c, d, b)) return true;
+    return (o1 > tolerance) !== (o2 > tolerance) &&
+      (o3 > tolerance) !== (o4 > tolerance);
+  };
+  for (let index = 0; index < points.length; index += 1) {
+    const next = (index + 1) % points.length;
+    if (points[index][0] === points[next][0] && points[index][1] === points[next][1]) {
+      return `第 ${index + 1} 条边长度为零，请调整节点。`;
+    }
+    for (let other = index + 2; other < points.length; other += 1) {
+      if (index === 0 && other === points.length - 1) continue;
+      if (intersects(points[index], points[next], points[other],
+          points[(other + 1) % points.length])) {
+        return `第 ${index + 1} 与第 ${other + 1} 条边相交，请调整节点。`;
+      }
+    }
+  }
+  const origin = points[0];
+  let doubleArea = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const a = points[index];
+    const b = points[(index + 1) % points.length];
+    doubleArea += (a[0] - origin[0]) * (b[1] - origin[1]) -
+      (b[0] - origin[0]) * (a[1] - origin[1]);
+  }
+  const xs = points.map((point) => point[0]);
+  const ys = points.map((point) => point[1]);
+  const maxArea = (Math.max(...xs) - Math.min(...xs)) *
+    (Math.max(...ys) - Math.min(...ys));
+  if (Math.abs(doubleArea) <= maxArea * 1e-12) {
+    return "面面积为零或过小，请让至少三个节点不共线。";
+  }
+  return null;
+}
+
 async function finishDraft() {
-  const draftSize = state.draft.length;
-  if (state.mode === "line" && state.draft.length >= 2) {
-    await addFeature({ type: "LineString", coordinates: state.draft });
+  const coordinates = normaliseDraftCoordinates(state.draft, state.mode === "polygon");
+  const draftSize = coordinates.length;
+  if (state.mode === "line" && draftSize >= 2) {
+    await addFeature({ type: "LineString", coordinates });
     state.draft = [];
     setNotice("折线已完成并保存。可以继续绘制或切换工具。 ");
   }
@@ -1771,8 +2480,13 @@ async function finishDraft() {
     setNotice("画线至少需要 2 个节点。继续点击地图添加节点。 ");
   }
 
-  if (state.mode === "polygon" && state.draft.length >= 3) {
-    const ring = [...state.draft, state.draft[0]];
+  if (state.mode === "polygon" && draftSize >= 3) {
+    const issue = polygonDraftError(coordinates);
+    if (issue) {
+      setNotice(`画面未保存：${issue}（可撤销节点后重画）`);
+      return;
+    }
+    const ring = [...coordinates, coordinates[0]];
     await addFeature({ type: "Polygon", coordinates: [ring] });
     state.draft = [];
     setNotice("面要素已完成并保存。可以继续绘制或切换工具。 ");
@@ -1783,6 +2497,7 @@ async function finishDraft() {
   }
 
   state.draftHover = null;
+  state.snapTarget = null;
   syncDraftControls();
   draw();
 }
@@ -1847,8 +2562,9 @@ function handleEditMouseDown(event, world) {
   }
 }
 
-canvas.addEventListener("mousedown", (event) => {
+canvas.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
+  canvas.setPointerCapture(event.pointerId);
   const rect = canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
@@ -1866,20 +2582,25 @@ canvas.addEventListener("mousedown", (event) => {
   }
 });
 
-canvas.addEventListener("mousemove", (event) => {
+canvas.addEventListener("pointermove", (event) => {
   const rect = canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
   const world = screenToWorld(x, y);
-  document.getElementById("coordinateReadout").textContent = `X ${world[0].toFixed(1)} · Y ${world[1].toFixed(1)}`;
+  const canSnap = ["point", "line", "polygon"].includes(state.mode) || Boolean(state.vertexDrag);
+  state.snapTarget = canSnap ? findSnapTarget(x, y, state.vertexDrag ? state.editFeatureId : null) : null;
+  const activeWorld = state.snapTarget ? state.snapTarget.coord : world;
+  const digits = state.geographic ? 5 : 1;
+  document.getElementById("coordinateReadout").textContent =
+    `X ${activeWorld[0].toFixed(digits)} · Y ${activeWorld[1].toFixed(digits)}`;
 
   // 拖节点：每次都从 origin 重建，避免累计误差。
   if (state.vertexDrag && state.editGeometry) {
     const drag = state.vertexDrag;
     state.editGeometry.coordinates = deepCopy(drag.origin);
-    applyVertexCoordinates(state.editGeometry, drag.path, [world[0], world[1]]);
+    applyVertexCoordinates(state.editGeometry, drag.path, [...activeWorld]);
     if (drag.twinPath) {
-      applyVertexCoordinates(state.editGeometry, drag.twinPath, [world[0], world[1]]);
+      applyVertexCoordinates(state.editGeometry, drag.twinPath, [...activeWorld]);
     }
     drag.moved = true;
     draw();
@@ -1911,7 +2632,7 @@ canvas.addEventListener("mousemove", (event) => {
   }
 
   if (state.mode === "line" || state.mode === "polygon") {
-    state.draftHover = world;
+    state.draftHover = activeWorld;
   }
 
   if (state.dragging && state.mode === "pan") {
@@ -1925,12 +2646,13 @@ canvas.addEventListener("mousemove", (event) => {
     draw();
   }
 
-  if ((state.mode === "line" || state.mode === "polygon") && state.draft.length) {
+  if (["point", "line", "polygon"].includes(state.mode) &&
+      (state.snapTarget || state.draft.length)) {
     draw();
   }
 });
 
-canvas.addEventListener("mouseup", async (event) => {
+canvas.addEventListener("pointerup", async (event) => {
   const rect = canvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
@@ -1939,6 +2661,7 @@ canvas.addEventListener("mouseup", async (event) => {
     const drag = state.vertexDrag;
     state.vertexDrag = null;
     state.dragging = false;
+    state.snapTarget = null;
     syncGeometryControls();
     if (drag.moved) {
       state.skipClickOnce = true;
@@ -1964,7 +2687,7 @@ canvas.addEventListener("mouseup", async (event) => {
   if (state.mode === "box" && state.boxStart) {
     const a = screenToWorld(state.boxStart.x, state.boxStart.y);
     const b = screenToWorld(x, y);
-    selectByBox(a, b);
+    selectByBox(a, b, selectionOperation(event));
     state.boxStart = null;
     state.boxEnd = null;
     state.dragging = false;
@@ -1972,6 +2695,7 @@ canvas.addEventListener("mouseup", async (event) => {
   }
 
   state.dragging = false;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
 });
 
 canvas.addEventListener("click", async (event) => {
@@ -1997,11 +2721,32 @@ canvas.addEventListener("click", async (event) => {
   }
 
   if (state.mode === "point") {
-    await addFeature({ type: "Point", coordinates: world });
+    const snap = findSnapTarget(x, y);
+    try {
+      await addFeature({ type: "Point", coordinates: snap ? [...snap.coord] : world });
+    } catch (error) {
+      setNotice(`新增点失败：${error.message}`);
+    }
   }
 
   if (state.mode === "line" || state.mode === "polygon") {
-    state.draft.push(world);
+    if (event.detail > 1) return;
+    const snap = findSnapTarget(x, y);
+    const coord = snap ? [...snap.coord] : world;
+    const last = state.draft[state.draft.length - 1];
+    const placed = worldToScreen(coord);
+    if (last) {
+      const previous = worldToScreen(last);
+      if (Math.hypot(previous.x - placed.x, previous.y - placed.y) < 4) return;
+    }
+    if (state.mode === "polygon" && state.draft.length >= 3) {
+      const first = worldToScreen(state.draft[0]);
+      if (Math.hypot(first.x - placed.x, first.y - placed.y) <= 10) {
+        try { await finishDraft(); } catch (error) { setNotice(`绘制保存失败：${error.message}`); }
+        return;
+      }
+    }
+    state.draft.push(coord);
     state.draftHover = null;
     syncDraftControls();
     draw();
@@ -2009,11 +2754,16 @@ canvas.addEventListener("click", async (event) => {
 
   if (state.mode === "select") {
     const feature = hitTest(world);
-    selectFeatures(feature ? [feature.id] : []);
+    applySelection(feature ? [feature.id] : [], selectionOperation(event));
   }
 });
 
 canvas.addEventListener("dblclick", (event) => {
+  if (state.mode === "line" || state.mode === "polygon") {
+    event.preventDefault();
+    finishDraft().catch((error) => setNotice(`绘制保存失败：${error.message}`));
+    return;
+  }
   if (state.mode !== "edit" || !isEditMode()) return;
   const rect = canvas.getBoundingClientRect();
   const world = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
@@ -2036,7 +2786,11 @@ canvas.addEventListener("wheel", (event) => {
   zoomAt(x, y, event.deltaY < 0 ? 1.12 : 0.88);
 });
 
-canvas.addEventListener("mouseleave", () => {
+canvas.addEventListener("pointerleave", () => {
+  if (state.snapTarget) {
+    state.snapTarget = null;
+    draw();
+  }
   if (state.mode === "line" || state.mode === "polygon") {
     state.draftHover = null;
     draw();
@@ -2048,6 +2802,22 @@ canvas.addEventListener("mouseleave", () => {
   }
 });
 
+canvas.addEventListener("pointercancel", () => {
+  if (state.vertexDrag && state.editGeometry) {
+    state.editGeometry.coordinates = deepCopy(state.vertexDrag.origin);
+    state.vertexDrag = null;
+  }
+  if (state.featureDrag && state.editGeometry) {
+    state.editGeometry.coordinates = deepCopy(state.featureDrag.origin);
+    state.featureDrag = null;
+  }
+  state.dragging = false;
+  state.boxStart = null;
+  state.boxEnd = null;
+  state.snapTarget = null;
+  draw();
+});
+
 window.addEventListener("keydown", (event) => {
   // 在输入框里打字（属性表单元格、搜索框、属性表单）时不要抢快捷键。
   const target = event.target;
@@ -2055,16 +2825,25 @@ window.addEventListener("keydown", (event) => {
       target instanceof HTMLSelectElement) {
     return;
   }
-  const isUndo = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z";
-  // 撤销优先作用在正在绘制、还没提交的草稿上；没有草稿时才撤销几何编辑。
+  const modifier = event.ctrlKey || event.metaKey;
+  const key = event.key.toLowerCase();
+  const isUndo = modifier && !event.shiftKey && key === "z";
+  const isRedo = modifier && (key === "y" || (event.shiftKey && key === "z"));
+  if (event.key === "Enter" && !(target instanceof HTMLButtonElement) &&
+      ["line", "polygon"].includes(state.mode)) {
+    event.preventDefault();
+    finishDraft().catch((error) => setNotice(`绘制保存失败：${error.message}`));
+    return;
+  }
+  // 未提交的草稿节点优先撤销；已保存的操作统一进入数据集编辑历史。
   if (isUndo && state.draft.length) {
     event.preventDefault();
     document.getElementById("undoDraftBtn").click();
     return;
   }
-  if (isUndo && state.geometryHistory.length) {
+  if (isUndo || isRedo) {
     event.preventDefault();
-    undoGeometryEdit();
+    replayEdit(isUndo ? "undo" : "redo");
     return;
   }
   if (event.key !== "Escape") return;
@@ -2077,7 +2856,7 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
-document.querySelectorAll(".tool").forEach((button) => {
+document.querySelectorAll(".tool[data-mode]").forEach((button) => {
   button.addEventListener("click", () => setMode(button.dataset.mode));
 });
 
@@ -2097,8 +2876,18 @@ document.getElementById("undoDraftBtn").addEventListener("click", () => {
   draw();
 });
 document.getElementById("cancelDraftBtn").addEventListener("click", () => clearDraft());
-document.getElementById("undoGeometryBtn").addEventListener("click", () => undoGeometryEdit());
+document.getElementById("undoEditBtn").addEventListener("click", () => replayEdit("undo"));
+document.getElementById("redoEditBtn").addEventListener("click", () => replayEdit("redo"));
 document.getElementById("endEditBtn").addEventListener("click", () => setMode("select"));
+document.getElementById("snapBtn").addEventListener("click", (event) => {
+  state.snapEnabled = !state.snapEnabled;
+  state.snapTarget = null;
+  event.currentTarget.classList.toggle("active", state.snapEnabled);
+  event.currentTarget.setAttribute("aria-pressed", String(state.snapEnabled));
+  event.currentTarget.textContent = state.snapEnabled ? "吸附：开" : "吸附：关";
+  setNotice(state.snapEnabled ? "节点和边吸附已开启。" : "吸附已关闭。绘制与拖拽将使用原始鼠标位置。");
+  draw();
+});
 document.getElementById("zoomInBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 1.2));
 document.getElementById("zoomOutBtn").addEventListener("click", () => zoomAt(state.viewWidth / 2, state.viewHeight / 2, 0.82));
 document.getElementById("fitBtn").addEventListener("click", fitView);
@@ -2155,84 +2944,121 @@ document.getElementById("attributeBody").addEventListener("keydown", (event) => 
 document.getElementById("updateFeatureBtn").addEventListener("click", async () => {
   const feature = getSingleSelectedFeature();
   if (!feature) return;
-  // 表单里的输入框是按要素真实字段动态生成的，这里照单全收。
-  const properties = { ...feature.properties };
-  for (const input of document.querySelectorAll("#editFieldList input[data-field]")) {
-    const field = input.dataset.field;
-    properties[field] = coerceFieldValue(input.value, feature.properties[field]);
-  }
-  if (properties.name !== undefined && !String(properties.name).trim()) {
-    setNotice("名称不能为空。");
-    return;
-  }
   try {
-    await updateFeature({ ...feature, properties });
+    // 表单里的输入框按真实字段生成；保存前逐项校验，避免混入错误类型。
+    const properties = { ...feature.properties };
+    for (const input of document.querySelectorAll("#editFieldList input[data-field]")) {
+      if (input.disabled) continue;
+      const field = input.dataset.field;
+      try {
+        properties[field] = coerceFieldValue(input.value, feature.properties[field],
+          fieldTypeForFeature(feature, field));
+      } catch (error) {
+        input.focus();
+        throw new Error(`字段“${field}”：${error.message}`);
+      }
+    }
+    if (properties.name !== undefined && !String(properties.name).trim()) {
+      throw new Error("名称不能为空。");
+    }
+    await updateFeature({ ...feature, properties }, `修改 ${feature.id} 的属性`);
     setNotice(`已保存 ${feature.id} 的属性修改。`);
   } catch (error) {
     setNotice(`属性更新失败：${error.message}`);
   }
 });
 
+document.getElementById("bulkUpdateBtn").addEventListener("click", async () => {
+  const selected = selectedFeatures();
+  if (selected.length < 2) return;
+  try {
+    assertEditableSelection(selected);
+  } catch (error) {
+    setNotice(error.message);
+    return;
+  }
+  const field = document.getElementById("bulkFieldSelect").value;
+  if (!field || DISPLAY_ONLY_FIELDS.has(field) || !selected.every((feature) =>
+    Object.prototype.hasOwnProperty.call(feature.properties || {}, field))) return;
+  const raw = document.getElementById("bulkValueInput").value;
+  if ((field === "name" || field === "layer") && !raw.trim()) {
+    setNotice(`字段“${field}”不能为空。`);
+    return;
+  }
+  try {
+    for (const feature of selected) {
+      coerceFieldValue(raw, feature.properties[field], fieldTypeForFeature(feature, field));
+    }
+  } catch (error) {
+    setNotice(`批量修改字段“${field}”失败：${error.message}`);
+    return;
+  }
+  if (!window.confirm(`将 ${selected.length} 个选中要素的“${field}”统一改为“${raw}”？`)) return;
+  const selectedIds = new Set(selected.map((feature) => feature.id));
+  const button = document.getElementById("bulkUpdateBtn");
+  button.disabled = true;
+  try {
+    await persistActiveFeatures((data) => {
+      const matches = data.features.filter((feature) => selectedIds.has(feature.id));
+      if (matches.length !== selectedIds.size) {
+        throw new Error("所选要素已变化，请刷新后重新选择。");
+      }
+      for (const feature of matches) {
+        feature.properties[field] = coerceFieldValue(raw, feature.properties[field],
+          fieldTypeForFeature(feature, field));
+      }
+    }, `已批量更新当前数据集 ${selected.length} 个要素的“${field}”。`);
+  } catch (error) {
+    renderAttributes();
+    setNotice(`批量修改失败：${error.message}`);
+  }
+});
+
 document.getElementById("deleteSelectionBtn").addEventListener("click", async () => {
   const selected = selectedFeatures();
   if (!selected.length) return;
+  try {
+    assertEditableSelection(selected);
+  } catch (error) {
+    setNotice(error.message);
+    return;
+  }
+  if (!window.confirm(`确定删除选中的 ${selected.length} 个要素及其属性吗？删除后可通过“撤销”恢复。`)) return;
   const button = document.getElementById("deleteSelectionBtn");
   button.disabled = true;
   const selectedIds = new Set(selected.map((feature) => feature.id));
-  const nextData = {
-    ...state.data,
-    features: state.data.features.filter((feature) => !selectedIds.has(feature.id)),
-  };
   try {
-    await api("/api/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(nextData),
-    });
-    state.data = nextData;
-    for (const id of selectedIds) state.selectedIds.delete(id);
-    state.dirty = false;
-    // 删掉的正好是编辑目标时，编辑状态必须一并清掉，否则会画出悬空节点。
-    if (!getEditFeature()) exitGeometryEdit();
-    renderLayers();
-    renderAttributes();
-    draw();
-    setNotice(`已删除 ${selected.length} 个要素。 `);
+    await persistActiveFeatures((data) => {
+      const matches = data.features.filter((feature) => selectedIds.has(feature.id));
+      if (matches.length !== selectedIds.size) {
+        throw new Error("所选要素已变化，请刷新后重新选择。");
+      }
+      data.features = data.features.filter((feature) => !selectedIds.has(feature.id));
+    }, `已从当前数据集删除 ${selected.length} 个要素。`);
   } catch (error) {
     renderAttributes();
     setNotice(`删除失败：${error.message}`);
   }
 });
 
-document.getElementById("saveBtn").addEventListener("click", async () => {
-  try {
-    await api("/api/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state.data),
-    });
-    state.dirty = false;
-    setNotice("已保存到后端 GeoJSON 文件。 ");
-  } catch (error) {
-    setNotice(`保存失败：${error.message}`);
-  }
+document.getElementById("saveBtn").addEventListener("click", () => {
+  setNotice("新增、修改、删除会自动保存到当前数据集；无需重复保存叠加图层。");
 });
 
 document.getElementById("resetBtn").addEventListener("click", async () => {
-  const result = await api("/api/reset", { method: "POST" });
-  state.data = result.data;
-  state.geographic = false;
-  state.visibleLayers = new Set(state.data.features.map((feature) => feature.properties.layer || "未命名"));
+  await api("/api/reset", { method: "POST" });
+  clearEditHistory();
   state.selectedIds.clear();
   state.draft = [];
   state.draftHover = null;
   state.dirty = false;
   exitGeometryEdit();
   state.attributePage = 1;
-  renderLayers();
-  renderAttributes();
   syncDraftControls();
-  await Promise.all([loadDatasets(), loadStatus()]);
+  await loadDatasets();
+  await loadStatus();
+  state.visibleDatasetIds.add(state.activeDataset.id);
+  await loadData();
   syncMapMode();
   fitView();
   setNotice("数据已重置为示例内容。 ");
@@ -2264,7 +3090,34 @@ document.getElementById("attributeSearch").addEventListener("input", (event) => 
   renderAttributeTable();
 });
 
-document.getElementById("addFieldBtn").addEventListener("click", () => addField());
+document.getElementById("addFieldBtn").addEventListener("click", () => {
+  if (!state.activeDataset) {
+    setNotice("请先选择数据集再新增字段。");
+    return;
+  }
+  document.getElementById("addFieldDialog").showModal();
+  document.getElementById("newFieldName").focus();
+});
+document.getElementById("cancelFieldBtn").addEventListener("click", () =>
+  document.getElementById("addFieldDialog").close());
+document.getElementById("addFieldForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = document.getElementById("confirmFieldBtn");
+  button.disabled = true;
+  try {
+    await addField(
+      document.getElementById("newFieldName").value,
+      document.getElementById("newFieldType").value,
+      document.getElementById("newFieldDefault").value,
+    );
+    document.getElementById("addFieldDialog").close();
+    document.getElementById("addFieldForm").reset();
+  } catch (error) {
+    setNotice(`新增字段失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
 document.getElementById("attributePrevBtn").addEventListener("click", () => {
   state.attributePage = Math.max(1, state.attributePage - 1);
   renderAttributeTable();
@@ -2274,7 +3127,7 @@ document.getElementById("attributeNextBtn").addEventListener("click", () => {
   renderAttributeTable();
 });
 
-document.getElementById("attributeTableBody").addEventListener("click", (event) => {
+function selectAttributeTableRow(event) {
   // 正在编辑的单元格不要触发选中切换，否则输入框会被重渲染掉。
   if (event.target.closest("td.cell-editing")) return;
   const row = event.target.closest("tr[data-id]");
@@ -2301,11 +3154,19 @@ document.getElementById("attributeTableBody").addEventListener("click", (event) 
     selectFeatures([id]);
   }
   state.lastRowClickId = id;
+}
+
+document.getElementById("attributeTableBody").addEventListener("click", selectAttributeTableRow);
+document.getElementById("attributeTableBody").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  if (!event.target.closest("tr[data-id]") || event.target.closest("input")) return;
+  event.preventDefault();
+  selectAttributeTableRow(event);
 });
 
 window.addEventListener("resize", resizeCanvas);
 
-Promise.all([loadDatasets(), loadData(), loadStatus()]).then(() => {
+loadDatasets().then(() => Promise.all([loadData(), loadStatus()])).then(() => {
   resizeCanvas();
   syncMapMode();
   fitView();

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>GIS 矢量数据编辑 Demo</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/route-addon.css?v=20261016">
 </head>
 <body>
   <div class="app-shell">
@@ -20,6 +21,7 @@
         <div><strong id="selectionCount">0</strong><span>已选</span></div>
       </div>
       <div class="top-actions">
+        <span id="saveStatus" class="save-status" data-state="saved" role="status" aria-live="polite">自动保存</span>
         <button id="saveBtn" class="primary"><span class="button-icon">↥</span>保存</button>
         <a class="button" href="/api/export">导出 GeoJSON</a>
         <button id="resetBtn">重置数据</button>
@@ -66,10 +68,10 @@
             <input id="nameInput" type="text" value="新要素" maxlength="40" placeholder="例如：北门">
           </label>
           <label>
-            图层
+            原始图层字段
             <input id="layerInput" type="text" list="layerOptions" value="兴趣点" maxlength="20">
           </label>
-          <p class="form-tip">先设置属性，再选择“画点 / 画线 / 画面”。图层既可以输入已有图层名，也可以直接输入新名称。</p>
+          <p class="form-tip">先设置属性，再选择“画点 / 画线 / 画面”。地图按数据集分组显示；这里的图层字段写入源文件。画线、画面可双击或按 Enter 完成。</p>
         </section>
 
         <section>
@@ -101,8 +103,13 @@
           <div class="tool-group">
             <span class="toolbar-label">几何</span>
             <button data-mode="edit" class="tool">编辑几何</button>
-            <button id="undoGeometryBtn" class="draft-button" disabled>撤销几何</button>
             <button id="endEditBtn" class="draft-button" disabled>结束编辑</button>
+            <button id="snapBtn" class="tool active" type="button" aria-pressed="true" title="绘制和拖动节点时吸附到已有要素的节点或边">吸附：开</button>
+          </div>
+          <div class="tool-group">
+            <span class="toolbar-label">历史</span>
+            <button id="undoEditBtn" type="button" title="撤销上一次已保存的编辑（Ctrl+Z）" disabled>撤销</button>
+            <button id="redoEditBtn" type="button" title="重做上一次撤销（Ctrl+Y 或 Ctrl+Shift+Z）" disabled>重做</button>
           </div>
           <div class="tool-group view-tools">
             <span class="toolbar-label">视图</span>
@@ -120,6 +127,12 @@
           <canvas id="mapCanvas" aria-label="地图画布"></canvas>
           <div class="map-badge"><span class="live-dot"></span><span id="mapBadgeText">模拟平面坐标系</span></div>
           <div id="coordinateReadout" class="coordinate-readout">坐标 —</div>
+          <div class="map-north-arrow" aria-label="指北针" title="北"><span>N</span><i></i></div>
+          <div class="map-scale-control" aria-label="比例尺">
+            <span id="mapScaleLabel">—</span>
+            <i id="mapScaleBar"></i>
+          </div>
+          <div id="mapZoomLabel" class="map-zoom-label">缩放 —</div>
           <a id="mapAttribution" class="map-attribution" href="https://www.amap.com/" target="_blank" rel="noopener noreferrer" hidden>© 高德地图</a>
         </div>
         <div id="hint" class="hint">当前：漫游。拖拽移动地图，滚轮缩放。</div>
@@ -138,7 +151,7 @@
               <tbody id="attributeBody"></tbody>
             </table>
           </div>
-          <p class="form-tip">完整的多字段属性表在地图下方的抽屉里。</p>
+          <p class="form-tip">Shift 加选、Alt 减选；多选后可批量修改共有字段。完整属性表在地图下方。</p>
           <div id="selectionEditor" class="selection-editor is-empty">
             <div class="editor-heading">
               <div>
@@ -149,6 +162,15 @@
             </div>
             <div id="editFieldList" class="edit-field-list">
               <p class="empty-layer">点选一个要素后编辑属性。</p>
+            </div>
+            <div id="bulkEditor" class="bulk-editor" hidden>
+              <label>统一修改字段
+                <select id="bulkFieldSelect" aria-label="批量修改字段"></select>
+              </label>
+              <label>新值
+                <input id="bulkValueInput" type="text" placeholder="输入新值；留空可清空字段">
+              </label>
+              <button id="bulkUpdateBtn" class="primary" type="button">应用到选中要素</button>
             </div>
             <div id="editorMeta" class="editor-meta">点选一行要素开始编辑。</div>
             <div class="editor-actions">
@@ -164,11 +186,11 @@
             <span class="section-kicker">QUICK GUIDE</span>
           </div>
           <ul class="checklist">
-            <li><span>01</span>点选或框选要素查看属性</li>
-            <li><span>02</span>滚轮缩放，漫游模式拖动地图</li>
-            <li><span>03</span>绘制后点击“完成绘制”提交</li>
-            <li><span>04</span>“编辑几何”可拖动节点、整体平移要素</li>
-            <li><span>05</span>底部属性表双击单元格即可改属性</li>
+            <li><span>01</span>点选 / 框选，Shift 加选、Alt 减选</li>
+            <li><span>02</span>画线画面双击或 Enter 完成，Esc 取消</li>
+            <li><span>03</span>吸附可让新节点贴合已有节点或边</li>
+            <li><span>04</span>多选后批量改属性；删要素前确认</li>
+            <li><span>05</span>编辑几何可拖节点；属性表可双击修改</li>
           </ul>
         </section>
       </aside>
@@ -211,6 +233,31 @@
 
   <datalist id="layerOptions"></datalist>
 
+  <dialog id="addFieldDialog" class="field-dialog" aria-labelledby="addFieldTitle">
+    <form id="addFieldForm">
+      <h2 id="addFieldTitle">新增属性字段</h2>
+      <p class="form-tip">类型会保存在当前数据集中；数字或布尔字段留空表示空值。</p>
+      <label>字段名
+        <input id="newFieldName" name="fieldName" type="text" maxlength="64" required placeholder="例如：面积、是否开放">
+      </label>
+      <label>字段类型
+        <select id="newFieldType" name="fieldType">
+          <option value="text">文本</option>
+          <option value="number">数字</option>
+          <option value="boolean">布尔（true / false）</option>
+        </select>
+      </label>
+      <label>默认值（可留空）
+        <input id="newFieldDefault" name="fieldDefault" type="text" placeholder="现有及之后新画的要素均使用此默认值">
+      </label>
+      <div class="field-dialog-actions">
+        <button id="cancelFieldBtn" type="button">取消</button>
+        <button id="confirmFieldBtn" class="primary" type="submit">新增字段</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="/static/app.js"></script>
+  <script src="/static/route-addon.js?v=20261016"></script>
 </body>
 </html>

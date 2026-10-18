@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "test:browser": "node --test tests/browser.test.js"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

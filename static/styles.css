@@ -102,6 +102,14 @@ button.active,
   white-space: nowrap;
 }
 
+.save-status {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.save-status[data-state="saving"] { color: var(--primary-dark); }
+.save-status[data-state="error"] { color: var(--danger); }
+
 .workspace {
   flex: 1;
   display: grid;
@@ -323,6 +331,120 @@ select {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface-2);
+}
+
+/* Map layer ordering, styling controls, and view overlays. */
+.layer-row {
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr) auto auto;
+  align-items: center;
+  cursor: default;
+}
+
+.layer-row.is-dragging { opacity: 0.45; }
+
+.layer-row.is-drop-target {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px rgba(23, 109, 106, 0.24);
+}
+
+.layer-drag-handle {
+  color: #9aa9a4;
+  cursor: grab;
+  font-size: 13px;
+  user-select: none;
+}
+
+.layer-drag-handle:active { cursor: grabbing; }
+
+.layer-style-controls {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.layer-color-input {
+  width: 22px;
+  height: 22px;
+  padding: 1px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.layer-style-controls input[type="range"] {
+  width: 48px;
+  padding: 0;
+  accent-color: var(--primary);
+}
+
+.map-north-arrow,
+.map-scale-control,
+.map-zoom-label {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  border: 1px solid rgba(214, 226, 223, 0.92);
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--muted);
+  box-shadow: 0 3px 12px rgba(36, 70, 63, 0.1);
+}
+
+.map-north-arrow {
+  top: 14px;
+  left: 14px;
+  width: 34px;
+  height: 45px;
+  display: grid;
+  justify-items: center;
+  padding-top: 4px;
+  border-radius: 6px;
+  font-family: Georgia, serif;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.map-north-arrow i {
+  width: 0;
+  height: 0;
+  margin-top: -2px;
+  border-right: 6px solid transparent;
+  border-bottom: 18px solid var(--primary);
+  border-left: 6px solid transparent;
+}
+
+.map-scale-control {
+  left: 14px;
+  bottom: 14px;
+  display: grid;
+  gap: 3px;
+  min-width: 70px;
+  padding: 5px 7px 7px;
+  border-radius: 5px;
+  font-family: Consolas, monospace;
+  font-size: 10px;
+}
+
+#mapCanvas { touch-action: none; }
+
+.map-scale-control i {
+  display: block;
+  width: 112px;
+  max-width: 132px;
+  height: 4px;
+  border-right: 1px solid var(--text);
+  border-bottom: 2px solid var(--text);
+  border-left: 1px solid var(--text);
+}
+
+.map-zoom-label {
+  right: 14px;
+  bottom: 14px;
+  padding: 6px 9px;
+  border-radius: 5px;
+  font-family: Consolas, monospace;
+  font-size: 10px;
 }
 
 .layer-row label {
@@ -1042,6 +1164,27 @@ section {
    交互编辑与属性模块
    ============================================================ */
 
+.field-dialog {
+  width: min(400px, calc(100vw - 32px));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.field-dialog::backdrop { background: rgba(17, 39, 47, 0.45); }
+
+.field-dialog .form-tip { margin: 0 0 18px; }
+
+.field-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
 /* 让 workspace 变成「主区 + 底部抽屉」两行。这里只加 grid-template-rows，
    不重新声明 display，760px 媒体查询里的 flex 布局因此不受影响。 */
 .workspace {
@@ -1274,6 +1417,38 @@ section {
   font-family: Consolas, monospace;
 }
 
+.column-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.column-sort:hover {
+  border: 0;
+  background: transparent;
+  color: var(--primary-dark);
+  transform: none;
+}
+
+.sort-indicator { color: var(--muted); font-size: 10px; }
+
+.row-locate {
+  margin-left: 8px;
+  padding: 2px 5px;
+  border-color: var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--primary-dark);
+  font-family: inherit;
+  font-size: 10px;
+}
+
 .attribute-table td.cell-empty {
   color: #b6c2bd;
 }
@@ -1334,6 +1509,31 @@ section {
 
 .edit-field-list .empty-layer {
   margin: 0;
+}
+
+.bulk-editor {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.bulk-editor[hidden] {
+  display: none;
+}
+
+.bulk-editor label {
+  margin-bottom: 0;
+}
+
+.bulk-editor select,
+.bulk-editor input {
+  width: 100%;
+  margin-top: 5px;
+  font-size: 12px;
 }
 
 .editor-field-name {

@@ -31,7 +31,7 @@ import uuid
 import zipfile
 import base64
 from urllib.parse import parse_qs, unquote, urlsplit
-
+from route_api import handle_routing_request
 
 # 兼容层：str.removeprefix / str.removesuffix 是 Python 3.9 才有的，
 # 本机与部分演示环境只有 3.8（本机为 3.8.8），直接用会让
@@ -118,6 +118,18 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def field_value_matches_type(value, kind):
+    if value is None:
+        return True
+    if kind == "text":
+        return isinstance(value, str)
+    if kind == "number":
+        return type(value) in (int, float) and (
+            not isinstance(value, float) or math.isfinite(value)
+        )
+    return isinstance(value, bool)
+
+
 def validate_feature_collection(payload):
     if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
         raise ValueError("payload must be a GeoJSON FeatureCollection")
@@ -126,8 +138,28 @@ def validate_feature_collection(payload):
         raise ValueError("features must be a list")
     if len(features) > MAX_FEATURES:
         raise ValueError(f"feature count cannot exceed {MAX_FEATURES}")
+    field_types = payload.get("field_types", {})
+    if not isinstance(field_types, dict) or any(
+        not isinstance(name, str) or not name or kind not in {"text", "number", "boolean"}
+        for name, kind in field_types.items()
+    ):
+        raise ValueError("field_types must map field names to text, number or boolean")
+    field_defaults = payload.get("field_defaults", {})
+    if not isinstance(field_defaults, dict) or any(name not in field_types for name in field_defaults):
+        raise ValueError("field_defaults must refer to declared field_types")
+    for name, value in field_defaults.items():
+        kind = field_types[name]
+        if not field_value_matches_type(value, kind):
+            raise ValueError(f"default for field {name} must be {kind}")
     for feature in features:
         validate_feature(feature)
+        properties = feature.get("properties", {})
+        for name, kind in field_types.items():
+            if name not in properties or properties[name] is None:
+                continue
+            value = properties[name]
+            if not field_value_matches_type(value, kind):
+                raise ValueError(f"field {name} must contain {kind} values")
     return payload
 
 
@@ -947,6 +979,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
         return json.loads(raw or "{}")
 
     def do_GET(self):
+        if handle_routing_request(self, "GET"):
+            return
         path = urlsplit(self.path).path
         if path == "/api/layers":
             query = parse_qs(urlsplit(self.path).query)
@@ -1012,6 +1046,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        if handle_routing_request(self, "POST"):
+            return
         path = urlsplit(self.path).path
         try:
             if path == "/api/features":
@@ -1165,6 +1201,8 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             self.send_error_json(str(exc), status=status)
 
     def do_DELETE(self):
+        if handle_routing_request(self, "DELETE"):
+            return
         path = urlsplit(self.path).path
         try:
             if path.startswith("/api/datasets/"):
@@ -1244,6 +1282,7 @@ def main():
     print("Press Ctrl+C to stop.")
     server.serve_forever()
 
-
+from d_spatial import install_d_spatial
+install_d_spatial(GisDemoHandler, read_dataset, write_geojson, validate_feature, STATIC_DIR)
 if __name__ == "__main__":
     main()
