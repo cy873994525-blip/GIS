@@ -83,9 +83,11 @@ http://127.0.0.1:8000
 
 ### 3. 稳定性与验证
 
-- 保留现有点、线、面绘制、点选、框选、几何编辑、在线底图和属性表能力，新增 UI 状态不改变后端接口。
-- 通过 `node --check static/app.js`、`python -m py_compile server.py` 和 `git diff --check` 检查。
-- 本地浏览器验证：默认数据与真实数据集均可加载；图层颜色/透明度控件可操作；点击放大后缩放读数与比例尺同步更新；控制台无错误。
+- 图层顺序、颜色与透明度偏好经过数据校验后保存在浏览器本地；存储不可用或内容损坏时回退到默认样式，不影响 GeoJSON 数据。
+- 地图拖拽改用 Pointer Events，并禁用画布触摸滚动；保留既有点击绘制、点选和几何编辑交互。
+- 高频地图重绘合并到下一浏览器帧，减少同一帧重复执行 Canvas 绘制。
+- 浏览器回归测试覆盖指北针/比例尺控件、图层颜色与透明度偏好保存、图层顺序保存和刷新恢复；其余既有绘制和属性编辑测试继续运行。
+- 本次验证命令：`node --check static/app.js`、`node --test tests/interaction.test.js`、`npm run test:browser`、`python -m py_compile server.py`。
 
 本次 B 组主要修改：`static/index.html`、`static/styles.css`、`static/app.js`、`README.md`。
 
