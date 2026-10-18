@@ -44,6 +44,28 @@
       "crs": "WGS 84",
       "crs_kind": "geographic",
       "source_note": "34 个省级行政区首府 WGS84 坐标（手写），可直接叠加在线底图"
+    },
+    {
+      "id": "ds-b27af2a58c",
+      "name": "九段线_Albers",
+      "file_name": "九段线_Albers.shp",
+      "format": "Shapefile",
+      "feature_count": 1,
+      "geometry_types": [
+        "MultiLineString"
+      ],
+      "bbox": [
+        108.202721,
+        3.4084769999999778,
+        122.81658799999998,
+        24.65820199999999
+      ],
+      "size_bytes": 50294,
+      "created_at": "2026-10-09T12:15:33+00:00",
+      "path": "uploads/ds-b27af2a58c.geojson",
+      "crs": "WGS 84（已从 WGS1984_Albers 投影坐标转换）",
+      "crs_kind": "geographic",
+      "source_note": "从 九段线_albers.shp 转换为 GeoJSON；已从投影坐标自动转换为 WGS 84 经纬度，可叠加在线底图"
     }
   ]
 }
