@@ -49,6 +49,7 @@
     <div id="routeAddonResult" class="route-addon-result" role="status" aria-live="polite">尚未加载路网。</div>
     <div class="route-addon-data"><div id="routeAddonSource">正在准备离线路网…</div>
       <label for="routeAddonInput">↑ 导入路网</label><input id="routeAddonInput" type="file" accept=".geojson,.json" hidden>
+      <button id="routeAddonDataset" type="button">用当前数据集作为路网</button>
       <button id="routeAddonDemo" type="button">示范选点</button>
       <button id="routeAddonReset" type="button">恢复样例</button>
       <p>道路数据：<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>。仅按道路长度计算，不考虑单行道、交通管制和实时路况。</p>
@@ -214,13 +215,26 @@
       route.busy = false;updateFields();draw();
     }
   }
-  async function loadRoads() {
-    const payload = await api('/api/routing/network');
+  async function loadRoads(datasetId) {
+    const url = datasetId
+      ? '/api/routing/network?dataset_id=' + encodeURIComponent(datasetId)
+      : '/api/routing/network';
+    const payload = await api(url);
     if (!payload.geojson || !payload.geojson.features || !payload.info) throw new Error('后端路网响应缺少 GeoJSON 数据');
     route.geojson = payload.geojson;
     route.info = payload.info;
-    byId('routeAddonSource').textContent = `${payload.info.demo ? '内置离线样例' : '自定义路网'} · ${payload.info.ways} 条道路 · ${payload.info.nodes} 个节点`;
+    const source = payload.info.from_dataset
+      ? `数据集“${payload.info.name}”` : (payload.info.demo ? '内置离线样例' : '自定义路网');
+    byId('routeAddonSource').textContent = `${source} · ${payload.info.ways} 条道路 · ${payload.info.nodes} 个节点`;
     updateFields();
+  }
+  async function loadRoadsFromActiveDataset() {
+    const datasets = await api('/api/datasets');
+    const active = (datasets.datasets || []).find((item) => item.active) || (datasets.datasets || [])[0];
+    if (!active) throw new Error('没有可用的数据集');
+    setStatus(`正在用数据集“${active.name}”重建路网…`);
+    await loadRoads(active.id);
+    setStatus(`✓ 已从数据集“${active.name}”加载路网。`);
   }
   async function openRoute() {
     if (route.active) {closeRoute(true);return;}
@@ -289,6 +303,13 @@
     route.points = [[126.9843635, 37.5318988], [126.9800453, 37.5261904]];
     route.solution = null;
     updateFields();setStatus('示范起终点已选好，点击「求解最短路径」。');draw();
+  });
+  byId('routeAddonDataset').addEventListener('click', async () => {
+    try {
+      route.geojson = null;route.info = null;
+      await loadRoadsFromActiveDataset();clearRoute(true);
+      if (route.active) fitView();
+    } catch (error) {setStatus(`从数据集加载路网失败：${error.message}`, true);}
   });
   byId('routeAddonInput').addEventListener('change', async (event) => {
     const file = event.target.files && event.target.files[0];
