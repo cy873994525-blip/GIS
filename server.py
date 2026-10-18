@@ -118,6 +118,35 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def infer_field_types(payload):
+    """扫描要素属性，推断每字段类型：boolean / number / text（与 C 组 field_types 命名一致）。
+
+    全部布尔 → boolean；全部数值（int/float，非 bool）→ number；否则 → text。
+    None 值不参与判定；无属性或空数据集返回 {}。
+    """
+    fields = {}
+    for feature in payload.get("features", []):
+        for name, value in (feature.get("properties") or {}).items():
+            if value is None:
+                continue
+            if name not in fields:
+                fields[name] = None  # None 表示尚未确定
+            current = fields[name]
+            if current == "text":
+                continue
+            if isinstance(value, bool):
+                inferred = "boolean"
+            elif isinstance(value, (int, float)):
+                inferred = "number"
+            else:
+                inferred = "text"
+            if current is None:
+                fields[name] = inferred
+            elif current != inferred:
+                fields[name] = "text"
+    return {name: kind for name, kind in fields.items() if kind is not None}
+
+
 def field_value_matches_type(value, kind):
     if value is None:
         return True
@@ -314,6 +343,7 @@ def dataset_summary(
         "path": path_name,
         "crs": crs_name or "Unknown",
         "crs_kind": crs_kind,
+        "field_types": infer_field_types(payload),
         "source_note": source_note or "坐标系未提供",
     }
 
@@ -1140,7 +1170,22 @@ def ensure_storage():
 
 def read_catalog():
     ensure_storage()
-    return json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
+    catalog = json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
+    # 惰性回填：老记录缺 field_types 时按存储文件重算并写回，之后不再重复读取
+    changed = False
+    for dataset in catalog.get("datasets", []):
+        if "field_types" in dataset:
+            continue
+        try:
+            path = dataset_path(dataset)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            dataset["field_types"] = infer_field_types(payload)
+            changed = True
+        except (KeyError, OSError, ValueError):
+            dataset["field_types"] = {}
+    if changed:
+        write_json_atomic(CATALOG_FILE, catalog)
+    return catalog
 
 
 def write_catalog(catalog):
