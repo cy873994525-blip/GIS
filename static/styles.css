@@ -348,8 +348,10 @@ select {
 /* Map layer ordering, styling controls, and view overlays. */
 .layer-row {
   display: grid;
-  grid-template-columns: 15px minmax(0, 1fr) auto auto;
+  grid-template-columns: 15px minmax(0, 1fr) auto;
+  grid-template-areas: "drag name count" "drag style style";
   align-items: center;
+  row-gap: 5px;
   cursor: default;
 }
 
@@ -361,6 +363,7 @@ select {
 }
 
 .layer-drag-handle {
+  grid-area: drag;
   color: #9aa9a4;
   cursor: grab;
   font-size: 13px;
@@ -370,8 +373,10 @@ select {
 .layer-drag-handle:active { cursor: grabbing; }
 
 .layer-style-controls {
+  grid-area: style;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 5px;
 }
 
@@ -460,6 +465,8 @@ select {
 }
 
 .layer-row label {
+  grid-area: name;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -472,6 +479,7 @@ select {
 }
 
 .layer-count {
+  grid-area: count;
   color: var(--muted);
   font-size: 12px;
 }

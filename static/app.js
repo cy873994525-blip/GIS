@@ -889,6 +889,7 @@ function renderLayers() {
     swatch.style.background = layerStyle(name).color;
     const labelText = document.createElement("span");
     labelText.textContent = name;
+    labelText.title = name;
     label.append(input, swatch, labelText);
 
     const count = document.createElement("span");
