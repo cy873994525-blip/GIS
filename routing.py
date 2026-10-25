@@ -14,6 +14,157 @@ EARTH_RADIUS_M = 6371008.8
 MAX_WAYS = 5000
 MAX_VERTICES = 60000
 MAX_SNAP_METERS = 100.0
+MAX_OBSTACLES = 20
+MAX_OBSTACLE_VERTICES = 500
+GEOMETRY_EPS = 1e-10
+
+
+def _orientation(a, b, c):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    ex, ey = c[0] - a[0], c[1] - a[1]
+    cross = dx * ey - dy * ex
+    tolerance = GEOMETRY_EPS * max(abs(dx), abs(dy), abs(ex), abs(ey), 1e-6)
+    return 1 if cross > tolerance else -1 if cross < -tolerance else 0
+
+
+def _point_on_segment(p, a, b):
+    return (_orientation(a, b, p) == 0
+            and min(a[0], b[0]) - GEOMETRY_EPS <= p[0] <= max(a[0], b[0]) + GEOMETRY_EPS
+            and min(a[1], b[1]) - GEOMETRY_EPS <= p[1] <= max(a[1], b[1]) + GEOMETRY_EPS)
+
+
+def _segments_intersect(a, b, c, d):
+    if (max(a[0], b[0]) + GEOMETRY_EPS < min(c[0], d[0])
+            or max(c[0], d[0]) + GEOMETRY_EPS < min(a[0], b[0])
+            or max(a[1], b[1]) + GEOMETRY_EPS < min(c[1], d[1])
+            or max(c[1], d[1]) + GEOMETRY_EPS < min(a[1], b[1])):
+        return False
+    o1, o2 = _orientation(a, b, c), _orientation(a, b, d)
+    o3, o4 = _orientation(c, d, a), _orientation(c, d, b)
+    return (o1 * o2 < 0 and o3 * o4 < 0
+            or o1 == 0 and _point_on_segment(c, a, b)
+            or o2 == 0 and _point_on_segment(d, a, b)
+            or o3 == 0 and _point_on_segment(a, c, d)
+            or o4 == 0 and _point_on_segment(b, c, d))
+
+
+def _ring_position(point, ring):
+    """Return 0 on boundary, 1 inside, -1 outside (ring is closed)."""
+    inside = False
+    x, y = point
+    for a, b in zip(ring, ring[1:]):
+        if _point_on_segment(point, a, b):
+            return 0
+        if (a[1] > y) != (b[1] > y):
+            crossing_x = a[0] + (y - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+            if x < crossing_x:
+                inside = not inside
+    return 1 if inside else -1
+
+
+def _rings_intersect(first, second):
+    return any(_segments_intersect(a, b, c, d)
+               for a, b in zip(first, first[1:])
+               for c, d in zip(second, second[1:]))
+
+
+def validate_obstacles(obstacles):
+    """Validate Polygon obstacles without modifying caller or cached graph data.
+
+    Polygon holes are free space; every outer/hole boundary is impassable.
+    Limits bound validation and intersection work for an interactive request.
+    """
+    if obstacles is None:
+        obstacles = []
+    if not isinstance(obstacles, list) or len(obstacles) > MAX_OBSTACLES:
+        raise ValueError('障碍面必须是列表，最多添加 {} 个障碍面'.format(MAX_OBSTACLES))
+    validated = []
+    vertex_count = 0
+    for obstacle in obstacles:
+        geometry = obstacle.get('geometry') if isinstance(obstacle, dict) and obstacle.get('type') == 'Feature' else obstacle
+        if not isinstance(geometry, dict) or geometry.get('type') != 'Polygon':
+            raise ValueError('障碍面只支持 GeoJSON Polygon 多边形')
+        coordinates = geometry.get('coordinates')
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError('障碍面至少需要一个闭合外环')
+        rings = []
+        for raw_ring in coordinates:
+            if not isinstance(raw_ring, list) or len(raw_ring) < 4:
+                raise ValueError('障碍面至少需要三个不同顶点并闭合')
+            vertex_count += len(raw_ring)
+            if vertex_count > MAX_OBSTACLE_VERTICES:
+                raise ValueError('障碍面总顶点数不能超过 {}'.format(MAX_OBSTACLE_VERTICES))
+            try:
+                ring = [check_coord(point) for point in raw_ring]
+            except ValueError as error:
+                raise ValueError('障碍面坐标无效：' + str(error))
+            if ring[0] != ring[-1]:
+                raise ValueError('障碍面坐标环必须闭合（首尾坐标一致）')
+            if any(a == b for a, b in zip(ring, ring[1:])):
+                raise ValueError('障碍面不能有连续重复顶点')
+            origin = ring[0]
+            area2 = sum((a[0] - origin[0]) * (b[1] - origin[1])
+                        - (b[0] - origin[0]) * (a[1] - origin[1])
+                        for a, b in zip(ring, ring[1:]))
+            span = max(max(p[0] for p in ring) - min(p[0] for p in ring),
+                       max(p[1] for p in ring) - min(p[1] for p in ring), 1e-6)
+            if abs(area2) <= GEOMETRY_EPS * span:
+                raise ValueError('障碍面面积为零或过小，请重新绘制')
+            size = len(ring) - 1
+            for i in range(size):
+                previous, current, following = ring[(i - 1) % size], ring[i], ring[(i + 1) % size]
+                if (_orientation(previous, current, following) == 0
+                        and (current[0] - previous[0]) * (following[0] - current[0])
+                        + (current[1] - previous[1]) * (following[1] - current[1]) < 0):
+                    raise ValueError('障碍面不能有折返或重叠边')
+                for j in range(i + 1, size):
+                    if j == i + 1 or i == 0 and j == size - 1:
+                        continue
+                    if _segments_intersect(ring[i], ring[i + 1], ring[j], ring[j + 1]):
+                        raise ValueError('障碍面存在自相交，请重新绘制')
+            rings.append(ring)
+        for index, hole in enumerate(rings[1:], 1):
+            if _ring_position(hole[0], rings[0]) != 1 or _rings_intersect(rings[0], hole):
+                raise ValueError('障碍面的内环必须完全位于外环内部，且不能接触外环')
+            for other in rings[1:index]:
+                if (_rings_intersect(hole, other)
+                        or _ring_position(hole[0], other) != -1
+                        or _ring_position(other[0], hole) != -1):
+                    raise ValueError('障碍面的内环不能相交、重叠或相互包含')
+        outer = rings[0]
+        validated.append({'rings': rings, 'bbox': [min(p[0] for p in outer), min(p[1] for p in outer),
+                                                   max(p[0] for p in outer), max(p[1] for p in outer)]})
+    return validated
+
+
+def _point_in_obstacle(point, obstacle):
+    rings = obstacle['rings']
+    outer_position = _ring_position(point, rings[0])
+    if outer_position == -1:
+        return False
+    if outer_position == 0:
+        return True
+    for hole in rings[1:]:
+        position = _ring_position(point, hole)
+        if position == 0:
+            return True
+        if position == 1:
+            return False
+    return True
+
+
+def _segment_blocked(a, b, obstacles):
+    for obstacle in obstacles:
+        left, bottom, right, top = obstacle['bbox']
+        if (max(a[0], b[0]) + GEOMETRY_EPS < left or min(a[0], b[0]) - GEOMETRY_EPS > right
+                or max(a[1], b[1]) + GEOMETRY_EPS < bottom or min(a[1], b[1]) - GEOMETRY_EPS > top):
+            continue
+        if _point_in_obstacle(a, obstacle) or _point_in_obstacle(b, obstacle):
+            return True
+        if any(_segments_intersect(a, b, c, d)
+               for ring in obstacle['rings'] for c, d in zip(ring, ring[1:])):
+            return True
+    return False
 
 
 def check_coord(p):
@@ -127,9 +278,22 @@ class Network:
             raise ValueError('请在道路附近点击（距离道路不超过 100 米）')
         return best
 
-    def shortest_path(self, start, end):
+    def shortest_path(self, start, end, obstacles=None):
+        barriers = validate_obstacles(obstacles)
         a = self.nearest_segment(start)
         b = self.nearest_segment(end)
+        for label, snap in (('起点', a), ('终点', b)):
+            if any(_point_in_obstacle(snap['point'], obstacle) for obstacle in barriers):
+                raise ValueError(label + '位于障碍面内或边界上，请调整障碍面或重新选点')
+        # Per-request filtering keeps the LRU-cached network safe for reuse.
+        blocked_pairs = set()
+        blocked_edges = 0
+        if barriers:
+            for u, v, _weight in self.edges:
+                if _segment_blocked(self.coords[u], self.coords[v], barriers):
+                    blocked_pairs.add((u, v))
+                    blocked_pairs.add((v, u))
+                    blocked_edges += 1
         n = len(self.coords)
         # Extra vertices are attached to the 2 endpoints of each snapped edge.
         # The direct connector below handles BOTH clicks falling on the SAME edge.
@@ -139,9 +303,11 @@ class Network:
             u, v, w = self.edges[snap['edge_id']]
             t = snap['fraction']
             for neighbour, weight in ((u, w*t), (v, w*(1-t))):
-                extra[idx].append((neighbour, weight))
-                extra.setdefault(neighbour, []).append((idx, weight))
-        if a['edge_id'] == b['edge_id']:
+                # A snap can use a clear portion of an otherwise blocked edge.
+                if not _segment_blocked(snap['point'], self.coords[neighbour], barriers):
+                    extra[idx].append((neighbour, weight))
+                    extra.setdefault(neighbour, []).append((idx, weight))
+        if a['edge_id'] == b['edge_id'] and not _segment_blocked(a['point'], b['point'], barriers):
             w = self.edges[a['edge_id']][2]
             direct = w * abs(a['fraction'] - b['fraction'])
             extra[n].append((n+1, direct))
@@ -159,6 +325,8 @@ class Network:
             if u == n+1:
                 break
             for v, weight in self.adjacency[u] if u < n else []:
+                if (u, v) in blocked_pairs:
+                    continue
                 next_cost = cost + weight
                 if next_cost < distances.get(v, math.inf) - 1e-9:
                     distances[v] = next_cost
@@ -171,6 +339,8 @@ class Network:
                     previous[v] = u
                     heapq.heappush(queue, (next_cost, v))
         if n+1 not in distances:
+            if barriers:
+                raise ValueError('当前障碍面约束下无法找到可通行路径，请撤销或清空障碍面，或重新选择起终点。')
             raise ValueError('两点处于不连通的道路网，无法找到路径。请换到同一个连通路网中。')
         path = [n+1]
         while path[-1] != n:
@@ -190,6 +360,7 @@ class Network:
             'snapping_m': [round(a['distance_m'], 2), round(b['distance_m'], 2)],
             'distance_m': round(distances[n+1], 2),
             'visited_nodes': len(settled),
+            'obstacle_count': len(barriers), 'blocked_edges': blocked_edges,
             'route': {'type': 'Feature', 'properties': {'kind': 'shortest_path', 'length_m': round(distances[n+1], 2)},
                       'geometry': {'type': 'LineString', 'coordinates': cleaned}},
         }
