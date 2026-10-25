@@ -632,7 +632,29 @@ function renderDatasets() {
     deleteButton.title = dataset.active ? "当前数据集不能删除" : "删除这个数据集";
     deleteButton.disabled = dataset.active;
     deleteButton.addEventListener("click", () => deleteDataset(dataset));
-    actions.append(showLabel, button, deleteButton);
+    const qualityButton = document.createElement("button");
+    qualityButton.className = "dataset-check";
+    qualityButton.type = "button";
+    qualityButton.textContent = "检查";
+    qualityButton.title = "检查重复 ID、空几何、坐标与字段类型问题（对标 GIS 数据检查）";
+    qualityButton.addEventListener("click", async () => {
+      qualityButton.disabled = true;
+      qualityButton.textContent = "…";
+      try {
+        const report = await api(`/api/datasets/${encodeURIComponent(dataset.id)}/quality`);
+        const q = report.quality || {};
+        const extra = q.issues && q.issues.length
+          ? `（示例：${q.issues.slice(0, 3).map((issue) => issue.message).join("；")}）`
+          : "";
+        setNotice((report.summary || "检查完成") + extra);
+      } catch (error) {
+        setNotice(`质量检查失败：${error.message}`);
+      } finally {
+        qualityButton.disabled = false;
+        qualityButton.textContent = "检查";
+      }
+    });
+    actions.append(showLabel, qualityButton, button, deleteButton);
     row.append(info, actions);
     list.appendChild(row);
   }

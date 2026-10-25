@@ -171,6 +171,79 @@ class FieldTypeInferenceTests(unittest.TestCase):
         ])
         self.assertEqual(server.infer_field_types(payload), {"m": "text"})
 
+    def test_declared_field_types_take_priority_over_inference(self):
+        # 用户显式声明 field_types（与 C 组一致）时，catalog 记录应使用声明值而非推断值
+        payload = make_fc([
+            {"type": "Feature", "id": "a", "properties": {"code": "001", "score": 1},
+             "geometry": {"type": "Point", "coordinates": [0, 0]}},
+        ], field_types={"code": "text", "score": "number"})
+        summary = server.dataset_summary("d", "d.geojson", payload, 100, "uploads/d.geojson")
+        self.assertEqual(summary["field_types"], {"code": "text", "score": "number"})
+        # 未声明时按值推断（code 全是数字字符串但推断为 text，保持与 C 组类型系统一致）
+        plain = make_fc([
+            {"type": "Feature", "id": "a", "properties": {"score": 1},
+             "geometry": {"type": "Point", "coordinates": [0, 0]}},
+        ])
+        self.assertEqual(server.dataset_summary("d", "d.geojson", plain, 100, "uploads/d.geojson")["field_types"], {"score": "number"})
+
+
+class DatasetQualityTests(unittest.TestCase):
+    def _store_quality_dataset(self, dataset_id, payload, declared):
+        """坏数据无法通过 dataset_summary（正常入库会拦截），这里手工构造 catalog 记录，
+        模拟手工编辑/外部写入产生的脏数据，验证质量检查能宽松识别。"""
+        target = server.UPLOAD_DIR / f"{dataset_id}.geojson"
+        server.write_json_atomic(target, payload)
+        catalog = server.read_catalog()
+        catalog["datasets"].append({
+            "id": dataset_id, "name": "quality", "file_name": "quality.geojson",
+            "format": "GeoJSON", "feature_count": len(payload["features"]),
+            "geometry_types": ["Point"], "bbox": None, "size_bytes": target.stat().st_size,
+            "created_at": server.utc_now(), "path": f"uploads/{dataset_id}.geojson",
+            "crs": "WGS 84", "crs_kind": "geographic", "field_types": declared,
+            "source_note": "test",
+        })
+        server.write_catalog(catalog)
+
+    def test_quality_reports_duplicates_empty_and_type_mismatch(self):
+        directory, patcher = isolated_server()
+        with patcher:
+            server.ensure_storage()
+            dataset_id = "ds-quality01"
+            payload = make_fc([
+                {"type": "Feature", "id": "dup", "properties": {"n": 1},
+                 "geometry": {"type": "Point", "coordinates": [1, 2]}},
+                {"type": "Feature", "id": "dup", "properties": {"n": 2},
+                 "geometry": {"type": "Point", "coordinates": [3, 4]}},
+                {"type": "Feature", "id": "empty", "properties": {},
+                 "geometry": None},
+                {"type": "Feature", "id": "bad", "properties": {"n": "文本"},
+                 "geometry": {"type": "Point", "coordinates": [5, 6]}},
+            ], field_types={"n": "number"})
+            self._store_quality_dataset(dataset_id, payload, {"n": "number"})
+
+            report = server.assess_dataset_quality(dataset_id)
+            quality = report["quality"]
+            self.assertEqual(quality["duplicate_ids"], {"dup": 2})
+            self.assertEqual(quality["empty_geometries"], 1)
+            self.assertEqual(quality["type_mismatches"], 1)
+            self.assertIn("发现", report["summary"])
+            kinds = {issue["kind"] for issue in quality["issues"]}
+            self.assertEqual(kinds, {"type_mismatch", "empty_geometry"})
+        directory.cleanup()
+
+    def test_quality_clean_dataset_summary(self):
+        directory, patcher = isolated_server()
+        with patcher:
+            server.ensure_storage()
+            dataset_id = "ds-quality02"
+            payload = make_fc([point_feature("p", 1, 2)])
+            self._store_quality_dataset(dataset_id, payload, {})
+            report = server.assess_dataset_quality(dataset_id)
+            self.assertEqual(report["quality"]["duplicate_ids"], {})
+            self.assertEqual(report["quality"]["empty_geometries"], 0)
+            self.assertIn("良好", report["summary"])
+        directory.cleanup()
+
 
 class MultiLayerApiTests(unittest.TestCase):
     def test_read_layers_merges_datasets_and_tags_layer(self):

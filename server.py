@@ -326,6 +326,102 @@ def calculate_bbox(payload):
     ]
 
 
+def declared_or_inferred_field_types(payload):
+    """catalog 的字段类型：用户显式声明（payload 顶层 field_types）优先，
+    未声明时才按属性值自动推断（infer_field_types）。避免推断值覆盖用户设定。
+    """
+    declared = payload.get("field_types")
+    if isinstance(declared, dict) and any(
+        isinstance(name, str) and name and kind in {"text", "number", "boolean"}
+        for name, kind in declared.items()
+    ):
+        return {
+            name: kind
+            for name, kind in declared.items()
+            if isinstance(name, str) and name and kind in {"text", "number", "boolean"}
+        }
+    return infer_field_types(payload)
+
+
+def assess_dataset_quality(dataset_id):
+    """对标 GIS 的数据检查：重复 ID、空几何、非法坐标、字段值与声明类型不符。
+
+    正常入库会拦截大部分坏数据，但手工编辑或外部写入的文件仍可能有残留问题，
+    因此这里宽松读取（不走 validate_feature_collection），逐要素宽松检查。
+    返回结构化质量报告（issues 最多保留 20 条示例，统计数完整）。
+    """
+    dataset = find_dataset(dataset_id)
+    payload = json.loads(dataset_path(dataset).read_text(encoding="utf-8"))
+    features = payload.get("features")
+    if not isinstance(features, list):
+        return {
+            "ok": True, "dataset_id": dataset_id, "name": dataset.get("name"),
+            "feature_count": 0, "declared_field_types": {},
+            "quality": {"duplicate_ids": {}, "empty_geometries": 0,
+                        "invalid_coordinates": 0, "type_mismatches": 0, "issues": []},
+            "summary": "数据集文件结构异常：features 不是数组",
+        }
+    declared = dataset.get("field_types") or {}
+    seen_ids = {}
+    issues = []
+    empty_geometries = 0
+    invalid_coordinates = 0
+    type_mismatch_count = 0
+    for feature in features:
+        feature_id = feature.get("id")
+        seen_ids[feature_id] = seen_ids.get(feature_id, 0) + 1
+        geometry = feature.get("geometry") or {}
+        if (not isinstance(geometry, dict) or not geometry.get("type")
+                or geometry.get("coordinates") in (None, [], {})):
+            empty_geometries += 1
+            if len(issues) < 20:
+                issues.append({"feature_id": feature_id, "kind": "empty_geometry", "message": "要素缺少有效几何"})
+            continue
+        try:
+            validate_geometry_coordinates(geometry["type"], geometry.get("coordinates"))
+        except (ValueError, TypeError) as exc:
+            invalid_coordinates += 1
+            if len(issues) < 20:
+                issues.append({"feature_id": feature_id, "kind": "invalid_coordinates", "message": str(exc)})
+        properties = feature.get("properties") or {}
+        for name, kind in declared.items():
+            value = properties.get(name)
+            if value is None:
+                continue
+            if not field_value_matches_type(value, kind):
+                type_mismatch_count += 1
+                if len(issues) < 20:
+                    issues.append({
+                        "feature_id": feature_id, "kind": "type_mismatch",
+                        "field": name, "expected": kind,
+                        "message": f"字段 {name} 声明为 {kind}，实际为 {type(value).__name__}",
+                    })
+    duplicates = {feature_id: count for feature_id, count in seen_ids.items() if count > 1}
+    problems = empty_geometries + invalid_coordinates + type_mismatch_count + len(duplicates)
+    if problems == 0:
+        summary = f"数据质量良好：{len(features)} 个要素，未发现重复 ID、空几何、坐标或字段类型问题"
+    else:
+        summary = (
+            f"发现 {problems} 个问题：重复 ID {len(duplicates)} 处、空几何 {empty_geometries} 个、"
+            f"坐标非法 {invalid_coordinates} 处、字段类型不符 {type_mismatch_count} 处"
+        )
+    return {
+        "ok": True,
+        "dataset_id": dataset_id,
+        "name": dataset.get("name"),
+        "feature_count": len(features),
+        "declared_field_types": declared,
+        "quality": {
+            "duplicate_ids": duplicates,
+            "empty_geometries": empty_geometries,
+            "invalid_coordinates": invalid_coordinates,
+            "type_mismatches": type_mismatch_count,
+            "issues": issues,
+        },
+        "summary": summary,
+    }
+
+
 def dataset_summary(
     dataset_id,
     file_name,
@@ -358,7 +454,7 @@ def dataset_summary(
         "path": path_name,
         "crs": crs_name or "Unknown",
         "crs_kind": crs_kind,
-        "field_types": infer_field_types(payload),
+        "field_types": declared_or_inferred_field_types(payload),
         "source_note": source_note or "坐标系未提供",
     }
 
@@ -1429,6 +1525,16 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             return
 
         if path.startswith("/api/datasets/"):
+            if path.endswith("/quality"):
+                dataset_id = unquote(remove_prefix(path, "/api/datasets/").removesuffix("/quality")).strip("/")
+                if not dataset_id:
+                    self.send_error_json("missing dataset id", status=400)
+                    return
+                try:
+                    self.send_json(assess_dataset_quality(dataset_id))
+                except KeyError as exc:
+                    self.send_error_json(str(exc), status=404)
+                return
             dataset_id = unquote(remove_prefix(path, "/api/datasets/")).strip("/")
             if dataset_id:
                 dataset, payload = read_dataset(dataset_id)
