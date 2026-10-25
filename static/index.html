@@ -22,8 +22,9 @@
       </div>
       <div class="top-actions">
         <span id="saveStatus" class="save-status" data-state="saved" role="status" aria-live="polite">自动保存</span>
-        <a class="button" href="/api/export">导出 GeoJSON</a>
-        <a class="button" href="/api/export?format=shapefile" title="导出为 .shp/.shx/.dbf/.prj 打包的 ZIP（需为单一几何类型）">导出 Shapefile</a>
+        <a class="button" id="exportGeoJSON" href="/api/export">导出 GeoJSON</a>
+        <a class="button" id="exportShapefile" href="/api/export?format=shapefile" title="导出为 .shp/.shx/.dbf/.prj 打包的 ZIP（需为单一几何类型）">导出 Shapefile</a>
+        <a class="button" id="exportCSV" href="/api/export?format=csv" title="导出属性表为 CSV（含几何 WKT，UTF-8 带 BOM，可用 Excel 打开）">导出 CSV</a>
         <button id="resetBtn">重置数据</button>
       </div>
     </header>

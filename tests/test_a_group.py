@@ -245,6 +245,101 @@ class DatasetQualityTests(unittest.TestCase):
         directory.cleanup()
 
 
+class ExportEnhancementTests(unittest.TestCase):
+    """第 2 批导出能力扩展：Z 维保真 roundtrip、ids 合并导出、CSV 属性导出。"""
+
+    def _roundtrip(self, payload):
+        """导出 ZIP → 走导入管线的 convert_shapefile_zip 读回要素。"""
+        zip_bytes = server.export_shapefile_zip(payload)
+        fc, _crs, _name, _fmt, _kind, _wkt = server.convert_shapefile_zip("export.zip", zip_bytes)
+        return fc
+
+    def test_point_z_roundtrip_preserves_third_dimension(self):
+        payload = make_fc([
+            {"type": "Feature", "id": "a", "properties": {"name": "高点"},
+             "geometry": {"type": "Point", "coordinates": [116.4, 39.9, 120.5]}},
+        ])
+        self.assertEqual(server._shapefile_type_for([payload["features"][0]["geometry"]]), 11)
+        parsed = self._roundtrip(payload)
+        features = parsed.get("features", [])
+        self.assertEqual(len(features), 1)
+        coords = features[0]["geometry"]["coordinates"]
+        self.assertEqual(len(coords), 3)
+        self.assertAlmostEqual(coords[2], 120.5)
+
+    def test_linestring_z_roundtrip_preserves_z_array(self):
+        payload = make_fc([
+            {"type": "Feature", "id": "l", "properties": {},
+             "geometry": {"type": "LineString",
+                          "coordinates": [[0, 0, 5], [1, 1, 9], [2, 0, 7]]}},
+        ])
+        self.assertEqual(server._shapefile_type_for([payload["features"][0]["geometry"]]), 13)
+        parsed = self._roundtrip(payload)
+        coords = parsed["features"][0]["geometry"]["coordinates"]
+        self.assertEqual([p[2] for p in coords], [5, 9, 7])
+
+    def test_2d_geometry_with_missing_z_exports_as_2d(self):
+        payload = make_fc([point_feature("p", 1, 2)])
+        self.assertEqual(server._shapefile_type_for([payload["features"][0]["geometry"]]), 1)
+        parsed = self._roundtrip(payload)
+        self.assertEqual(len(parsed["features"][0]["geometry"]["coordinates"]), 2)
+
+    def test_empty_multipoint_export_is_rejected(self):
+        # 空 MultiPoint 与导入校验一致：导出端拒绝而非写出非法记录
+        payload = make_fc([
+            {"type": "Feature", "id": "m", "properties": {},
+             "geometry": {"type": "MultiPoint", "coordinates": []}},
+        ])
+        with self.assertRaisesRegex(ValueError, "at least one position"):
+            server.export_shapefile_zip(payload)
+
+    def test_export_shapefile_zip_merges_datasets(self):
+        directory, patcher = isolated_server()
+        with patcher:
+            server.ensure_storage()
+            # 两个点数据集合并导出（内置数据集为面，混类导出会被正确拒绝，故用点）
+            catalog = server.read_catalog()
+            payloads = {
+                "ds-merge01": make_fc([point_feature("m1", 1, 1)]),
+                "ds-merge02": make_fc([point_feature("m2", 2, 2), point_feature("m3", 3, 3)]),
+            }
+            ids = []
+            for dataset_id, payload in payloads.items():
+                target = server.UPLOAD_DIR / f"{dataset_id}.geojson"
+                server.write_json_atomic(target, payload)
+                imported = server.dataset_summary(
+                    dataset_id, f"{dataset_id}.geojson", payload, target.stat().st_size,
+                    f"uploads/{dataset_id}.geojson", crs_name="WGS 84", crs_kind="geographic",
+                )
+                catalog["datasets"].append(imported)
+                ids.append(dataset_id)
+            server.write_catalog(catalog)
+
+            merged = server.read_layers(ids)
+            self.assertEqual(len(merged["features"]), 3)
+            parsed = self._roundtrip(merged)
+            self.assertEqual(len(parsed["features"]), 3)
+            layer_tags = {f["properties"].get("layer") for f in parsed["features"]}
+            self.assertEqual(layer_tags, {"ds-merge01", "ds-merge02"})
+        directory.cleanup()
+
+    def test_export_csv_includes_properties_and_wkt(self):
+        payload = make_fc([
+            {"type": "Feature", "id": "a", "properties": {"name": "北京", "pop": 2189},
+             "geometry": {"type": "Point", "coordinates": [116.4, 39.9]}},
+            {"type": "Feature", "id": "b", "properties": {"name": "线", "pop": 0},
+             "geometry": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]}},
+        ])
+        body = server.export_csv_bytes(payload)
+        self.assertTrue(body.startswith(b"\xef\xbb\xbf"), "CSV 应带 UTF-8 BOM 便于 Excel 识别")
+        text = body.decode("utf-8-sig")
+        lines = text.strip().splitlines()
+        self.assertEqual(lines[0], "name,pop,geometry_type,wkt")
+        self.assertIn("POINT (116.4 39.9)", lines[1])
+        self.assertIn("LINESTRING (0 0, 1 1)", lines[2])
+        self.assertEqual(len(lines), 3)
+
+
 class MultiLayerApiTests(unittest.TestCase):
     def test_read_layers_merges_datasets_and_tags_layer(self):
         directory, patcher = isolated_server()

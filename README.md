@@ -325,7 +325,7 @@ Y 范围约为 2367106 至 6385320
 
 **验证汇总**：`python -m py_compile server.py route_api.py`、`node --check static/app.js static/route-addon.js`、`tests/test_a_group.py` 13/13、导出/MultiPoint/routing 端到端均通过；全部改动已 git commit（消息含“2026-10-18”）。
 
-### A 组本次补充记录（2026-10-25）：字段类型闭环与数据质量检查（第 1 次完善）
+### A 组本次补充记录（2026-10-25）：字段类型闭环与数据质量检查
 
 对标 GIS 基础功能（属性管理与数据检查），补齐「后端类型推断 → 前端类型使用」的一致性缺口，并新增数据质量检查能力。**本次记录更新时间：2026-10-25。**
 
@@ -356,6 +356,31 @@ Y 范围约为 2367106 至 6385320
 - 已合并本周其他成员 8 个提交（D 组障碍面约束最短路径 + 高德同源代理、C 组 OSM/高德底图接入与图层控件收尾），Fast-forward 无冲突。
 - D 组顺带修复了 A 组上周前端衔接的 `solve` 遗漏 `dataset_id` 问题（自动重算现携带数据来源）。
 - A 组核心（投影转换、标准 XYZ 瓦片公式 `y=(180−mercator度)/360×2^z`、多图层接口、Shapefile 导入导出、MultiPoint）经 C 组底图大改后全部保留并回归通过。
+
+### A 组本次补充记录（2026-10-25）：数据导出能力扩展
+
+对标 GIS 基础功能（数据导出与格式互通），在既有 GeoJSON / Shapefile 导出基础上补齐 Z 维保真、多数据集合并导出、CSV 属性表导出。**本次记录更新时间：2026-10-25。**
+
+#### 1. Shapefile 导出增强
+
+- **Z 维保真导出**：数据集坐标携带第三维（Z）时，自动升级为 PointZ(11) / MultiPointZ(18) / PolyLineZ(13) / PolygonZ(15)，记录写入 zmin/zmax + z 数组；混合缺 Z 的坐标补 0。导出后可被本仓库导入管线原样读回（roundtrip 测试验证 Z 值一致）。
+- **多数据集合并导出**：`/api/export?format=shapefile&ids=id1,id2` 按数据集合并为一个图层导出（复用 `read_layers`，要素自动附加 `layer`/`dataset_id` 标记）；混合几何类型（点/线/面）仍按既有规则拒绝，提示先按类型拆分。
+- **文件名用数据集名**：下载文件名从固定 id 改为数据集名称（如 `中国_省(WGS84)-shapefile.zip`）；中文文件名走 RFC 5987 `filename*` 编码，兼容 Excel / 浏览器下载。
+
+#### 2. CSV 属性表导出（对标 QGIS 属性表导出）
+
+- 新增 `/api/export?format=csv`：属性字段并集 + `geometry_type` + `wkt`（几何列用 WKT 表达，手写生成器、不依赖 shapely），支持 `ids` 多数据集合并。
+- UTF-8 带 BOM 输出，Excel 直接双击打开中文不乱码。
+
+#### 3. 前端
+
+- 顶部新增「导出 CSV」按钮；三个导出按钮（GeoJSON / Shapefile / CSV）点击时自动携带当前可见数据集（多选合并导出），无可见数据集时回退活动数据集。
+
+#### 4. 测试与验证
+
+- `tests/test_a_group.py` 新增 6 个用例：PointZ / LineStringZ roundtrip Z 值保真、2D 数据仍导出 2D、空 MultiPoint 导出拒绝（与导入校验一致）、多数据集合并导出 roundtrip、CSV 表头 / WKT / BOM。
+- 全量回归 **29/29 通过**（A 组 22 + C 组 5 + D 组高德代理 2，T1 转换在 pyproj 缺失环境按设计跳过）；`py_compile` / `node --check` 通过。
+- 服务冒烟：`format=csv&ids=省,省会` 返回 1.6 MB CSV（68 要素，字段 name/gb/layer/dataset_id/capital/geometry_type/wkt）；`format=shapefile&ids=省` 返回 ZIP 200，中文文件名 `filename*` 正确编码。
 
 ## C 组：交互编辑、属性与地图展示模块
 

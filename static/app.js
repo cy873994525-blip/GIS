@@ -3423,6 +3423,33 @@ document.getElementById("deleteSelectionBtn").addEventListener("click", async ()
   }
 });
 
+function bindExportButtons() {
+  // 导出时携带当前可见数据集（多选合并导出），无可见数据集时回退到活动数据集
+  const visibleIds = () => {
+    const ids = Array.from(state.visibleDatasetIds);
+    if (ids.length) return ids.join(",");
+    return state.activeDataset ? state.activeDataset.id : "";
+  };
+  const wire = (elementId, formatSuffix) => {
+    const anchor = document.getElementById(elementId);
+    if (!anchor) return;
+    anchor.addEventListener("click", (event) => {
+      const ids = visibleIds();
+      const separator = formatSuffix ? "&" : "?";
+      const idsPart = ids ? `${separator}ids=${encodeURIComponent(ids)}` : "";
+      const href = formatSuffix
+        ? `/api/export?format=${formatSuffix}${idsPart}`
+        : `/api/export${idsPart}`;
+      if (anchor.getAttribute("href") === href) return;
+      event.preventDefault();
+      window.location.href = href;
+    });
+  };
+  wire("exportGeoJSON", "");
+  wire("exportShapefile", "shapefile");
+  wire("exportCSV", "csv");
+}
+
 document.getElementById("resetBtn").addEventListener("click", async () => {
   if (!window.confirm("重置会覆盖内置示例数据并切换到该数据集，且无法撤销。其他已导入数据集不会删除。确定继续吗？")) return;
   const button = document.getElementById("resetBtn");
@@ -3553,6 +3580,7 @@ document.getElementById("attributeTableBody").addEventListener("keydown", (event
 window.addEventListener("resize", resizeCanvas);
 
 loadDatasets().then(() => Promise.all([loadData(), loadStatus()])).then(() => {
+  bindExportButtons();
   resizeCanvas();
   syncMapMode();
   fitView();
