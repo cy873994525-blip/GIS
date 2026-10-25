@@ -23,6 +23,7 @@ from pathlib import Path
 import json
 import math
 import mimetypes
+import os
 import re
 import io
 import sys
@@ -30,7 +31,9 @@ import struct
 import uuid
 import zipfile
 import base64
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, parse_qsl, urlencode, unquote, urlsplit
+from urllib.request import Request, urlopen
 from route_api import handle_routing_request
 
 # 兼容层：str.removeprefix / str.removesuffix 是 Python 3.9 才有的，
@@ -68,6 +71,18 @@ MAX_IMPORT_BYTES = 20 * 1024 * 1024
 MAX_FEATURES = 10000
 MAX_ZIP_MEMBERS = 32
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
+AMAP_PROXY_PREFIX = "/_AMapService/"
+
+
+def amap_public_config():
+    """Expose the browser key, but never send the security code to the browser."""
+    key = os.environ.get("GIS_AMAP_JS_KEY", "").strip()
+    security_code = os.environ.get("GIS_AMAP_SECURITY_JS_CODE", "").strip()
+    return {
+        "enabled": bool(key and security_code),
+        "key": key if key and security_code else "",
+        "service_host": "/_AMapService",
+    }
 
 
 SAMPLE_DATA = {
@@ -1306,6 +1321,41 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
     def send_error_json(self, message, status=400):
         self.send_json({"ok": False, "error": message}, status=status)
 
+    def proxy_amap_service(self, path):
+        """Same-origin proxy for official JS API services; keep jscode server-side."""
+        security_code = os.environ.get("GIS_AMAP_SECURITY_JS_CODE", "").strip()
+        if not amap_public_config()["enabled"]:
+            self.send_error_json("高德官方地图尚未配置", status=503)
+            return
+        tail = path[len("/_AMapService"):]
+        if not re.fullmatch(r"/(?:v3|v4|v5)/[A-Za-z0-9/_-]+", tail) or ".." in tail:
+            self.send_error_json("不支持的高德服务路径", status=404)
+            return
+        parsed = urlsplit(self.path)
+        params = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                  if key.lower() != "jscode"]
+        params.append(("jscode", security_code))
+        host = "https://webapi.amap.com" if tail.startswith("/v4/map/styles") else "https://restapi.amap.com"
+        upstream_url = host + tail + "?" + urlencode(params)
+        try:
+            response = urlopen(Request(upstream_url, headers={"User-Agent": "GISClassroomDemo/1.0"}), timeout=10)
+        except HTTPError as error:
+            response = error
+        except (URLError, TimeoutError, OSError):
+            self.send_error_json("高德服务暂时不可用", status=502)
+            return
+        with response:
+            body = response.read(8 * 1024 * 1024 + 1)
+            if len(body) > 8 * 1024 * 1024:
+                self.send_error_json("高德服务响应过大", status=502)
+                return
+            self.send_response(response.status)
+            self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
     def read_json_body(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length > MAX_REQUEST_BYTES:
@@ -1317,6 +1367,12 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
         if handle_routing_request(self, "GET"):
             return
         path = urlsplit(self.path).path
+        if path == "/api/map-config":
+            self.send_json(amap_public_config())
+            return
+        if path.startswith(AMAP_PROXY_PREFIX):
+            self.proxy_amap_service(path)
+            return
         if path == "/api/layers":
             query = parse_qs(urlsplit(self.path).query)
             ids = [item for item in (query.get("ids") or [""])[0].split(",") if item]

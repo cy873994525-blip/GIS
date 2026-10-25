@@ -20,6 +20,18 @@
   box-sizing: border-box;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 body {
   margin: 0;
   min-width: 960px;
@@ -921,6 +933,32 @@ section {
   font-size: 12px;
 }
 
+.toolbar select,
+.place-search-form input {
+  min-height: 31px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.place-search-form {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.place-search-form input {
+  width: 138px;
+}
+
+#officialMapTools[hidden],
+#amapBase[hidden] {
+  display: none;
+}
+
 .accent-button {
   border-color: #e0b09c;
   background: #fff7f3;
@@ -942,11 +980,22 @@ section {
   z-index: 0;
 }
 
+.amap-base {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
 .basemap-tiles img {
   position: absolute;
   display: block;
   max-width: none;
   user-select: none;
+}
+
+.basemap-tiles.basemap-clean img {
+  filter: saturate(0.4) brightness(1.06);
 }
 
 #mapCanvas {

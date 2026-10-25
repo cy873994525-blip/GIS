@@ -1,16 +1,30 @@
 const canvas = document.getElementById("mapCanvas");
 const ctx = canvas.getContext("2d");
 const tileLayer = document.getElementById("baseMapTiles");
+const amapBase = document.getElementById("amapBase");
 const visibleTiles = new Map();
 let drawFramePending = false;
 const MAX_MERCATOR_LAT = 85.05112878;
 const TILE_SIZE = 256;
 const MAX_TILE_ZOOM = 19;
 
-// ---- 高德底图（GCJ-02 坐标系）配置 ----
-const TILE_MIN_ZOOM = 1;    // 高德瓦片最小缩放级别（z=0 高德不提供）
-const TILE_MAX_ZOOM = 18;   // 高德瓦片最大缩放级别（z=19 高德不提供）
-const TILE_STYLE = 7;       // 7=基础底图（干净），8=路网+中文标注
+// 免配置底图使用 OSM 的 WGS 84 瓦片；官方高德地图启用后再转换到 GCJ-02。
+const TILE_MIN_ZOOM = 1;
+const TILE_MAX_ZOOM = 19;
+const CITY_VIEWS = {
+  beijing: { name: "北京", lon: 116.397428, lat: 39.90923 },
+  shanghai: { name: "上海", lon: 121.4737, lat: 31.2304 },
+  guangzhou: { name: "广州", lon: 113.2644, lat: 23.1291 },
+  chengdu: { name: "成都", lon: 104.0665, lat: 30.5723 },
+};
+const BASEMAP_STYLE_KEY = "gis-demo-basemap-style";
+let savedBasemapStyle = "detailed";
+try {
+  if (localStorage.getItem(BASEMAP_STYLE_KEY) === "clean") savedBasemapStyle = "clean";
+} catch (error) {
+  // 禁用本地存储时仍可使用详细底图。
+}
+const officialMap = { map: null, ready: false, loading: false, lastView: null, marker: null };
 
 const state = {
   data: { type: "FeatureCollection", features: [] },
@@ -19,6 +33,7 @@ const state = {
   visibleDatasetIds: new Set(),
   visibleDatasetIdsInitialized: false,
   visibleLayers: new Set(),
+  knownLayers: new Set(),
   selectedIds: new Set(),
   mode: "pan",
   scale: 0.7,
@@ -58,6 +73,7 @@ const state = {
   skipClickOnce: false,
   geographic: false,
   baseMapEnabled: true,
+  baseMapStyle: savedBasemapStyle,
   baseMapErrorShown: false,
   layerOrder: [],
   layerStyles: {},
@@ -206,24 +222,22 @@ function gcj02ToWgs84(lon, lat) {
   return [wLon, wLat];
 }
 
-// 高德栅格瓦片 URL（标准 XYZ，y 自北向南递增，与当前瓦片模型一致）
-function amapTileUrl(z, x, y) {
-  const s = ((x * 2 + y + z) % 4) + 1; // 子域 webrd01~04 轮询，分散请求更稳定
-  return `https://webrd0${s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=${TILE_STYLE}&x=${x}&y=${y}&z=${z}`;
+function fallbackTileUrl(z, x, y) {
+  return `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
 }
 
 function projectWorld(coord) {
   if (!state.geographic) return coord;
-  const gcj = wgs84ToGcj02(coord[0], coord[1]);
-  const latitude = Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, gcj[1]));
+  const location = officialMap.ready ? wgs84ToGcj02(coord[0], coord[1]) : coord;
+  const latitude = Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, location[1]));
   const radians = latitude * Math.PI / 180;
-  return [gcj[0], Math.asinh(Math.tan(radians)) * 180 / Math.PI];
+  return [location[0], Math.asinh(Math.tan(radians)) * 180 / Math.PI];
 }
 
 function unprojectWorld(coord) {
   if (!state.geographic) return coord;
   const latitude = Math.atan(Math.sinh(coord[1] * Math.PI / 180)) * 180 / Math.PI;
-  return gcj02ToWgs84(coord[0], latitude);
+  return officialMap.ready ? gcj02ToWgs84(coord[0], latitude) : [coord[0], latitude];
 }
 
 function worldToScreen(coord) {
@@ -254,6 +268,37 @@ function isGeographicDataset() {
     crs === "Unknown" || /WGS[ _-]?(?:19)?84|EPSG:?4326|CRS:?84/i.test(crs));
 }
 
+function clearVisibleTiles() {
+  for (const image of visibleTiles.values()) image.remove();
+  visibleTiles.clear();
+}
+
+function syncOfficialMapView() {
+  if (!officialMap.ready || !state.geographic || !state.baseMapEnabled) return;
+  const centerWgs = screenToWorld(state.viewWidth / 2, state.viewHeight / 2);
+  const center = wgs84ToGcj02(centerWgs[0], centerWgs[1]);
+  const zoom = Math.max(2, Math.min(20, Math.log2(state.scale * 360 / TILE_SIZE)));
+  const view = [zoom, center[0], center[1], state.viewWidth, state.viewHeight];
+  if (officialMap.lastView && view.every((value, index) =>
+    Math.abs(value - officialMap.lastView[index]) < 0.00001)) return;
+  officialMap.lastView = view;
+  officialMap.map.setZoomAndCenter(zoom, center, true);
+}
+
+function setFallbackMapStyle(style) {
+  state.baseMapStyle = style === "clean" ? "clean" : "detailed";
+  document.getElementById("baseMapStyle").value = state.baseMapStyle;
+  try { localStorage.setItem(BASEMAP_STYLE_KEY, state.baseMapStyle); } catch (error) {
+    // 本地存储不可用时仅保持当前会话的选择。
+  }
+  tileLayer.classList.toggle("basemap-clean", state.baseMapStyle === "clean");
+  if (officialMap.ready) {
+    officialMap.map.setMapStyle(state.baseMapStyle === "clean"
+      ? "amap://styles/whitesmoke" : "amap://styles/normal");
+  }
+  syncMapMode();
+}
+
 function syncMapMode() {
   state.geographic = isGeographicDataset();
   state.baseMapErrorShown = false;
@@ -264,19 +309,37 @@ function syncMapMode() {
   button.setAttribute("aria-pressed", String(enabled));
   button.textContent = state.geographic ? (enabled ? "地图：开" : "地图：关") : "需经纬度";
   document.getElementById("mapBadgeText").textContent = state.geographic
-    ? (enabled ? "WGS 84 经纬度 · 在线底图" : "WGS 84 经纬度 · 底图已关闭")
+    ? (enabled ? (officialMap.ready ? "高德官方地图 · 可编辑矢量数据"
+      : `OSM ${state.baseMapStyle === "clean" ? "浅色" : "详细"}底图 · 可编辑矢量数据`)
+      : "WGS 84 经纬度 · 底图已关闭")
     : "模拟 / 投影坐标 · 平面画布";
-  document.getElementById("mapAttribution").hidden = !enabled;
+  const attribution = document.getElementById("mapAttribution");
+  attribution.hidden = !enabled;
+  attribution.href = officialMap.ready ? "https://www.amap.com/" : "https://www.openstreetmap.org/copyright";
+  attribution.textContent = officialMap.ready ? "© 高德地图" : "© OpenStreetMap contributors";
   canvas.classList.toggle("with-basemap", enabled);
   draw();
 }
 
 function renderBasemapTiles() {
   if (!state.geographic || !state.baseMapEnabled) {
-    for (const image of visibleTiles.values()) image.remove();
-    visibleTiles.clear();
+    clearVisibleTiles();
+    amapBase.hidden = true;
     return;
   }
+
+  if (officialMap.ready) {
+    clearVisibleTiles();
+    const wasHidden = amapBase.hidden;
+    amapBase.hidden = false;
+    if (wasHidden) {
+      officialMap.map.resize?.();
+      officialMap.lastView = null;
+    }
+    syncOfficialMapView();
+    return;
+  }
+  amapBase.hidden = true;
 
   const zoom = Math.max(TILE_MIN_ZOOM, Math.min(TILE_MAX_ZOOM,
     Math.floor(Math.log2(state.scale * 360 / TILE_SIZE))));
@@ -309,7 +372,7 @@ function renderBasemapTiles() {
           state.baseMapErrorShown = true;
           document.getElementById("mapBadgeText").textContent = "底图暂时无法加载，请检查网络";
         });
-        image.src = amapTileUrl(zoom, x, y);
+        image.src = fallbackTileUrl(zoom, x, y);
         visibleTiles.set(key, image);
         tileLayer.appendChild(image);
       }
@@ -328,6 +391,127 @@ function renderBasemapTiles() {
   }
 }
 
+function loadAmapScript(key) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    const timer = setTimeout(() => reject(new Error("高德脚本加载超时")), 12000);
+    script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(key)}`;
+    script.async = true;
+    script.onload = () => {
+      clearTimeout(timer);
+      if (window.AMap && typeof window.AMap.Map === "function") resolve();
+      else reject(new Error("高德脚本未提供地图接口"));
+    };
+    script.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("高德脚本加载失败"));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+async function initializeOfficialMap() {
+  if (officialMap.loading || officialMap.ready) return;
+  officialMap.loading = true;
+  try {
+    const response = await fetch("/api/map-config", { cache: "no-store" });
+    if (!response.ok) return;
+    const config = await response.json();
+    if (!config.enabled || !config.key) return;
+    // 安全密钥只留在本地 Python 服务端；浏览器只接收公开的 Web 端 Key。
+    window._AMapSecurityConfig = {
+      serviceHost: `${location.origin}${config.service_host}`,
+    };
+    amapBase.hidden = false;
+    await loadAmapScript(config.key);
+    const AMap = window.AMap;
+    const map = new AMap.Map(amapBase, {
+      center: [116.397428, 39.90923], zoom: 12, zooms: [2, 20],
+      viewMode: "2D", mapStyle: state.baseMapStyle === "clean"
+        ? "amap://styles/whitesmoke" : "amap://styles/normal",
+      features: ["bg", "point", "road", "building"],
+      dragEnable: false, zoomEnable: false, doubleClickZoom: false,
+      keyboardEnable: false, touchZoom: false, resizeEnable: true,
+    });
+    officialMap.map = map;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("高德地图初始化超时")), 12000);
+      map.on("complete", () => { clearTimeout(timer); resolve(); });
+    });
+    const oldCenter = state.geographic
+      ? screenToWorld(state.viewWidth / 2, state.viewHeight / 2) : null;
+    officialMap.ready = true;
+    if (oldCenter) {
+      const projected = projectWorld(oldCenter);
+      state.offsetX = state.viewWidth / 2 - projected[0] * state.scale;
+      state.offsetY = state.viewHeight / 2 - projected[1] * state.scale;
+    }
+    officialMap.lastView = null;
+    document.getElementById("officialMapTools").hidden = false;
+    map.resize?.();
+    syncMapMode();
+    setNotice("高德官方地图已连接。可切换卫星图、实时路况或搜索地点。");
+  } catch (error) {
+    officialMap.map?.destroy?.();
+    officialMap.map = null;
+    officialMap.ready = false;
+    amapBase.hidden = true;
+    draw();
+    setNotice(`官方地图未加载，已继续使用 OSM 详细底图：${error.message}`);
+  } finally {
+    officialMap.loading = false;
+  }
+}
+
+function setOfficialMapType(type) {
+  if (!officialMap.ready) return;
+  const AMap = window.AMap;
+  const layers = type === "satellite"
+    ? [new AMap.TileLayer.Satellite(), new AMap.TileLayer.RoadNet()]
+    : type === "traffic"
+      ? [new AMap.TileLayer(), new AMap.TileLayer.Traffic()]
+      : [new AMap.TileLayer()];
+  officialMap.map.setLayers(layers);
+  officialMap.lastView = null;
+  syncOfficialMapView();
+}
+
+function focusGeographicLocation(lon, lat, zoom = 12) {
+  if (!state.geographic) return;
+  const projected = projectWorld([lon, lat]);
+  state.scale = TILE_SIZE * 2 ** zoom / 360;
+  state.offsetX = state.viewWidth / 2 - projected[0] * state.scale;
+  state.offsetY = state.viewHeight / 2 - projected[1] * state.scale;
+  draw();
+}
+
+function searchOfficialPlace(query) {
+  if (!officialMap.ready) return;
+  window.AMap.plugin("AMap.PlaceSearch", () => {
+    const placeSearch = new window.AMap.PlaceSearch({ city: "全国" });
+    placeSearch.search(query, (status, result) => {
+      const poi = status === "complete" ? result?.poiList?.pois?.[0] : null;
+      if (!poi?.location) {
+        setNotice(`没有找到“${query}”，请尝试更具体的地点名称。`);
+        return;
+      }
+      const gcj = poi.location;
+      const lon = typeof gcj.getLng === "function" ? gcj.getLng() : gcj.lng;
+      const lat = typeof gcj.getLat === "function" ? gcj.getLat() : gcj.lat;
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+        setNotice("地点没有可用坐标。");
+        return;
+      }
+      const wgs = gcj02ToWgs84(lon, lat);
+      focusGeographicLocation(wgs[0], wgs[1], 14);
+      if (officialMap.marker) officialMap.map.remove(officialMap.marker);
+      officialMap.marker = new window.AMap.Marker({ position: [lon, lat], title: poi.name || query });
+      officialMap.map.add(officialMap.marker);
+      setNotice(`已定位到：${poi.name || query}。搜索结果仅用于定位，不会写入当前数据集。`);
+    });
+  });
+}
+
 function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();
   state.dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -336,6 +520,10 @@ function resizeCanvas() {
   canvas.width = Math.floor(state.viewWidth * state.dpr);
   canvas.height = Math.floor(state.viewHeight * state.dpr);
   ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+  if (officialMap.ready) {
+    officialMap.map.resize?.();
+    officialMap.lastView = null;
+  }
   draw();
 }
 
@@ -504,7 +692,9 @@ async function loadData() {
     state.data.features.some((feature) => feature.id === id)));
   state.geographic = false;
   const layers = new Set(state.data.features.map((f) => f.properties.layer || "未命名"));
-  state.visibleLayers = layers;
+  state.visibleLayers = new Set([...layers].filter((layer) =>
+    !state.knownLayers.has(layer) || state.visibleLayers.has(layer)));
+  state.knownLayers = layers;
   // 数据集换了，旧的编辑目标已经不在数据里了。
   exitGeometryEdit();
   state.attributePage = 1;
@@ -527,12 +717,13 @@ async function loadStatus() {
   document.getElementById("statusDot").className = "status-dot";
 }
 
-async function activateDataset(datasetId) {
+async function activateDataset(datasetId, { isolate = false } = {}) {
   try {
     await api(`/api/datasets/${encodeURIComponent(datasetId)}/activate`, { method: "POST" });
     clearEditHistory();
     state.selectedIds.clear();
-    state.visibleDatasetIds.add(datasetId);
+    if (isolate) state.visibleDatasetIds = new Set([datasetId]);
+    else state.visibleDatasetIds.add(datasetId);
     await loadDatasets();
     await Promise.all([loadData(), loadStatus()]);
     syncMapMode();
@@ -556,7 +747,7 @@ async function deleteDataset(dataset) {
   }
 }
 
-async function importDataset(file) {
+async function importDataset(file, { isolate = false } = {}) {
   const fileInput = document.getElementById("fileInput");
   const status = document.getElementById("datasetImportStatus");
   const setImportStatus = (message, kind = "") => {
@@ -603,7 +794,8 @@ async function importDataset(file) {
     });
     state.selectedIds.clear();
     const imported = result.dataset;
-    state.visibleDatasetIds.add(imported.id);
+    if (isolate) state.visibleDatasetIds = new Set([imported.id]);
+    else state.visibleDatasetIds.add(imported.id);
     clearEditHistory();
     await loadDatasets();
     await Promise.all([loadData(), loadStatus()]);
@@ -630,7 +822,7 @@ async function openMapDemo() {
     await loadDatasets();
     const existing = state.datasets.find((dataset) => dataset.file_name === "map_demo.geojson");
     if (existing) {
-      await activateDataset(existing.id);
+      await activateDataset(existing.id, { isolate: true });
       return;
     }
     const response = await fetch("/static/map_demo.geojson");
@@ -638,7 +830,7 @@ async function openMapDemo() {
     const file = new File([await response.blob()], "map_demo.geojson", {
       type: "application/geo+json",
     });
-    await importDataset(file);
+    await importDataset(file, { isolate: true });
   } catch (error) {
     setNotice(`打开地图示例失败：${error.message}`);
   } finally {
@@ -1645,6 +1837,8 @@ async function commitGeometryChange(previousGeometry, message) {
   const feature = getEditFeature();
   if (!feature || !state.editGeometry) return;
   try {
+    const issue = editedGeometryError(state.editGeometry);
+    if (issue) throw new Error(issue);
     await updateFeature({ ...feature, geometry: deepCopy(state.editGeometry) }, message);
     setNotice(`${message}（节点数 ${extractVertices(state.editGeometry).length}，Ctrl+Z 撤销 / Ctrl+Y 重做）`);
   } catch (error) {
@@ -2442,48 +2636,63 @@ function normaliseDraftCoordinates(draft, polygon = false) {
   return coordinates;
 }
 
-function polygonDraftError(points) {
-  if (points.length < 3) return "画面至少需要 3 个节点。";
-  if (points.some((point) => !Number.isFinite(point[0]) || !Number.isFinite(point[1]))) {
-    return "面节点坐标必须是有效数字。";
-  }
+function segmentsIntersect(a, b, c, d) {
   const cross = (a, b, c) =>
     (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
   const onSegment = (a, b, p) => p[0] >= Math.min(a[0], b[0]) &&
     p[0] <= Math.max(a[0], b[0]) && p[1] >= Math.min(a[1], b[1]) &&
     p[1] <= Math.max(a[1], b[1]);
-  const intersects = (a, b, c, d) => {
-    if (Math.max(a[0], b[0]) < Math.min(c[0], d[0]) ||
-        Math.max(c[0], d[0]) < Math.min(a[0], b[0]) ||
-        Math.max(a[1], b[1]) < Math.min(c[1], d[1]) ||
-        Math.max(c[1], d[1]) < Math.min(a[1], b[1])) return false;
-    const tolerance = Math.max(
-      Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]),
-      Math.abs(d[0] - c[0]), Math.abs(d[1] - c[1]),
-    ) ** 2 * 1e-12;
-    const o1 = cross(a, b, c);
-    const o2 = cross(a, b, d);
-    const o3 = cross(c, d, a);
-    const o4 = cross(c, d, b);
-    if (Math.abs(o1) <= tolerance && onSegment(a, b, c)) return true;
-    if (Math.abs(o2) <= tolerance && onSegment(a, b, d)) return true;
-    if (Math.abs(o3) <= tolerance && onSegment(c, d, a)) return true;
-    if (Math.abs(o4) <= tolerance && onSegment(c, d, b)) return true;
-    return (o1 > tolerance) !== (o2 > tolerance) &&
-      (o3 > tolerance) !== (o4 > tolerance);
-  };
-  for (let index = 0; index < points.length; index += 1) {
-    const next = (index + 1) % points.length;
-    if (points[index][0] === points[next][0] && points[index][1] === points[next][1]) {
-      return `第 ${index + 1} 条边长度为零，请调整节点。`;
+  if (Math.max(a[0], b[0]) < Math.min(c[0], d[0]) ||
+      Math.max(c[0], d[0]) < Math.min(a[0], b[0]) ||
+      Math.max(a[1], b[1]) < Math.min(c[1], d[1]) ||
+      Math.max(c[1], d[1]) < Math.min(a[1], b[1])) return false;
+  const tolerance = Math.max(
+    Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]),
+    Math.abs(d[0] - c[0]), Math.abs(d[1] - c[1]),
+  ) ** 2 * 1e-12;
+  const o1 = cross(a, b, c);
+  const o2 = cross(a, b, d);
+  const o3 = cross(c, d, a);
+  const o4 = cross(c, d, b);
+  if (Math.abs(o1) <= tolerance && onSegment(a, b, c)) return true;
+  if (Math.abs(o2) <= tolerance && onSegment(a, b, d)) return true;
+  if (Math.abs(o3) <= tolerance && onSegment(c, d, a)) return true;
+  if (Math.abs(o4) <= tolerance && onSegment(c, d, b)) return true;
+  return (o1 > tolerance) !== (o2 > tolerance) &&
+    (o3 > tolerance) !== (o4 > tolerance);
+}
+
+function polygonDraftError(points) {
+  if (points.length < 3) return "画面至少需要 3 个节点。";
+  if (points.some((point) => !Number.isFinite(point[0]) || !Number.isFinite(point[1]))) {
+    return "面节点坐标必须是有效数字。";
+  }
+  const segments = points.map((a, index) => {
+    const b = points[(index + 1) % points.length];
+    return { index, a, b, minX: Math.min(a[0], b[0]), maxX: Math.max(a[0], b[0]),
+      minY: Math.min(a[1], b[1]), maxY: Math.max(a[1], b[1]) };
+  });
+  for (const segment of segments) {
+    if (segment.a[0] === segment.b[0] && segment.a[1] === segment.b[1]) {
+      return `第 ${segment.index + 1} 条边长度为零，请调整节点。`;
     }
-    for (let other = index + 2; other < points.length; other += 1) {
-      if (index === 0 && other === points.length - 1) continue;
-      if (intersects(points[index], points[next], points[other],
-          points[(other + 1) % points.length])) {
-        return `第 ${index + 1} 与第 ${other + 1} 条边相交，请调整节点。`;
+  }
+  // 大型 Shapefile 外环可有数千节点；按 X 范围扫描候选边，避免逐对遍历所有边。
+  segments.sort((a, b) => a.minX - b.minX);
+  const active = [];
+  for (const segment of segments) {
+    for (let index = active.length - 1; index >= 0; index -= 1) {
+      if (active[index].maxX < segment.minX) active.splice(index, 1);
+    }
+    for (const other of active) {
+      const distance = Math.abs(segment.index - other.index);
+      if (distance === 1 || distance === points.length - 1 ||
+          segment.minY > other.maxY || other.minY > segment.maxY) continue;
+      if (segmentsIntersect(segment.a, segment.b, other.a, other.b)) {
+        return `第 ${segment.index + 1} 与第 ${other.index + 1} 条边相交，请调整节点。`;
       }
     }
+    active.push(segment);
   }
   const origin = points[0];
   let doubleArea = 0;
@@ -2501,6 +2710,82 @@ function polygonDraftError(points) {
     return "面面积为零或过小，请让至少三个节点不共线。";
   }
   return null;
+}
+
+function ringsIntersect(first, second) {
+  for (let a = 1; a < first.length; a += 1) {
+    for (let b = 1; b < second.length; b += 1) {
+      if (segmentsIntersect(first[a - 1], first[a], second[b - 1], second[b])) return true;
+    }
+  }
+  return false;
+}
+
+// 拖节点、整体平移、插点和删点都走同一份提交前校验，避免把坏几何写入文件。
+function editedGeometryError(geometry) {
+  const validPosition = (point) => Array.isArray(point) && point.length >= 2 &&
+    Number.isFinite(point[0]) && Number.isFinite(point[1]) &&
+    (!state.geographic || (Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= MAX_MERCATOR_LAT));
+  const checkLine = (line) => {
+    if (!Array.isArray(line) || line.length < 2) return "线至少需要 2 个节点。";
+    if (line.some((point) => !validPosition(point))) return "线节点坐标无效或超出地图范围。";
+    if (line.every((point) => point[0] === line[0][0] && point[1] === line[0][1])) {
+      return "线的全部节点不能重合。";
+    }
+    return null;
+  };
+  const checkPolygon = (polygon) => {
+    if (!Array.isArray(polygon) || !polygon.length) return "面至少需要一个外环。";
+    for (const [index, ring] of polygon.entries()) {
+      if (!Array.isArray(ring) || ring.length < 4) return `第 ${index + 1} 个环至少需要 3 个节点。`;
+      if (ring.some((point) => !validPosition(point))) return `第 ${index + 1} 个环坐标无效或超出地图范围。`;
+      const first = ring[0];
+      const last = ring[ring.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) return `第 ${index + 1} 个环没有闭合。`;
+      // 已导入的真实 Shapefile 可能含重复相邻点；校验拓扑时忽略这些历史冗余点。
+      const issue = polygonDraftError(normaliseDraftCoordinates(ring.slice(0, -1), true));
+      if (issue) return `第 ${index + 1} 个环：${issue}`;
+    }
+    const outer = polygon[0];
+    for (let index = 1; index < polygon.length; index += 1) {
+      const hole = polygon[index];
+      if (!pointInPolygon(hole[0], outer) || ringsIntersect(hole, outer)) {
+        return `第 ${index + 1} 个环必须完整位于外环内。`;
+      }
+      for (let other = 1; other < index; other += 1) {
+        const previous = polygon[other];
+        if (ringsIntersect(hole, previous) || pointInPolygon(hole[0], previous) ||
+            pointInPolygon(previous[0], hole)) {
+          return "面洞之间不能相交或包含。";
+        }
+      }
+    }
+    return null;
+  };
+  if (geometry.type === "Point") return validPosition(geometry.coordinates) ? null : "点坐标无效或超出地图范围。";
+  if (geometry.type === "MultiPoint") {
+    return Array.isArray(geometry.coordinates) && geometry.coordinates.length &&
+      geometry.coordinates.every(validPosition) ? null : "多点坐标无效或没有节点。";
+  }
+  if (geometry.type === "LineString") return checkLine(geometry.coordinates);
+  if (geometry.type === "MultiLineString") {
+    if (!Array.isArray(geometry.coordinates) || !geometry.coordinates.length) return "多线至少需要一段。";
+    for (const line of geometry.coordinates) {
+      const issue = checkLine(line);
+      if (issue) return issue;
+    }
+    return null;
+  }
+  if (geometry.type === "Polygon") return checkPolygon(geometry.coordinates);
+  if (geometry.type === "MultiPolygon") {
+    if (!Array.isArray(geometry.coordinates) || !geometry.coordinates.length) return "多面至少需要一个面。";
+    for (const polygon of geometry.coordinates) {
+      const issue = checkPolygon(polygon);
+      if (issue) return issue;
+    }
+    return null;
+  }
+  return "暂不支持编辑这种几何类型。";
 }
 
 async function finishDraft() {
@@ -2933,6 +3218,44 @@ document.getElementById("baseMapBtn").addEventListener("click", () => {
   syncMapMode();
   setNotice(state.baseMapEnabled ? "已显示在线地图底图。" : "已隐藏在线地图底图。");
 });
+document.getElementById("baseMapStyle").value = state.baseMapStyle;
+tileLayer.classList.toggle("basemap-clean", state.baseMapStyle === "clean");
+document.getElementById("baseMapStyle").addEventListener("change", (event) => {
+  setFallbackMapStyle(event.target.value);
+  setNotice(state.baseMapStyle === "clean" ? "已切换到浅色地图。" : "已切换到带道路和地名标注的详细地图。");
+});
+document.getElementById("cityJump").addEventListener("change", async (event) => {
+  const view = CITY_VIEWS[event.target.value];
+  if (!view) return;
+  event.target.value = "";
+  if (!state.geographic) await openMapDemo();
+  if (!state.geographic) {
+    setNotice("请先导入 WGS 84 经纬度数据，再使用真实地图定位。");
+    return;
+  }
+  state.baseMapEnabled = true;
+  syncMapMode();
+  focusGeographicLocation(view.lon, view.lat, 12);
+  setNotice(`已定位到${view.name}。滚轮或＋－可以继续放大查看道路与地名。`);
+});
+document.getElementById("mapTypeSelect").addEventListener("change", (event) => {
+  setOfficialMapType(event.target.value);
+  const names = { standard: "标准地图", satellite: "卫星图与路网", traffic: "实时路况" };
+  setNotice(`已切换到${names[event.target.value] || "标准地图"}。`);
+});
+document.getElementById("placeSearchForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const query = document.getElementById("placeSearchInput").value.trim();
+  if (!query) return;
+  if (!state.geographic) await openMapDemo();
+  if (!state.geographic) {
+    setNotice("请先导入 WGS 84 经纬度数据，再搜索地点。");
+    return;
+  }
+  state.baseMapEnabled = true;
+  syncMapMode();
+  searchOfficialPlace(query);
+});
 document.getElementById("openMapDemoBtn").addEventListener("click", openMapDemo);
 document.getElementById("fileInput").addEventListener("change", (event) => {
   const files = Array.from(event.target.files || []);
@@ -3077,28 +3400,32 @@ document.getElementById("deleteSelectionBtn").addEventListener("click", async ()
   }
 });
 
-document.getElementById("saveBtn").addEventListener("click", () => {
-  setNotice("新增、修改、删除会自动保存到当前数据集；无需重复保存叠加图层。");
-});
-
 document.getElementById("resetBtn").addEventListener("click", async () => {
-  await api("/api/reset", { method: "POST" });
-  clearEditHistory();
-  state.selectedIds.clear();
-  state.draft = [];
-  state.draftHover = null;
-  state.dirty = false;
-  exitGeometryEdit();
-  state.attributePage = 1;
-  syncDraftControls();
-  await loadDatasets();
-  await loadStatus();
-  state.visibleDatasetIds.add(state.activeDataset.id);
-  await loadData();
-  syncMapMode();
-  fitView();
-  setNotice("数据已重置为示例内容。 ");
-  draw();
+  if (!window.confirm("重置会覆盖内置示例数据并切换到该数据集，且无法撤销。其他已导入数据集不会删除。确定继续吗？")) return;
+  const button = document.getElementById("resetBtn");
+  button.disabled = true;
+  try {
+    await api("/api/reset", { method: "POST" });
+    clearEditHistory();
+    state.selectedIds.clear();
+    state.draft = [];
+    state.draftHover = null;
+    state.dirty = false;
+    exitGeometryEdit();
+    state.attributePage = 1;
+    syncDraftControls();
+    await Promise.all([loadDatasets(), loadStatus()]);
+    state.visibleDatasetIds = new Set([state.activeDataset.id]);
+    state.knownLayers.clear();
+    await loadData();
+    syncMapMode();
+    fitView();
+    setNotice("已切换并重置内置示例数据；其他数据集未删除。");
+  } catch (error) {
+    setNotice(`重置失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 /* ---------- 底部属性表抽屉的交互 ---------- */
@@ -3206,6 +3533,7 @@ loadDatasets().then(() => Promise.all([loadData(), loadStatus()])).then(() => {
   resizeCanvas();
   syncMapMode();
   fitView();
+  initializeOfficialMap();
 }).catch((error) => {
   document.getElementById("backendStatus").textContent = `连接失败：${error.message}`;
   document.getElementById("statusDot").className = "status-dot error";

@@ -198,3 +198,122 @@ test("C 组浏览器流程：字段默认值、绘制、属性、历史、排序
     await stopServer(child);
   }
 });
+
+test("无 Key 时仍可切换详细底图并快速定位城市", { timeout: 60000 }, async () => {
+  const { child, baseUrl } = await startServer();
+  let browser;
+  try {
+    const channel = process.env.GIS_BROWSER_CHANNEL ||
+      (process.platform === "win32" ? "msedge" : undefined);
+    browser = await chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
+    const page = await browser.newPage({ viewport: { width: 1500, height: 960 } });
+    const transparentPng = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l1cAAAAASUVORK5CYII=", "base64");
+    await page.route(/tile\.openstreetmap\.org\/\d+\/\d+\/\d+\.png/, (route) => route.fulfill({
+      status: 200, contentType: "image/png", body: transparentPng,
+    }));
+    await page.goto(baseUrl);
+    await page.locator("#openMapDemoBtn").click();
+    await page.waitForFunction(() => document.getElementById("baseMapBtn").disabled === false);
+    assert.equal(await page.locator("#baseMapStyle").inputValue(), "detailed");
+    await page.waitForFunction(() => document.querySelector("#baseMapTiles img")?.src.includes("tile.openstreetmap.org"));
+    assert.equal(await page.locator("#officialMapTools").isVisible(), false);
+    assert.match(await page.locator("#mapAttribution").textContent(), /OpenStreetMap/);
+    await page.locator("#cityJump").selectOption("beijing");
+    await page.waitForFunction(() => document.getElementById("hint").textContent.includes("已定位到北京"));
+    await page.locator("#baseMapStyle").selectOption("clean");
+    assert.equal(await page.locator("#baseMapTiles").evaluate((element) => element.classList.contains("basemap-clean")), true);
+  } finally {
+    if (browser) await browser.close();
+    await stopServer(child);
+  }
+});
+
+test("隐藏图层在字段保存后保持隐藏，重置需要确认", { timeout: 60000 }, async () => {
+  const { child, baseUrl } = await startServer();
+  let browser;
+  try {
+    const channel = process.env.GIS_BROWSER_CHANNEL ||
+      (process.platform === "win32" ? "msedge" : undefined);
+    browser = await chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
+    const page = await browser.newPage({ viewport: { width: 1500, height: 960 } });
+    await page.goto(baseUrl);
+    await page.waitForFunction(() => document.querySelector("#layerList .layer-row input"));
+    await page.locator("#layerList .layer-row input").first().uncheck();
+    await page.locator("#addFieldBtn").click();
+    await page.locator("#newFieldName").fill("reviewed");
+    await page.locator("#confirmFieldBtn").click();
+    await page.locator("#addFieldDialog").waitFor({ state: "hidden" });
+    assert.equal(await page.locator("#layerList .layer-row input").first().isChecked(), false);
+    const dataAfterEdit = (await (await page.request.get(`${baseUrl}/api/datasets/features`)).json()).data;
+    assert.equal(dataAfterEdit.field_types.reviewed, "text");
+
+    page.once("dialog", (dialog) => dialog.dismiss());
+    await page.locator("#resetBtn").click();
+    const dataAfterCancel = (await (await page.request.get(`${baseUrl}/api/datasets/features`)).json()).data;
+    assert.equal(dataAfterCancel.field_types.reviewed, "text");
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.locator("#resetBtn").click();
+    await page.waitForFunction(() => document.getElementById("hint").textContent.includes("已切换并重置"));
+    const resetData = (await (await page.request.get(`${baseUrl}/api/datasets/features`)).json()).data;
+    assert.equal(resetData.field_types?.reviewed, undefined);
+  } finally {
+    if (browser) await browser.close();
+    await stopServer(child);
+  }
+});
+
+test("配置官方 Key 后可加载地图、切换图层和搜索地点", { timeout: 60000 }, async () => {
+  const { child, baseUrl } = await startServer();
+  let browser;
+  try {
+    const channel = process.env.GIS_BROWSER_CHANNEL ||
+      (process.platform === "win32" ? "msedge" : undefined);
+    browser = await chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
+    const page = await browser.newPage({ viewport: { width: 1500, height: 960 } });
+    await page.route(`${baseUrl}/api/map-config`, (route) => route.fulfill({
+      json: { enabled: true, key: "public-test-key", service_host: "/_AMapService" },
+    }));
+    await page.route(/webapi\.amap\.com\/maps\?/, (route) => route.fulfill({
+      status: 200, contentType: "application/javascript", body: `
+        window.AMap = {
+          Map: class {
+            constructor() { this.events = {}; window.__mockMap = this;
+              setTimeout(() => this.events.complete?.(), 10); }
+            on(name, callback) { this.events[name] = callback; }
+            resize() {} setZoomAndCenter(zoom, center) { this.zoom = zoom; this.center = center; }
+            setMapStyle(style) { this.style = style; }
+            setLayers(layers) { this.layers = layers; }
+            add(marker) { this.marker = marker; }
+            remove() {} destroy() {}
+          },
+          TileLayer: class {},
+          Marker: class { constructor(options) { this.options = options; } },
+          PlaceSearch: class { search(_query, callback) { callback("complete", {
+            poiList: { pois: [{ name: "北京大学", location: { lng: 116.31, lat: 39.99 } }] }
+          }); } },
+          plugin(_name, callback) { callback(); }
+        };
+        AMap.TileLayer.Satellite = class {};
+        AMap.TileLayer.RoadNet = class {};
+        AMap.TileLayer.Traffic = class {};
+      `,
+    }));
+    await page.goto(baseUrl);
+    await page.locator("#officialMapTools").waitFor({ state: "visible" });
+    const security = await page.evaluate(() => window._AMapSecurityConfig);
+    assert.equal(security.serviceHost, `${baseUrl}/_AMapService`);
+    assert.equal(JSON.stringify(security).includes("private"), false);
+    await page.locator("#openMapDemoBtn").click();
+    await page.waitForFunction(() => document.getElementById("baseMapBtn").disabled === false);
+    await page.locator("#mapTypeSelect").selectOption("satellite");
+    assert.equal(await page.evaluate(() => window.__mockMap.layers.length), 2);
+    await page.locator("#placeSearchInput").fill("北京大学");
+    await page.locator("#placeSearchForm button").click();
+    await page.waitForFunction(() => document.getElementById("hint").textContent.includes("已定位到：北京大学"));
+    assert.ok(await page.evaluate(() => window.__mockMap.zoom >= 12));
+  } finally {
+    if (browser) await browser.close();
+    await stopServer(child);
+  }
+});

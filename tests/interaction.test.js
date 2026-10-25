@@ -81,6 +81,21 @@ test("new polygons reject crossing edges and zero area without rejecting concave
   assert.equal(evaluate('polygonDraftError([[0,0],[2,0],[2,2],[1,1],[0,2]])'), null);
 });
 
+test("geometry edits reject bow ties, invalid holes and collapsed lines before saving", () => {
+  const issue = (geometry) => evaluate(`editedGeometryError(${JSON.stringify(geometry)})`);
+  const outer = [[0, 0], [8, 0], [8, 8], [0, 8], [0, 0]];
+  const inner = [[2, 2], [3, 2], [3, 3], [2, 3], [2, 2]];
+  assert.equal(issue({ type: "Polygon", coordinates: [outer, inner] }), null);
+  assert.match(issue({ type: "Polygon", coordinates: [[[0, 0], [4, 4], [0, 4], [4, 0], [0, 0]]] }), /相交/);
+  assert.match(issue({ type: "Polygon", coordinates: [outer,
+    [[7, 7], [9, 7], [9, 9], [7, 9], [7, 7]]] }), /外环内/);
+  assert.match(issue({ type: "LineString", coordinates: [[1, 1], [1, 1]] }), /重合/);
+  assert.equal(issue({ type: "MultiPoint", coordinates: [[1, 2], [3, 4]] }), null);
+  evaluate("state.geographic = true");
+  assert.match(issue({ type: "Point", coordinates: [181, 30] }), /超出地图范围/);
+  evaluate("state.geographic = false");
+});
+
 test("attribute sorting is numeric, stable, and keeps empty values last", () => {
   evaluate(`
     state.data.features = [
