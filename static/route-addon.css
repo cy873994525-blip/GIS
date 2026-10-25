@@ -30,3 +30,87 @@
 .route-addon-data button,.route-addon-data label {display:inline-block;font-size:11px;padding:5px 8px;border:1px solid #d2dcd9;border-radius:6px;color:#346e68;background:white;margin:7px 4px 0 0;cursor:pointer}
 .route-addon-data p {font-size:10px;line-height:1.5;color:#7e9090;margin:9px 0 0}
 .route-addon-data a {color:#247b73}
+/* 障碍面操作区 */
+#routeAddonPanel {
+  max-height: calc(100% - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+#routeAddonPanel button:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+#routeAddonPanel [hidden] {
+  display: none !important;
+}
+
+.route-addon-obstacles {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid #edc8be;
+  border-radius: 9px;
+  background: #fff8f4;
+}
+
+.route-addon-obstacle-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+#routeAddonObstacleCount {
+  font-size: 11px;
+  color: #8c6359;
+}
+
+#routeAddonPanel .route-addon-obstacle-add {
+  width: 100%;
+  padding: 7px 10px;
+  color: #a74735;
+  border-color: #dcad9e;
+  background: #fff0e8;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+#routeAddonPanel .route-addon-obstacle-add[aria-pressed="true"] {
+  background: #fbdcc8;
+}
+
+.route-addon-obstacle-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+#routeAddonPanel .route-addon-obstacle-controls button {
+  padding: 5px 7px;
+  font-size: 11px;
+}
+
+#routeAddonPanel #routeAddonObstacleFinish {
+  color: #fff;
+  background: #aa4a38;
+  border-color: #aa4a38;
+}
+
+#routeAddonObstacleHint,
+.route-addon-obstacle-note {
+  font-size: 11px;
+  line-height: 1.6;
+  color: #88675c;
+  margin: 8px 0 0;
+}
+
+.route-addon-data label.disabled {
+  opacity: .45;
+  pointer-events: none;
+  cursor: not-allowed;
+}
