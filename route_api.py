@@ -101,7 +101,7 @@ def handle_routing_request(handler, method):
             query = parse_qs(urlsplit(handler.path).query)
             dataset_id = (query.get('dataset_id') or [None])[0] or None
             graph, _meta = _load_graph(dataset_id)
-            handler.send_json(graph.shortest_path(payload['start'], payload['end']))
+            handler.send_json(graph.shortest_path(payload['start'], payload['end'], payload.get('obstacles', [])))
         elif path == '/api/routing/network' and method == 'POST':
             payload = handler.read_json_body()
             graph = Network(payload)  # validation occurs before replacing stored road data
