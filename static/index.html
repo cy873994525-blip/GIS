@@ -3,9 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GIS 矢量数据编辑 Demo</title>
+  <title>GIS 矢量工作台与沉降回剥分析</title>
+  <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css">
   <link rel="stylesheet" href="/static/styles.css">
   <link rel="stylesheet" href="/static/route-addon.css?v=20261023-obstacles">
+  <link rel="stylesheet" href="/static/backstrip-integration.css?v=20261026a">
 </head>
 <body>
   <div class="app-shell">
@@ -42,6 +44,8 @@
             <small>支持 GeoJSON / JSON、Shapefile ZIP 或配套 .shp/.shx/.dbf/.prj/.cpg 文件</small>
           </label>
           <button id="openMapDemoBtn" class="map-example-button" type="button">打开真实地图示例</button>
+          <button id="openSongliaoWellsBtn" class="map-example-button map-example-button-secondary" type="button">载入松辽井位训练数据</button>
+          <p class="form-tip">训练井为课程演示用虚构数据；回剥结果会写入井位属性，并同步到沉降速率专题图。</p>
           <p class="form-tip">WGS 84 经纬度数据可叠加在线地图；配置高德 Key 后可使用官方地图。模拟或未转换的投影坐标仍使用平面画布。</p>
           <div id="datasetImportStatus" class="dataset-import-status" aria-live="polite"></div>
           <div id="datasetList" class="dataset-list"></div>
@@ -155,6 +159,17 @@
           <div id="amapBase" class="amap-base" aria-hidden="true" hidden></div>
           <div id="baseMapTiles" class="basemap-tiles" aria-hidden="true"></div>
           <canvas id="mapCanvas" aria-label="地图画布"></canvas>
+          <div id="mapView" class="arcgis-map-view" aria-label="ArcGIS 沉降专题地图" hidden></div>
+          <div class="map-view-switch" role="group" aria-label="地图视图切换">
+            <button id="canvasMapBtn" type="button" class="map-view-tab active" aria-pressed="true">GIS 编辑地图</button>
+            <button id="arcgisMapBtn" type="button" class="map-view-tab" aria-pressed="false">ArcGIS 沉降专题图</button>
+          </div>
+          <div id="arcgisLegend" class="arcgis-legend" hidden>
+            <strong>沉降速率</strong>
+            <span><i class="legend-swatch slow"></i>慢</span>
+            <span><i class="legend-swatch medium"></i>中</span>
+            <span><i class="legend-swatch fast"></i>快</span>
+          </div>
           <div class="map-badge"><span class="live-dot"></span><span id="mapBadgeText">模拟平面坐标系</span></div>
           <div id="coordinateReadout" class="coordinate-readout">坐标 —</div>
           <div class="map-north-arrow" aria-label="指北针" title="北"><span>N</span><i></i></div>
@@ -169,6 +184,81 @@
       </section>
 
       <aside class="attribute-panel">
+        <section id="backstripPanel" class="backstrip-panel">
+          <div class="section-heading">
+            <h2>沉降回剥分析</h2>
+            <span class="section-kicker">BACKSTRIP</span>
+          </div>
+          <p class="form-tip">地层按新到老录入；年龄为每层底界年龄，深度单位为 m。</p>
+          <div class="formation-table-wrap">
+            <table class="formation-table">
+              <thead>
+                <tr>
+                  <th>地层名</th><th>顶深</th><th>底深</th><th>年龄</th><th>岩性</th><th aria-label="删除"></th>
+                </tr>
+              </thead>
+              <tbody id="formationRows"></tbody>
+            </table>
+          </div>
+          <button id="addFormationBtn" type="button" class="text-button backstrip-add">+ 添加地层</button>
+          <div class="backstrip-options">
+            <label>古水深 (m，逗号分隔)
+              <input id="paleoWaterDepthInput" type="text" placeholder="25, 40, 55, 75">
+            </label>
+            <label>海平面变化 (m，逗号分隔)
+              <input id="seaLevelInput" type="text" placeholder="0, 5, -10, -20">
+            </label>
+          </div>
+          <div class="backstrip-actions">
+            <button id="runBackstripBtn" class="primary" type="button">开始回剥计算</button>
+            <button id="loadBackstripExampleBtn" type="button">载入示例数据</button>
+          </div>
+          <div id="backstripStatus" class="backstrip-status" aria-live="polite">等待输入地层数据。</div>
+          <div id="backstripMapLink" class="backstrip-map-link">
+            <div class="backstrip-map-link-heading">
+              <strong>回剥结果 ↔ 井位地图</strong>
+              <span id="backstripMapLinkState">尚未计算</span>
+            </div>
+            <p id="backstripMapLinkText">载入松辽井位训练数据后，计算结果会保存到井位属性，并同步到 ArcGIS 沉降专题图。当前单套地层输入会把同一结果赋给训练井点；真实空间差异需逐井录入地层数据。</p>
+            <button id="showAnalysisAttributesBtn" type="button" disabled>查看地图点属性</button>
+          </div>
+          <div id="backstripMetrics" class="backstrip-metrics" hidden>
+            <div><span>总原始厚度</span><strong id="backstripThickness">—</strong><small>m</small></div>
+            <div><span>末期构造沉降</span><strong id="backstripTectonic">—</strong><small>m</small></div>
+            <div><span>平均沉降速率</span><strong id="backstripRate">—</strong><small>m/Ma</small></div>
+          </div>
+          <div class="backstrip-result-actions">
+            <button id="downloadBackstripBtn" type="button" disabled>导出回剥 JSON</button>
+          </div>
+          <div class="backstrip-rate-table-wrap">
+            <table class="backstrip-rate-table">
+              <thead><tr><th>年龄区间 (Ma)</th><th>构造速率 (m/Ma)</th></tr></thead>
+              <tbody id="backstripRateRows"><tr><td colspan="2">尚无计算结果</td></tr></tbody>
+            </table>
+          </div>
+          <div class="backstrip-chart"><canvas id="burialChart" aria-label="埋藏史图"></canvas></div>
+          <div class="backstrip-chart"><canvas id="subsidenceChart" aria-label="构造沉降与负载沉降图"></canvas></div>
+          <section id="backstripProfileSection" class="backstrip-profile-section" hidden>
+            <div class="section-heading profile-heading">
+              <h3>地质剖面回剥演示</h3>
+              <span class="section-kicker">PROFILE</span>
+            </div>
+            <p class="form-tip">对比现今压实剖面与不同地质年龄的去压实重建；灰色表示该时代尚未沉积的年轻地层。</p>
+            <div class="backstrip-profile-controls">
+              <button id="backstripProfilePlayBtn" type="button" class="primary" aria-pressed="false">播放回剥</button>
+              <button id="backstripProfileResetBtn" type="button">回到现在</button>
+              <label class="profile-slider-label" for="backstripProfileSlider">地质时间
+                <input id="backstripProfileSlider" type="range" min="0" max="0" step="1" value="0">
+              </label>
+              <strong id="backstripProfileStageLabel">现在</strong>
+            </div>
+            <div id="backstripProfileDetail" class="backstrip-profile-detail">计算后可查看现今与回剥重建剖面。</div>
+            <div class="backstrip-profile-chart">
+              <canvas id="backstripProfileCanvas" aria-label="现今压实地层与回剥重建地层剖面对比图"></canvas>
+            </div>
+            <div class="backstrip-profile-note">颜色代表岩性；播放方向为现在 → 老年代。</div>
+          </section>
+        </section>
         <section>
           <div class="section-heading">
             <h2>选中要素</h2>
@@ -287,7 +377,15 @@
     </form>
   </dialog>
 
-  <script src="/static/app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <!-- Chart.js must load before ArcGIS installs its AMD loader. -->
+  <script src="https://js.arcgis.com/4.29/"></script>
+  <script src="/static/app.js?v=backstrip-20261026a"></script>
   <script src="/static/route-addon.js?v=20261023-obstacles"></script>
+  <script src="/static/backstrip.js?v=backstrip-20261026a"></script>
+  <script src="/static/plotModule.js?v=backstrip-20261026a"></script>
+  <script src="/static/mapModule.js?v=backstrip-20261026a"></script>
+  <script src="/static/backstrip-profile.js?v=backstrip-20261026a"></script>
+  <script src="/static/backstrip-panel.js?v=backstrip-20261026a"></script>
 </body>
 </html>

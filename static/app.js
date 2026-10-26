@@ -75,6 +75,8 @@ const state = {
   baseMapEnabled: true,
   baseMapStyle: savedBasemapStyle,
   baseMapErrorShown: false,
+  mapViewMode: "canvas",
+  rateExtent: null,
   layerOrder: [],
   layerStyles: {},
   snapEnabled: true,
@@ -159,6 +161,25 @@ function rgbaFromHex(hex, alpha) {
   if (!/^[0-9a-f]{6}$/i.test(value)) return `rgba(23, 109, 106, ${alpha})`;
   const channels = [0, 2, 4].map((index) => parseInt(value.slice(index, index + 2), 16));
   return `rgba(${channels.join(", ")}, ${alpha})`;
+}
+
+function rateExtentForFeatures(features) {
+  const values = features.map((feature) => feature.properties?.rate)
+    .filter((value) => value !== null && value !== undefined && value !== "")
+    .map(Number)
+    .filter(Number.isFinite);
+  return values.length ? { min: Math.min(...values), max: Math.max(...values) } : null;
+}
+
+function subsidenceRateColor(rate) {
+  const extent = state.rateExtent || { min: rate, max: rate };
+  const t = extent.max === extent.min
+    ? 0.5
+    : Math.max(0, Math.min(1, (rate - extent.min) / (extent.max - extent.min)));
+  const from = t < 0.5 ? [23, 125, 220] : [255, 215, 0];
+  const to = t < 0.5 ? [255, 215, 0] : [220, 50, 47];
+  const amount = t < 0.5 ? t * 2 : (t - 0.5) * 2;
+  return `rgb(${from.map((channel, index) => Math.round(channel + (to[index] - channel) * amount)).join(", ")})`;
 }
 
 loadLayerPreferences();
@@ -318,7 +339,55 @@ function syncMapMode() {
   attribution.href = officialMap.ready ? "https://www.amap.com/" : "https://www.openstreetmap.org/copyright";
   attribution.textContent = officialMap.ready ? "© 高德地图" : "© OpenStreetMap contributors";
   canvas.classList.toggle("with-basemap", enabled);
+  if (state.mapViewMode === "arcgis") setMapViewMode("arcgis", false);
   draw();
+}
+
+/** Toggle the editable Canvas map and the ArcGIS rate-themed map in the same stage. */
+function setMapViewMode(mode, refresh = true) {
+  const showArcgis = mode === "arcgis";
+  state.mapViewMode = showArcgis ? "arcgis" : "canvas";
+  const mapCanvas = document.getElementById("mapCanvas");
+  const mapView = document.getElementById("mapView");
+  const legend = document.getElementById("arcgisLegend");
+  if (mapCanvas) mapCanvas.hidden = showArcgis;
+  if (mapView) mapView.hidden = !showArcgis;
+  const hasRates = state.data.features.some((feature) => {
+    const value = feature.properties?.rate;
+    return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
+  });
+  if (legend) legend.hidden = !hasRates;
+
+  document.querySelectorAll(".map-view-tab").forEach((button) => {
+    const active = (button.id === "arcgisMapBtn") === showArcgis;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+
+  const badge = document.getElementById("mapBadgeText");
+  if (badge) {
+    badge.textContent = showArcgis
+      ? "ArcGIS 专题图 · 沉降速率"
+      : (state.geographic
+        ? (state.baseMapEnabled ? "WGS 84 经纬度 · 在线底图" : "WGS 84 经纬度 · 底图已关闭")
+        : "模拟 / 投影坐标 · 平面画布");
+  }
+
+  if (showArcgis && refresh) {
+    const mapModule = window.MapModule;
+    const resize = () => {
+      if (mapModule?.view && typeof mapModule.view.resize === "function") mapModule.view.resize();
+      if (mapModule?.lastWells?.length && typeof mapModule.focusOnWells === "function") {
+        mapModule.focusOnWells(mapModule.lastWells);
+      }
+    };
+    if (mapModule?.ready && typeof mapModule.ready.then === "function") {
+      mapModule.ready.then(resize).catch(() => {});
+    } else {
+      resize();
+    }
+  }
+  return state.mapViewMode;
 }
 
 function renderBasemapTiles() {
@@ -705,6 +774,7 @@ async function loadData() {
     state.activeDataset ? activeDatasetData() : Promise.resolve(null),
   ]);
   state.data = layerData;
+  state.rateExtent = rateExtentForFeatures(state.data.features);
   state.declaredFieldTypes = activeRaw ? (activeRaw.field_types || {}) : {};
   state.declaredFieldDefaults = activeRaw ? (activeRaw.field_defaults || {}) : {};
   state.activeFieldTypes = activeRaw
@@ -857,6 +927,42 @@ async function openMapDemo() {
     setNotice(`打开地图示例失败：${error.message}`);
   } finally {
     button.disabled = false;
+  }
+}
+
+/* Import or activate the course's WGS 84 Songliao training-well dataset. */
+async function openSongliaoWells() {
+  const button = document.getElementById("openSongliaoWellsBtn");
+  if (button) button.disabled = true;
+  state.baseMapEnabled = true;
+  try {
+    await loadDatasets();
+    const existing = state.datasets.find((dataset) => {
+      const fileName = String(dataset.file_name || "").toLowerCase();
+      const name = String(dataset.name || "").toLowerCase();
+      return fileName === "songliao-wells.geojson" ||
+        fileName === "songliao-wells.json" ||
+        (name.includes("松辽") && name.includes("井"));
+    });
+
+    if (existing) {
+      await activateDataset(existing.id, { isolate: true });
+    } else {
+      const response = await fetch("/static/songliao-wells.geojson");
+      if (!response.ok) throw new Error("无法读取松辽井位训练数据");
+      const file = new File([await response.blob()], "songliao-wells.geojson", {
+        type: "application/geo+json",
+      });
+      await importDataset(file, { isolate: true });
+    }
+    setMapViewMode("canvas");
+    setNotice("已载入松辽盆地井位训练数据（虚构课程示例）。回剥计算后结果将保存到这些井位属性。");
+    return getAnalysisTargetInfo().features.length;
+  } catch (error) {
+    setNotice(`载入松辽井位训练数据失败：${error.message}`);
+    throw error;
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -1970,6 +2076,9 @@ function drawFeature(feature) {
   const style = layerStyle(layer);
   const color = style.color;
   const opacity = style.opacity;
+  const rawRate = feature.properties?.rate;
+  const hasRate = rawRate !== null && rawRate !== undefined && rawRate !== "" && Number.isFinite(Number(rawRate));
+  const markerColor = hasRate ? subsidenceRateColor(Number(rawRate)) : color;
 
   ctx.save();
   ctx.lineJoin = "round";
@@ -1982,8 +2091,8 @@ function drawFeature(feature) {
   if (geom.type === "Point") {
     const p = worldToScreen(geom.coordinates);
     ctx.beginPath();
-    ctx.arc(p.x, p.y, selected ? 8 : 6, 0, Math.PI * 2);
-    ctx.fillStyle = selected ? "#f2c94c" : color;
+    ctx.arc(p.x, p.y, selected ? 8 : hasRate ? 8 : 6, 0, Math.PI * 2);
+    ctx.fillStyle = selected ? "#f2c94c" : markerColor;
     ctx.fill();
     ctx.strokeStyle = "#ffffff";
     ctx.lineWidth = 2;
@@ -3576,6 +3685,110 @@ document.getElementById("attributeTableBody").addEventListener("keydown", (event
   event.preventDefault();
   selectAttributeTableRow(event);
 });
+
+/* Backstrip adapter: keep GeoJSON, Canvas editing, attribute table and /api/save on one data path. */
+window.GisApp = {
+  getAnalysisTargetInfo() {
+    const points = state.data.features.filter((feature) =>
+      feature.geometry?.type === "Point" && isEditableFeature(feature));
+    const wells = points.filter((feature) => {
+      const properties = feature.properties || {};
+      const wellId = properties.wellId ?? properties.well_id ?? properties.WELL_ID;
+      const label = `${properties.layer || ""} ${properties.name || ""}`;
+      return (wellId !== undefined && wellId !== null && String(wellId).trim() !== "") ||
+        /井位|井点|训练井|钻井|well|borehole/i.test(label);
+    });
+    // Do not write basin results into arbitrary point layers such as cities or POIs.
+    return { features: wells, isFallback: false };
+  },
+
+  getPointFeatures() {
+    return this.getAnalysisTargetInfo().features;
+  },
+
+  selectFeatureById(id) {
+    if (id === undefined || id === null) return false;
+    const target = state.data.features.find((feature) => {
+      if (String(feature.id) === String(id)) return true;
+      const properties = feature.properties || {};
+      return [properties.wellId, properties.well_id, properties.WELL_ID]
+        .some((value) => value !== undefined && String(value) === String(id));
+    });
+    if (!target || !isEditableFeature(target)) return false;
+    selectFeatures([target.id]);
+    return true;
+  },
+
+  showAnalysisMap() {
+    setMapViewMode("arcgis");
+    const mapModule = window.MapModule;
+    if (mapModule?.ready && typeof mapModule.ready.then === "function") {
+      mapModule.ready.then((view) => {
+        if (!view) {
+          setMapViewMode("canvas");
+          setNotice("ArcGIS SDK 当前不可用；回剥结果和速率配色仍可在 GIS 编辑地图中查看。");
+          return;
+        }
+        view.resize?.();
+        if (mapModule.lastWells?.length) mapModule.focusOnWells?.(mapModule.lastWells);
+      }).catch(() => {
+        setMapViewMode("canvas");
+        setNotice("ArcGIS 专题图暂时不可用；回剥结果仍保存在井位属性中。");
+      });
+    }
+    return true;
+  },
+
+  showAnalysisAttributes() {
+    const features = this.getAnalysisTargetInfo().features.filter(isEditableFeature);
+    if (!features.length) {
+      setNotice("当前数据集中没有可查看的井位点，请先载入松辽井位训练数据。");
+      return 0;
+    }
+    selectFeatures(features.map((feature) => feature.id));
+    state.attributeFilter = "selected";
+    state.attributePage = 1;
+    document.querySelectorAll(".filter-button").forEach((button) => {
+      button.classList.toggle("active", button.dataset.filter === "selected");
+    });
+    renderAttributeTable();
+    state.drawerOpen = true;
+    const drawer = document.getElementById("attributeDrawer");
+    drawer.classList.remove("collapsed");
+    document.getElementById("drawerToggleBtn").setAttribute("aria-expanded", "true");
+    drawer.scrollIntoView({ behavior: "smooth", block: "start" });
+    setNotice(`已选中 ${features.length} 个分析井位，可在属性表查看 tectonicSubsidence 和 rate。`);
+    return features.length;
+  },
+
+  async loadSongliaoWells() {
+    return openSongliaoWells();
+  },
+
+  async updateWellAnalysis({ tectonicSubsidence, rate }) {
+    const targetInfo = this.getAnalysisTargetInfo();
+    const pointFeatures = targetInfo.features.filter(isEditableFeature);
+    if (!pointFeatures.length) return [];
+    const pointIds = new Set(pointFeatures.map((feature) => String(feature.id)));
+    const tectonicValue = Number(tectonicSubsidence);
+    const rateValue = Number(rate);
+    if (!Number.isFinite(tectonicValue) || !Number.isFinite(rateValue)) {
+      throw new Error("回剥沉降值和速率必须是有效数字。");
+    }
+    await persistActiveFeatures((data) => {
+      for (const feature of data.features) {
+        if (!pointIds.has(String(feature.id))) continue;
+        feature.properties = feature.properties || {};
+        feature.properties.tectonicSubsidence = tectonicValue;
+        feature.properties.rate = rateValue;
+      }
+    }, `已将回剥结果写入 ${pointFeatures.length} 个井位要素。`);
+    return this.getAnalysisTargetInfo().features.filter(isEditableFeature);
+  },
+};
+
+document.getElementById("canvasMapBtn")?.addEventListener("click", () => setMapViewMode("canvas"));
+document.getElementById("arcgisMapBtn")?.addEventListener("click", () => window.GisApp.showAnalysisMap());
 
 window.addEventListener("resize", resizeCanvas);
 
