@@ -23,7 +23,6 @@ from pathlib import Path
 import json
 import math
 import mimetypes
-import os
 import re
 import io
 import sys
@@ -31,10 +30,8 @@ import struct
 import uuid
 import zipfile
 import base64
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, parse_qsl, urlencode, unquote, urlsplit, quote
-from urllib.request import Request, urlopen
-from route_api import handle_routing_request
+from urllib.parse import parse_qs, unquote, urlsplit
+
 
 # 兼容层：str.removeprefix / str.removesuffix 是 Python 3.9 才有的，
 # 本机与部分演示环境只有 3.8（本机为 3.8.8），直接用会让
@@ -71,18 +68,6 @@ MAX_IMPORT_BYTES = 20 * 1024 * 1024
 MAX_FEATURES = 10000
 MAX_ZIP_MEMBERS = 32
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
-AMAP_PROXY_PREFIX = "/_AMapService/"
-
-
-def amap_public_config():
-    """Expose the browser key, but never send the security code to the browser."""
-    key = os.environ.get("GIS_AMAP_JS_KEY", "").strip()
-    security_code = os.environ.get("GIS_AMAP_SECURITY_JS_CODE", "").strip()
-    return {
-        "enabled": bool(key and security_code),
-        "key": key if key and security_code else "",
-        "service_host": "/_AMapService",
-    }
 
 
 SAMPLE_DATA = {
@@ -133,47 +118,6 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def infer_field_types(payload):
-    """扫描要素属性，推断每字段类型：boolean / number / text（与 C 组 field_types 命名一致）。
-
-    全部布尔 → boolean；全部数值（int/float，非 bool）→ number；否则 → text。
-    None 值不参与判定；无属性或空数据集返回 {}。
-    """
-    fields = {}
-    for feature in payload.get("features", []):
-        for name, value in (feature.get("properties") or {}).items():
-            if value is None:
-                continue
-            if name not in fields:
-                fields[name] = None  # None 表示尚未确定
-            current = fields[name]
-            if current == "text":
-                continue
-            if isinstance(value, bool):
-                inferred = "boolean"
-            elif isinstance(value, (int, float)):
-                inferred = "number"
-            else:
-                inferred = "text"
-            if current is None:
-                fields[name] = inferred
-            elif current != inferred:
-                fields[name] = "text"
-    return {name: kind for name, kind in fields.items() if kind is not None}
-
-
-def field_value_matches_type(value, kind):
-    if value is None:
-        return True
-    if kind == "text":
-        return isinstance(value, str)
-    if kind == "number":
-        return type(value) in (int, float) and (
-            not isinstance(value, float) or math.isfinite(value)
-        )
-    return isinstance(value, bool)
-
-
 def validate_feature_collection(payload):
     if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
         raise ValueError("payload must be a GeoJSON FeatureCollection")
@@ -182,28 +126,8 @@ def validate_feature_collection(payload):
         raise ValueError("features must be a list")
     if len(features) > MAX_FEATURES:
         raise ValueError(f"feature count cannot exceed {MAX_FEATURES}")
-    field_types = payload.get("field_types", {})
-    if not isinstance(field_types, dict) or any(
-        not isinstance(name, str) or not name or kind not in {"text", "number", "boolean"}
-        for name, kind in field_types.items()
-    ):
-        raise ValueError("field_types must map field names to text, number or boolean")
-    field_defaults = payload.get("field_defaults", {})
-    if not isinstance(field_defaults, dict) or any(name not in field_types for name in field_defaults):
-        raise ValueError("field_defaults must refer to declared field_types")
-    for name, value in field_defaults.items():
-        kind = field_types[name]
-        if not field_value_matches_type(value, kind):
-            raise ValueError(f"default for field {name} must be {kind}")
     for feature in features:
         validate_feature(feature)
-        properties = feature.get("properties", {})
-        for name, kind in field_types.items():
-            if name not in properties or properties[name] is None:
-                continue
-            value = properties[name]
-            if not field_value_matches_type(value, kind):
-                raise ValueError(f"field {name} must contain {kind} values")
     return payload
 
 
@@ -219,7 +143,6 @@ def validate_feature(feature):
     geometry_type = feature["geometry"].get("type")
     if geometry_type not in {
         "Point",
-        "MultiPoint",
         "LineString",
         "Polygon",
         "MultiLineString",
@@ -248,12 +171,6 @@ def validate_geometry_coordinates(geometry_type, coordinates):
         return
     if geometry_type == "Point":
         validate_position(coordinates)
-        return
-    if geometry_type == "MultiPoint":
-        if not isinstance(coordinates, list) or not coordinates:
-            raise ValueError("MultiPoint must contain at least one position")
-        for position in coordinates:
-            validate_position(position)
         return
     if geometry_type == "LineString":
         if not isinstance(coordinates, list) or len(coordinates) < 2:
@@ -326,102 +243,6 @@ def calculate_bbox(payload):
     ]
 
 
-def declared_or_inferred_field_types(payload):
-    """catalog 的字段类型：用户显式声明（payload 顶层 field_types）优先，
-    未声明时才按属性值自动推断（infer_field_types）。避免推断值覆盖用户设定。
-    """
-    declared = payload.get("field_types")
-    if isinstance(declared, dict) and any(
-        isinstance(name, str) and name and kind in {"text", "number", "boolean"}
-        for name, kind in declared.items()
-    ):
-        return {
-            name: kind
-            for name, kind in declared.items()
-            if isinstance(name, str) and name and kind in {"text", "number", "boolean"}
-        }
-    return infer_field_types(payload)
-
-
-def assess_dataset_quality(dataset_id):
-    """对标 GIS 的数据检查：重复 ID、空几何、非法坐标、字段值与声明类型不符。
-
-    正常入库会拦截大部分坏数据，但手工编辑或外部写入的文件仍可能有残留问题，
-    因此这里宽松读取（不走 validate_feature_collection），逐要素宽松检查。
-    返回结构化质量报告（issues 最多保留 20 条示例，统计数完整）。
-    """
-    dataset = find_dataset(dataset_id)
-    payload = json.loads(dataset_path(dataset).read_text(encoding="utf-8"))
-    features = payload.get("features")
-    if not isinstance(features, list):
-        return {
-            "ok": True, "dataset_id": dataset_id, "name": dataset.get("name"),
-            "feature_count": 0, "declared_field_types": {},
-            "quality": {"duplicate_ids": {}, "empty_geometries": 0,
-                        "invalid_coordinates": 0, "type_mismatches": 0, "issues": []},
-            "summary": "数据集文件结构异常：features 不是数组",
-        }
-    declared = dataset.get("field_types") or {}
-    seen_ids = {}
-    issues = []
-    empty_geometries = 0
-    invalid_coordinates = 0
-    type_mismatch_count = 0
-    for feature in features:
-        feature_id = feature.get("id")
-        seen_ids[feature_id] = seen_ids.get(feature_id, 0) + 1
-        geometry = feature.get("geometry") or {}
-        if (not isinstance(geometry, dict) or not geometry.get("type")
-                or geometry.get("coordinates") in (None, [], {})):
-            empty_geometries += 1
-            if len(issues) < 20:
-                issues.append({"feature_id": feature_id, "kind": "empty_geometry", "message": "要素缺少有效几何"})
-            continue
-        try:
-            validate_geometry_coordinates(geometry["type"], geometry.get("coordinates"))
-        except (ValueError, TypeError) as exc:
-            invalid_coordinates += 1
-            if len(issues) < 20:
-                issues.append({"feature_id": feature_id, "kind": "invalid_coordinates", "message": str(exc)})
-        properties = feature.get("properties") or {}
-        for name, kind in declared.items():
-            value = properties.get(name)
-            if value is None:
-                continue
-            if not field_value_matches_type(value, kind):
-                type_mismatch_count += 1
-                if len(issues) < 20:
-                    issues.append({
-                        "feature_id": feature_id, "kind": "type_mismatch",
-                        "field": name, "expected": kind,
-                        "message": f"字段 {name} 声明为 {kind}，实际为 {type(value).__name__}",
-                    })
-    duplicates = {feature_id: count for feature_id, count in seen_ids.items() if count > 1}
-    problems = empty_geometries + invalid_coordinates + type_mismatch_count + len(duplicates)
-    if problems == 0:
-        summary = f"数据质量良好：{len(features)} 个要素，未发现重复 ID、空几何、坐标或字段类型问题"
-    else:
-        summary = (
-            f"发现 {problems} 个问题：重复 ID {len(duplicates)} 处、空几何 {empty_geometries} 个、"
-            f"坐标非法 {invalid_coordinates} 处、字段类型不符 {type_mismatch_count} 处"
-        )
-    return {
-        "ok": True,
-        "dataset_id": dataset_id,
-        "name": dataset.get("name"),
-        "feature_count": len(features),
-        "declared_field_types": declared,
-        "quality": {
-            "duplicate_ids": duplicates,
-            "empty_geometries": empty_geometries,
-            "invalid_coordinates": invalid_coordinates,
-            "type_mismatches": type_mismatch_count,
-            "issues": issues,
-        },
-        "summary": summary,
-    }
-
-
 def dataset_summary(
     dataset_id,
     file_name,
@@ -454,7 +275,6 @@ def dataset_summary(
         "path": path_name,
         "crs": crs_name or "Unknown",
         "crs_kind": crs_kind,
-        "field_types": declared_or_inferred_field_types(payload),
         "source_note": source_note or "坐标系未提供",
     }
 
@@ -685,17 +505,15 @@ SHAPE_BASE_TYPE = {
     1: "Point",
     3: "LineString",
     5: "Polygon",
-    8: "MultiPoint",
     11: "Point",
     13: "LineString",
     15: "Polygon",
-    18: "MultiPoint",
     21: "Point",
     23: "LineString",
     25: "Polygon",
-    28: "MultiPoint",
 }
 SUPPORTED_SHAPE_TYPES = set(SHAPE_BASE_TYPE)
+MULTIPOINT_TYPES = {8, 18, 28}  # MultiPoint / MultiPointZ / MultiPointM（暂不支持渲染）
 
 
 def ring_signed_area(ring):
@@ -771,6 +589,10 @@ def read_shp_records(shp_bytes):
     if len(shp_bytes) < 100:
         raise ValueError("SHP file is too short")
     declared_type = struct.unpack_from("<i", shp_bytes, 32)[0]
+    if declared_type in MULTIPOINT_TYPES:
+        raise ValueError(
+            "当前 Demo 暂不支持 MultiPoint 图层；请在 GIS 软件中把多点要素转为点/线后重新导出"
+        )
     if declared_type not in SUPPORTED_SHAPE_TYPES:
         raise ValueError(f"unsupported Shapefile geometry type: {declared_type}")
     features = []
@@ -790,7 +612,7 @@ def read_shp_records(shp_bytes):
             continue
         if record_type not in SUPPORTED_SHAPE_TYPES:
             raise ValueError(f"unsupported Shapefile geometry type: {record_type}")
-        has_z = record_type in {11, 13, 15, 18}
+        has_z = record_type in {11, 13, 15}
         if record_type in {1, 11, 21}:
             # Point / PointZ / PointM
             x, y = struct.unpack_from("<dd", shp_bytes, content_start + 4)
@@ -801,36 +623,6 @@ def read_shp_records(shp_bytes):
                 z, = struct.unpack_from("<d", shp_bytes, content_start + 20)
                 coordinates.append(z)
             geometry = {"type": "Point", "coordinates": coordinates}
-        elif record_type in {8, 18, 28}:
-            # MultiPoint / MultiPointZ / MultiPointM：box + numPoints + points
-            if content_start + 40 > content_end:
-                raise ValueError(f"SHP record {record_number} has an invalid header")
-            num_points, = struct.unpack_from("<i", shp_bytes, content_start + 36)
-            if num_points == 0:
-                # 空 MultiPoint：记录只有 type + numPoints，无 box/Z 数据
-                geometry = {"type": "MultiPoint", "coordinates": []}
-            else:
-                if content_start + 40 > content_end:
-                    raise ValueError(f"SHP record {record_number} has an invalid header")
-                points_offset = content_start + 40
-                expected_end = points_offset + num_points * 16
-                if expected_end > content_end:
-                    raise ValueError(f"SHP record {record_number} coordinate data is truncated")
-                points = [
-                    list(struct.unpack_from("<dd", shp_bytes, points_offset + index * 16))
-                    for index in range(num_points)
-                ]
-                if has_z:
-                    z_array_start = expected_end + 16  # 跳过 zmin/zmax
-                    z_array_end = z_array_start + num_points * 8
-                    if z_array_end > content_end:
-                        raise ValueError(f"SHP record {record_number} Z data is truncated")
-                    z_values = [
-                        struct.unpack_from("<d", shp_bytes, z_array_start + index * 8)[0]
-                        for index in range(num_points)
-                    ]
-                    points = [point + [z] for point, z in zip(points, z_values)]
-                geometry = {"type": "MultiPoint", "coordinates": points}
         elif record_type in {3, 5, 13, 15, 23, 25}:
             # PolyLine / Polygon（及 Z/M 变体）：几何头布局相同，
             # Z 类型的 Z 数组位于点数组之后。
@@ -989,371 +781,6 @@ def convert_shapefile_parts(file_name, main_bytes, sidecars):
     return payload, crs_name, f"{base_name}.shp", crs_kind, crs_wkt
 
 
-# ---------------------------------------------------------------------------
-# Shapefile 导出（GeoJSON → .shp/.shx/.dbf/.prj 打包 ZIP）
-# ---------------------------------------------------------------------------
-# 仅依赖 Python 标准库。支持 Point(1)、PolyLine(3)、Polygon(5)、MultiPoint(8)，
-# 坐标取前两维（忽略 Z）。属性写入 dBase III（.dbf），字符字段按 UTF-8 编码
-# 并附带 .cpg=UTF-8，可被本模块的 read_dbf_records 读回（roundtrip）。
-SHAPE_EXPORT_TYPES = {1: "Point", 3: "PolyLine", 5: "Polygon", 8: "MultiPoint"}
-PRJ_WGS84_WKT = (
-    'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",'
-    'SPHEROID["WGS_1984",6378137.0,298.257223563]],'
-    'PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]'
-)
-
-
-def _feature_base_kind(geometry):
-    """返回要素几何的导出基类：Point / MultiPoint / Line / Polygon。"""
-    geom_type = (geometry or {}).get("type")
-    if geom_type == "Point":
-        return "Point"
-    if geom_type == "MultiPoint":
-        return "MultiPoint"
-    if geom_type in {"LineString", "MultiLineString"}:
-        return "Line"
-    if geom_type in {"Polygon", "MultiPolygon"}:
-        return "Polygon"
-    raise ValueError(f"不支持导出的几何类型: {geom_type}")
-
-
-def _walk_xy(coordinates):
-    """递归产出所有 (x, y) 坐标对（只取前两维）。"""
-    if (
-        isinstance(coordinates, list)
-        and len(coordinates) >= 2
-        and all(isinstance(item, (int, float)) for item in coordinates[:2])
-    ):
-        yield (coordinates[0], coordinates[1])
-    elif isinstance(coordinates, list):
-        for child in coordinates:
-            yield from _walk_xy(child)
-
-
-def _bbox_of_payload(payload):
-    xs, ys = [], []
-    for feature in payload.get("features", []):
-        for x, y in _walk_xy((feature.get("geometry") or {}).get("coordinates")):
-            xs.append(x)
-            ys.append(y)
-    if not xs:
-        return (0.0, 0.0, 0.0, 0.0)
-    return (min(xs), min(ys), max(xs), max(ys))
-
-
-def _line_parts_for(geometry):
-    """把线/面几何转成 parts 列表；每个 part 是一组 (x, y, z)，z 缺失补 0。"""
-    def row(point):
-        return (point[0], point[1], point[2] if len(point) > 2 else 0.0)
-
-    geom_type = geometry["type"]
-    coords = geometry["coordinates"]
-    if geom_type == "LineString":
-        return [[row(p) for p in coords]]
-    if geom_type == "MultiLineString":
-        return [[row(p) for p in part] for part in coords]
-    if geom_type == "Polygon":
-        return [[row(p) for p in ring] for ring in coords]
-    if geom_type == "MultiPolygon":
-        return [
-            [row(p) for p in ring]
-            for poly in coords
-            for ring in poly
-        ]
-    raise ValueError(f"不支持导出的几何类型: {geom_type}")
-
-
-def _coordinates_have_z(coordinates):
-    """递归判断坐标是否携带第三维（Z）。"""
-    if (
-        isinstance(coordinates, list)
-        and len(coordinates) >= 3
-        and all(isinstance(item, (int, float)) for item in coordinates[:3])
-    ):
-        return True
-    if isinstance(coordinates, list):
-        return any(_coordinates_have_z(child) for child in coordinates)
-    return False
-
-
-def _shapefile_type_for(geoms):
-    kinds = {_feature_base_kind(geom) for geom in geoms}
-    if len(kinds) > 1:
-        raise ValueError("混合几何类型（点/线/面）不能导出为单个 Shapefile 图层；请先按类型拆分数据集")
-    kind = kinds.pop() if kinds else "Point"
-    base = {"Point": 1, "MultiPoint": 8, "Line": 3, "Polygon": 5}[kind]
-    has_z = any(_coordinates_have_z(geom.get("coordinates")) for geom in geoms)
-    if has_z:
-        return {1: 11, 8: 18, 3: 13, 5: 15}[base]  # PointZ/MultiPointZ/PolyLineZ/PolygonZ
-    return base
-
-
-def _encode_shp_record_content(shp_type, geometry):
-    """编码单个 Shapefile 记录内容（含类型号），返回 bytes。Z 变体（11/13/15/18）
-    在坐标后附加 zmin/zmax + z 数组；缺 Z 的坐标补 0。"""
-    kind = _feature_base_kind(geometry)
-    if shp_type in (1, 11):  # Point / PointZ
-        coords = geometry["coordinates"]
-        if shp_type == 1:
-            return struct.pack("<idd", 1, coords[0], coords[1])
-        z = coords[2] if len(coords) > 2 else 0.0
-        return struct.pack("<iddd", 11, coords[0], coords[1], z)
-    if shp_type in (8, 18):  # MultiPoint / MultiPointZ
-        points = [(p[0], p[1], p[2] if len(p) > 2 else 0.0) for p in geometry["coordinates"]]
-        if not points:
-            raise ValueError("MultiPoint must contain at least one position")
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        header = struct.pack("<i4di", shp_type, min(xs), min(ys), max(xs), max(ys), len(points))
-        body = b"".join(struct.pack("<dd", x, y) for x, y, _z in points)
-        if shp_type == 18:
-            zs = [p[2] for p in points]
-            header += struct.pack("<2d", min(zs), max(zs))
-            body += b"".join(struct.pack("<d", z) for z in zs)
-        return header + body
-    if shp_type in (3, 5, 13, 15):  # PolyLine / Polygon (+Z)
-        parts = _line_parts_for(geometry)
-        points = [(p[0], p[1]) for part in parts for p in part]
-        if not points:
-            raise ValueError("线/面要素没有有效坐标")
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        num_parts = len(parts)
-        num_points = len(points)
-        header = struct.pack(
-            "<i4dii",
-            shp_type,
-            min(xs), min(ys), max(xs), max(ys),
-            num_parts,
-            num_points,
-        )
-        parts_bytes = b"".join(struct.pack("<i", index) for index in range(num_parts))
-        points_bytes = b"".join(struct.pack("<dd", x, y) for x, y in points)
-        if shp_type in (13, 15):
-            zs = [p[2] for part in parts for p in part]
-            header += struct.pack("<2d", min(zs), max(zs))
-            points_bytes += b"".join(struct.pack("<d", z) for z in zs)
-        return header + parts_bytes + points_bytes
-    raise ValueError(f"不支持导出的 Shapefile 类型: {shp_type}")
-
-
-def _shp_file_bytes(shp_type, records):
-    """records: [(geometry, props)]，返回 .shp 与 .shx 字节。"""
-    contents = []
-    for geometry, _props in records:
-        contents.append(_encode_shp_record_content(shp_type, geometry))
-
-    shp_body = bytearray()
-    shx_body = bytearray()
-    offset_words = 50  # 从文件头之后开始计（shp 记录偏移以 16-bit word 计）
-    total_words = 50
-    for content in contents:
-        content_words = len(content) // 2
-        record_number = len(shx_body) // 8 + 1
-        shp_body.extend(struct.pack(">ii", record_number, content_words))
-        shp_body.extend(content)
-        shx_body.extend(struct.pack(">ii", offset_words, content_words))
-        offset_words += 4 + content_words
-        total_words += 4 + content_words
-
-    shp_header = bytearray(100)
-    struct.pack_into(">i", shp_header, 0, 9994)
-    struct.pack_into(">i", shp_header, 24, total_words)
-    struct.pack_into("<i", shp_header, 28, 1000)
-    struct.pack_into("<i", shp_header, 32, shp_type)
-    xs, ys = [], []
-    for geometry, _props in records:
-        for x, y in _walk_xy(geometry["coordinates"]):
-            xs.append(x)
-            ys.append(y)
-    if xs:
-        struct.pack_into("<4d", shp_header, 36, min(xs), min(ys), max(xs), max(ys))
-    shp_bytes = bytes(shp_header) + bytes(shp_body)
-
-    shx_header = bytearray(100)
-    struct.pack_into(">i", shx_header, 0, 9994)
-    struct.pack_into(">i", shx_header, 24, 50 + len(shx_body) // 8)
-    struct.pack_into("<i", shx_header, 28, 1000)
-    struct.pack_into("<i", shx_header, 32, shp_type)
-    if xs:
-        struct.pack_into("<4d", shx_header, 36, min(xs), min(ys), max(xs), max(ys))
-    shx_bytes = bytes(shx_header) + bytes(shx_body)
-    return shp_bytes, shx_bytes
-
-
-def _dbf_field_lengths(values):
-    """按值推断 dBase 字段类型与长度。返回 (type_char, length, decimals)。"""
-    non_null = [v for v in values if v is not None]
-    if not non_null:
-        return "C", 1, 0
-    if all(isinstance(v, bool) for v in non_null):
-        return "L", 1, 0
-    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in non_null):
-        text_lengths = [len(f"{v:g}") for v in non_null]
-        decimals = max(
-            (len(f"{v:g}".split(".")[1]) if "." in f"{v:g}" else 0) for v in non_null
-        )
-        return "N", max(1, min(254, max(text_lengths))), decimals
-    texts = [str(v) for v in non_null]
-    # dBase 字段长度按字节计；中文字符经 UTF-8 编码后占 3 字节，需按字节数计算
-    return "C", max(1, min(254, max(len(t.encode("utf-8")) for t in texts))), 0
-
-
-def _encode_dbf(features):
-    """把要素属性写成 dBase III（UTF-8），返回 .dbf 字节。"""
-    field_names = []
-    for feature in features:
-        for name in (feature.get("properties") or {}):
-            if name not in field_names:
-                field_names.append(name)
-    if not field_names:
-        field_names = ["name"]
-    fields = []  # (原始字段名, dBase类型, 长度, 小数位)
-    for name in field_names:
-        values = [((feature.get("properties") or {}).get(name)) for feature in features]
-        type_char, length, decimals = _dbf_field_lengths(values)
-        fields.append((name, type_char, length, decimals))
-    record_count = len(features)
-    header_length = 32 + 32 * len(fields) + 1
-    record_length = 1 + sum(field[2] for field in fields)
-    header = bytearray(header_length)
-    header[0] = 0x03
-    header[1:4] = (2026 & 0xFF, 10, 18)  # 最后更新日期 YY MM DD
-    struct.pack_into("<I", header, 4, record_count)
-    struct.pack_into("<H", header, 8, header_length)
-    struct.pack_into("<H", header, 10, record_length)
-    offset = 32
-    for name, type_char, length, decimals in fields:
-        desc = bytearray(32)
-        raw_name = name.encode("utf-8")[:10]
-        if not raw_name:
-            raw_name = b"f1"
-        desc[: len(raw_name)] = raw_name
-        desc[11] = ord(type_char)
-        desc[16] = length
-        desc[17] = decimals
-        header[offset : offset + 32] = desc
-        offset += 32
-    header[offset] = 0x0D
-    dbf = bytes(header)
-    for feature in features:
-        properties = feature.get("properties") or {}
-        record = bytearray(record_length)
-        record[0] = 0x20
-        cursor = 1
-        for name, type_char, length, decimals in fields:
-            value = properties.get(name)
-            slot = record[cursor : cursor + length]
-            if type_char == "L":
-                slot[0] = 0x54 if value in (True, 1, "1", "true", "T", "t") else 0x46  # T/F
-            elif type_char == "N":
-                if value is None:
-                    slot[:] = b" " * length
-                else:
-                    text = f"{value:g}".encode("utf-8")
-                    slot[length - len(text) :] = text  # 右对齐
-            else:
-                if value is None:
-                    slot[:] = b" " * length
-                else:
-                    text = str(value).encode("utf-8")
-                    slot[: len(text)] = text
-            record[cursor : cursor + length] = slot
-            cursor += length
-        dbf += bytes(record)
-    dbf += b"\x1a"
-    return dbf
-
-
-def export_shapefile_zip(payload):
-    """把 FeatureCollection 导出为 Shapefile ZIP，返回 zip 字节。"""
-    features = [f for f in payload.get("features", []) if f.get("geometry")]
-    if not features:
-        raise ValueError("没有可导出的要素")
-    shp_type = _shapefile_type_for([f["geometry"] for f in features])
-    records = [(f["geometry"], f.get("properties") or {}) for f in features]
-    shp_bytes, shx_bytes = _shp_file_bytes(shp_type, records)
-    dbf_bytes = _encode_dbf(features)
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("export.shp", shp_bytes)
-        archive.writestr("export.shx", shx_bytes)
-        archive.writestr("export.dbf", dbf_bytes)
-        archive.writestr("export.prj", PRJ_WGS84_WKT)
-        archive.writestr("export.cpg", "UTF-8")
-    return buffer.getvalue()
-
-
-def _position_wkt(position):
-    text = f"{position[0]} {position[1]}"
-    if len(position) > 2 and isinstance(position[2], (int, float)):
-        text += f" {position[2]}"
-    return text
-
-
-def _geometry_wkt(geometry):
-    """手写简化 WKT（不依赖 shapely），供 CSV 导出的几何列使用。"""
-    geom_type = geometry["type"]
-    coords = geometry["coordinates"]
-    if geom_type == "Point":
-        return f"POINT ({_position_wkt(coords)})"
-    if geom_type == "MultiPoint":
-        return "MULTIPOINT (" + ", ".join(_position_wkt(p) for p in coords) + ")"
-    if geom_type == "LineString":
-        return "LINESTRING (" + ", ".join(_position_wkt(p) for p in coords) + ")"
-    if geom_type == "MultiLineString":
-        return "MULTILINESTRING (" + ", ".join(
-            "(" + ", ".join(_position_wkt(p) for p in part) + ")" for part in coords
-        ) + ")"
-    if geom_type == "Polygon":
-        return "POLYGON (" + ", ".join(
-            "(" + ", ".join(_position_wkt(p) for p in ring) + ")" for ring in coords
-        ) + ")"
-    if geom_type == "MultiPolygon":
-        return "MULTIPOLYGON (" + ", ".join(
-            "(" + ", ".join(
-                "(" + ", ".join(_position_wkt(p) for p in ring) + ")" for ring in polygon
-            ) + ")" for polygon in coords
-        ) + ")"
-    raise ValueError(f"不支持导出的几何类型: {geom_type}")
-
-
-def export_csv_bytes(payload):
-    """把 FeatureCollection 导出为 CSV（UTF-8 带 BOM，便于 Excel 打开中文）。
-
-    列 = 属性字段并集 + geometry_type + wkt；几何以 WKT 表示（对标 GIS 属性表导出）。
-    """
-    import csv as csv_module
-
-    features = payload.get("features", [])
-    field_names = []
-    for feature in features:
-        for name in (feature.get("properties") or {}):
-            if name not in field_names:
-                field_names.append(name)
-    rows = []
-    for feature in features:
-        row = []
-        properties = feature.get("properties") or {}
-        for name in field_names:
-            value = properties.get(name)
-            row.append("" if value is None else value)
-        geometry = feature.get("geometry")
-        if geometry:
-            row.append(geometry.get("type"))
-            row.append(_geometry_wkt(geometry))
-        else:
-            row.append("")
-            row.append("")
-        rows.append(row)
-    buffer = io.StringIO()
-    writer = csv_module.writer(buffer)
-    writer.writerow([*field_names, "geometry_type", "wkt"])
-    writer.writerows(rows)
-    text = buffer.getvalue()
-    return b"\xef\xbb\xbf" + text.encode("utf-8")
-
-
 def write_json_atomic(path, payload):
     temp_file = path.with_suffix(".tmp")
     temp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1391,22 +818,7 @@ def ensure_storage():
 
 def read_catalog():
     ensure_storage()
-    catalog = json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
-    # 惰性回填：老记录缺 field_types 时按存储文件重算并写回，之后不再重复读取
-    changed = False
-    for dataset in catalog.get("datasets", []):
-        if "field_types" in dataset:
-            continue
-        try:
-            path = dataset_path(dataset)
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            dataset["field_types"] = infer_field_types(payload)
-            changed = True
-        except (KeyError, OSError, ValueError):
-            dataset["field_types"] = {}
-    if changed:
-        write_json_atomic(CATALOG_FILE, catalog)
-    return catalog
+    return json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
 
 
 def write_catalog(catalog):
@@ -1527,41 +939,6 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
     def send_error_json(self, message, status=400):
         self.send_json({"ok": False, "error": message}, status=status)
 
-    def proxy_amap_service(self, path):
-        """Same-origin proxy for official JS API services; keep jscode server-side."""
-        security_code = os.environ.get("GIS_AMAP_SECURITY_JS_CODE", "").strip()
-        if not amap_public_config()["enabled"]:
-            self.send_error_json("高德官方地图尚未配置", status=503)
-            return
-        tail = path[len("/_AMapService"):]
-        if not re.fullmatch(r"/(?:v3|v4|v5)/[A-Za-z0-9/_-]+", tail) or ".." in tail:
-            self.send_error_json("不支持的高德服务路径", status=404)
-            return
-        parsed = urlsplit(self.path)
-        params = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-                  if key.lower() != "jscode"]
-        params.append(("jscode", security_code))
-        host = "https://webapi.amap.com" if tail.startswith("/v4/map/styles") else "https://restapi.amap.com"
-        upstream_url = host + tail + "?" + urlencode(params)
-        try:
-            response = urlopen(Request(upstream_url, headers={"User-Agent": "GISClassroomDemo/1.0"}), timeout=10)
-        except HTTPError as error:
-            response = error
-        except (URLError, TimeoutError, OSError):
-            self.send_error_json("高德服务暂时不可用", status=502)
-            return
-        with response:
-            body = response.read(8 * 1024 * 1024 + 1)
-            if len(body) > 8 * 1024 * 1024:
-                self.send_error_json("高德服务响应过大", status=502)
-                return
-            self.send_response(response.status)
-            self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
     def read_json_body(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length > MAX_REQUEST_BYTES:
@@ -1570,15 +947,7 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
         return json.loads(raw or "{}")
 
     def do_GET(self):
-        if handle_routing_request(self, "GET"):
-            return
         path = urlsplit(self.path).path
-        if path == "/api/map-config":
-            self.send_json(amap_public_config())
-            return
-        if path.startswith(AMAP_PROXY_PREFIX):
-            self.proxy_amap_service(path)
-            return
         if path == "/api/layers":
             query = parse_qs(urlsplit(self.path).query)
             ids = [item for item in (query.get("ids") or [""])[0].split(",") if item]
@@ -1589,55 +958,14 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/export":
-            query = parse_qs(urlsplit(self.path).query)
-            export_format = (query.get("format") or ["geojson"])[0].lower()
-            ids = [item.strip() for item in (query.get("ids") or [""])[0].split(",") if item.strip()]
-            if ids:
-                # 多数据集合并导出：read_layers 会给要素附加 layer/dataset_id 标记
-                payload = read_layers(ids)
-                dataset_label = "多数据集"
-            else:
-                active_dataset, payload = read_dataset()
-                dataset_label = active_dataset.get("name") or active_dataset.get("id")
-            safe_label = "".join(
-                ch for ch in str(dataset_label) if ch not in '\\/:*?"<>|'
-            ).strip() or "export"
-            safe_label = re.sub(r"\s+", "_", safe_label)
-            # HTTP 头只允许 latin-1：ASCII 文件名作回退，中文名走 RFC 5987 filename*
-            def disposition(filename):
-                ascii_fallback = filename.encode("ascii", "ignore").decode("ascii").strip("-_") or "export"
-                return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quote(filename)}'
-
-            if export_format == "csv":
-                try:
-                    body = export_csv_bytes(payload)
-                except ValueError as exc:
-                    self.send_error_json(str(exc))
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "text/csv; charset=utf-8")
-                self.send_header("Content-Disposition", disposition(f"{safe_label}.csv"))
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            if export_format == "shapefile":
-                try:
-                    body = export_shapefile_zip(payload)
-                except ValueError as exc:
-                    self.send_error_json(str(exc))
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", disposition(f"{safe_label}-shapefile.zip"))
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
+            active_dataset, payload = read_dataset()
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/geo+json; charset=utf-8")
-            self.send_header("Content-Disposition", disposition(f"{safe_label}-export.geojson"))
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{active_dataset["id"]}-export.geojson"',
+            )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1658,16 +986,6 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             return
 
         if path.startswith("/api/datasets/"):
-            if path.endswith("/quality"):
-                dataset_id = unquote(remove_prefix(path, "/api/datasets/").removesuffix("/quality")).strip("/")
-                if not dataset_id:
-                    self.send_error_json("missing dataset id", status=400)
-                    return
-                try:
-                    self.send_json(assess_dataset_quality(dataset_id))
-                except KeyError as exc:
-                    self.send_error_json(str(exc), status=404)
-                return
             dataset_id = unquote(remove_prefix(path, "/api/datasets/")).strip("/")
             if dataset_id:
                 dataset, payload = read_dataset(dataset_id)
@@ -1694,8 +1012,6 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
-        if handle_routing_request(self, "POST"):
-            return
         path = urlsplit(self.path).path
         try:
             if path == "/api/features":
@@ -1849,8 +1165,6 @@ class GisDemoHandler(SimpleHTTPRequestHandler):
             self.send_error_json(str(exc), status=status)
 
     def do_DELETE(self):
-        if handle_routing_request(self, "DELETE"):
-            return
         path = urlsplit(self.path).path
         try:
             if path.startswith("/api/datasets/"):

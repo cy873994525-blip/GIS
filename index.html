@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GIS 井位与沉降回剥分析工作台</title>
+  <!-- ArcGIS MapView 的内部画布、控件和弹窗布局依赖官方主题样式。 -->
+  <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css">
+  <link rel="stylesheet" href="/static/styles.css?v=backstrip-20261013p">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="eyebrow">VECTOR LAB · GIS DEMO</div>
+        <h1>GIS 井位与沉降回剥工作台</h1>
+        <p>在 ArcGIS 地图中管理井位，并把盆地回剥结果写回属性和专题符号</p>
+      </div>
+      <div class="data-summary" aria-label="数据概览">
+        <div><strong id="featureCount">0</strong><span>要素</span></div>
+        <div><strong id="layerCount">0</strong><span>图层</span></div>
+        <div><strong id="selectionCount">0</strong><span>已选</span></div>
+      </div>
+      <div class="top-actions">
+        <button id="saveBtn" class="primary"><span class="button-icon">↥</span>保存</button>
+        <a class="button" href="/api/export">导出 GeoJSON</a>
+        <button id="resetBtn">重置数据</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <section>
+          <div class="section-heading">
+            <h2>数据文件</h2>
+            <span id="datasetCountLabel" class="section-kicker">0 FILES</span>
+          </div>
+          <label class="file-picker">
+            <span>导入地图数据</span>
+            <input id="fileInput" type="file" multiple accept=".geojson,.json,.zip,.shp,.shx,.dbf,.prj,.cpg,application/geo+json,application/json,application/zip,application/octet-stream">
+            <small>支持 GeoJSON / JSON、Shapefile ZIP 或配套 .shp/.shx/.dbf/.prj/.cpg 文件</small>
+          </label>
+          <button id="openMapDemoBtn" class="map-example-button" type="button">打开真实地图示例</button>
+          <button id="openSongliaoWellsBtn" class="map-example-button map-example-button-secondary" type="button">载入松辽井位训练数据</button>
+          <p class="form-tip">WGS 84 经纬度数据会自动叠加在线底图；“松辽井位训练数据”为课程演示用虚构数据。</p>
+          <div id="datasetImportStatus" class="dataset-import-status" aria-live="polite"></div>
+          <div id="datasetList" class="dataset-list"></div>
+          <div id="activeDatasetMeta" class="dataset-meta">正在读取数据文件...</div>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>图层</h2>
+            <div class="section-actions">
+              <button id="showAllBtn" class="text-button">全显</button>
+              <button id="hideAllBtn" class="text-button">全隐</button>
+            </div>
+          </div>
+          <div id="layerList" class="layer-list"></div>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>绘制属性</h2>
+            <span class="section-kicker">NEW FEATURE</span>
+          </div>
+          <label>
+            名称
+            <input id="nameInput" type="text" value="新要素" maxlength="40" placeholder="例如：北门">
+          </label>
+          <label>
+            原始图层字段
+            <input id="layerInput" type="text" list="layerOptions" value="兴趣点" maxlength="20">
+          </label>
+          <p class="form-tip">先设置属性，再选择“画点 / 画线 / 画面”。地图按数据集分组显示；这里的图层字段写入源文件。画线、画面可双击或按 Enter 完成。</p>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>后端状态</h2>
+            <span id="statusDot" class="status-dot pending"></span>
+          </div>
+          <div id="backendStatus" class="status">正在连接...</div>
+        </section>
+      </aside>
+
+      <section class="map-panel">
+        <div class="toolbar" role="toolbar" aria-label="地图工具">
+          <div class="tool-group">
+            <span class="toolbar-label">浏览</span>
+            <button data-mode="pan" class="tool active">漫游</button>
+            <button data-mode="select" class="tool">点选</button>
+            <button data-mode="box" class="tool">框选</button>
+          </div>
+          <div class="tool-group">
+            <span class="toolbar-label">编辑</span>
+            <button data-mode="point" class="tool">画点</button>
+            <button data-mode="line" class="tool">画线</button>
+            <button data-mode="polygon" class="tool">画面</button>
+            <button id="finishBtn" class="accent-button">完成绘制</button>
+            <button id="undoDraftBtn" class="draft-button" disabled>撤销节点</button>
+            <button id="cancelDraftBtn" class="draft-button" disabled>取消绘制</button>
+          </div>
+          <div class="tool-group">
+            <span class="toolbar-label">几何</span>
+            <button data-mode="edit" class="tool">编辑几何</button>
+            <button id="undoGeometryBtn" class="draft-button" disabled>撤销几何</button>
+            <button id="endEditBtn" class="draft-button" disabled>结束编辑</button>
+            <button id="snapBtn" class="tool active" type="button" aria-pressed="true" title="绘制和拖动节点时吸附到已有要素的节点或边">吸附：开</button>
+          </div>
+          <div class="tool-group view-tools">
+            <span class="toolbar-label">视图</span>
+            <button id="zoomInBtn" aria-label="放大">＋</button>
+            <button id="zoomOutBtn" aria-label="缩小">－</button>
+            <button id="fitBtn">全图</button>
+          </div>
+          <div class="tool-group">
+            <span class="toolbar-label">底图</span>
+            <button id="baseMapBtn" type="button" aria-pressed="false" disabled>在线地图</button>
+          </div>
+        </div>
+        <div class="map-stage">
+          <div id="baseMapTiles" class="basemap-tiles" aria-hidden="true"></div>
+          <canvas id="mapCanvas" aria-label="地图画布"></canvas>
+          <div id="mapView" class="arcgis-map-view" aria-label="ArcGIS 沉降专题地图" hidden></div>
+          <div class="map-view-switch" role="group" aria-label="地图视图切换">
+            <button id="canvasMapBtn" type="button" class="map-view-tab active">GIS 编辑地图</button>
+            <button id="arcgisMapBtn" type="button" class="map-view-tab">ArcGIS 沉降专题图</button>
+          </div>
+          <div id="arcgisLegend" class="arcgis-legend" hidden>
+            <strong>沉降速率</strong>
+            <span><i class="legend-swatch slow"></i>慢</span>
+            <span><i class="legend-swatch medium"></i>中</span>
+            <span><i class="legend-swatch fast"></i>快</span>
+          </div>
+          <div class="map-badge"><span class="live-dot"></span><span id="mapBadgeText">模拟平面坐标系</span></div>
+          <div id="coordinateReadout" class="coordinate-readout">坐标 —</div>
+          <a id="mapAttribution" class="map-attribution" href="https://www.amap.com/" target="_blank" rel="noopener noreferrer" hidden>© 高德地图</a>
+        </div>
+        <div id="hint" class="hint">当前：漫游。拖拽移动地图，滚轮缩放。</div>
+      </section>
+
+      <aside class="attribute-panel">
+        <section id="backstripPanel" class="backstrip-panel">
+          <div class="section-heading">
+            <h2>沉降回剥分析</h2>
+            <span class="section-kicker">BACKSTRIP</span>
+          </div>
+          <p class="form-tip">地层按新到老录入；年龄为每层底界年龄，深度单位为 m。</p>
+          <div class="formation-table-wrap">
+            <table class="formation-table">
+              <thead>
+                <tr>
+                  <th>地层名</th>
+                  <th>顶深</th>
+                  <th>底深</th>
+                  <th>年龄</th>
+                  <th>岩性</th>
+                  <th aria-label="删除"></th>
+                </tr>
+              </thead>
+              <tbody id="formationRows"></tbody>
+            </table>
+          </div>
+          <button id="addFormationBtn" type="button" class="text-button backstrip-add">+ 添加地层</button>
+          <div class="backstrip-options">
+            <label>古水深 (m，逗号分隔)
+              <input id="paleoWaterDepthInput" type="text" placeholder="20, 35, 50, 80">
+            </label>
+            <label>海平面变化 (m，逗号分隔)
+              <input id="seaLevelInput" type="text" placeholder="0, 5, -10, 0">
+            </label>
+          </div>
+          <div class="backstrip-actions">
+            <button id="runBackstripBtn" class="primary" type="button">开始回剥计算</button>
+            <button id="loadBackstripExampleBtn" type="button">载入示例数据</button>
+          </div>
+          <div id="backstripStatus" class="backstrip-status" aria-live="polite">等待输入地层数据。</div>
+          <div id="backstripMapLink" class="backstrip-map-link">
+            <div class="backstrip-map-link-heading">
+              <strong>回剥结果 ↔ 井位地图</strong>
+              <span id="backstripMapLinkState">尚未计算</span>
+            </div>
+            <p id="backstripMapLinkText">载入松辽井位训练数据后，计算结果会写入井位属性，并同步到 ArcGIS 沉降专题图。</p>
+            <button id="showAnalysisAttributesBtn" type="button" disabled>查看地图点属性</button>
+          </div>
+          <div id="backstripMetrics" class="backstrip-metrics" hidden>
+            <div><span>总原始厚度</span><strong id="backstripThickness">—</strong><small>m</small></div>
+            <div><span>末期构造沉降</span><strong id="backstripTectonic">—</strong><small>m</small></div>
+            <div><span>平均沉降速率</span><strong id="backstripRate">—</strong><small>m/Ma</small></div>
+          </div>
+          <div class="backstrip-result-actions">
+            <button id="downloadBackstripBtn" type="button" disabled>导出回剥 JSON</button>
+          </div>
+          <div class="backstrip-rate-table-wrap">
+            <table class="backstrip-rate-table">
+              <thead><tr><th>年龄区间 (Ma)</th><th>构造速率 (m/Ma)</th></tr></thead>
+              <tbody id="backstripRateRows"><tr><td colspan="2">尚无计算结果</td></tr></tbody>
+            </table>
+          </div>
+          <div class="backstrip-chart"><canvas id="burialChart" aria-label="埋藏史图"></canvas></div>
+          <div class="backstrip-chart"><canvas id="subsidenceChart" aria-label="构造沉降与负载沉降图"></canvas></div>
+          <section id="backstripProfileSection" class="backstrip-profile-section" hidden>
+            <div class="section-heading profile-heading">
+              <h3>地质剖面回剥演示</h3>
+              <span class="section-kicker">PROFILE</span>
+            </div>
+            <p class="form-tip">左侧为现今压实剖面，右侧为按年龄恢复的原始厚度剖面。灰色表示已从该时代回剥掉的年轻地层。</p>
+            <div class="backstrip-profile-controls">
+              <button id="backstripProfilePlayBtn" type="button" class="primary" aria-pressed="false">播放回剥</button>
+              <button id="backstripProfileResetBtn" type="button">回到现在</button>
+              <label class="profile-slider-label" for="backstripProfileSlider">地质时间
+                <input id="backstripProfileSlider" type="range" min="0" max="0" step="1" value="0">
+              </label>
+              <strong id="backstripProfileStageLabel">现在</strong>
+            </div>
+            <div id="backstripProfileDetail" class="backstrip-profile-detail">计算后可查看现今与回剥重建剖面。</div>
+            <div class="backstrip-profile-chart">
+              <canvas id="backstripProfileCanvas" aria-label="现今压实地层与回剥重建地层剖面对比图"></canvas>
+            </div>
+            <div class="backstrip-profile-note">颜色代表岩性：砂岩、页岩、灰岩、粉砂岩、煤。播放方向为现在 → 老年代。</div>
+          </section>
+        </section>
+        <section>
+          <div class="section-heading">
+            <h2>选中要素</h2>
+            <button id="clearSelectionBtn" class="text-button">清除</button>
+          </div>
+          <div id="selectionSummary" class="selection-summary">暂无选择</div>
+          <div class="table-wrap">
+            <table>
+              <thead id="selectionHead"></thead>
+              <tbody id="attributeBody"></tbody>
+            </table>
+          </div>
+          <p class="form-tip">Shift 加选、Alt 减选；多选后可批量修改共有字段。完整属性表在地图下方。</p>
+          <div id="selectionEditor" class="selection-editor is-empty">
+            <div class="editor-heading">
+              <div>
+                <span class="editor-title">属性编辑</span>
+                <span id="editorState" class="editor-state">未选择</span>
+              </div>
+              <span id="editorType" class="type-chip">—</span>
+            </div>
+            <div id="editFieldList" class="edit-field-list">
+              <p class="empty-layer">点选一个要素后编辑属性。</p>
+            </div>
+            <div id="bulkEditor" class="bulk-editor" hidden>
+              <label>统一修改字段
+                <select id="bulkFieldSelect" aria-label="批量修改字段"></select>
+              </label>
+              <label>新值
+                <input id="bulkValueInput" type="text" placeholder="输入新值；留空可清空字段">
+              </label>
+              <button id="bulkUpdateBtn" class="primary" type="button">应用到选中要素</button>
+            </div>
+            <div id="editorMeta" class="editor-meta">点选一行要素开始编辑。</div>
+            <div class="editor-actions">
+              <button id="updateFeatureBtn" class="primary" disabled>保存属性修改</button>
+              <button id="deleteSelectionBtn" class="danger-button" disabled>删除选中要素</button>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>操作提示</h2>
+            <span class="section-kicker">QUICK GUIDE</span>
+          </div>
+          <ul class="checklist">
+            <li><span>01</span>点选 / 框选，Shift 加选、Alt 减选</li>
+            <li><span>02</span>画线画面双击或 Enter 完成，Esc 取消</li>
+            <li><span>03</span>吸附可让新节点贴合已有节点或边</li>
+            <li><span>04</span>多选后批量改属性；删要素前确认</li>
+            <li><span>05</span>编辑几何可拖节点；属性表可双击修改</li>
+          </ul>
+        </section>
+      </aside>
+
+      <section id="attributeDrawer" class="attribute-drawer">
+        <div class="drawer-head">
+          <button id="drawerToggleBtn" class="drawer-toggle" type="button" aria-expanded="true" title="展开 / 折叠属性表">
+            <span class="drawer-caret">▾</span>
+          </button>
+          <div class="drawer-title">
+            <span class="section-kicker">ATTRIBUTE TABLE</span>
+            <h2>属性表</h2>
+          </div>
+          <span id="attributeCount" class="drawer-count">共 0 个要素</span>
+          <div class="drawer-filter" role="group" aria-label="属性表过滤">
+            <button type="button" class="filter-button active" data-filter="all">全部</button>
+            <button type="button" class="filter-button" data-filter="selected">仅选中</button>
+          </div>
+          <input id="attributeSearch" class="drawer-search" type="search" placeholder="搜索字段值…" aria-label="搜索属性值">
+          <button id="addFieldBtn" class="drawer-action" type="button">新增字段</button>
+        </div>
+        <div class="drawer-body">
+          <div class="table-wrap drawer-table-wrap">
+            <table class="attribute-table">
+              <thead id="attributeHead"></thead>
+              <tbody id="attributeTableBody"></tbody>
+            </table>
+          </div>
+          <div class="drawer-footer">
+            <span id="attributePageInfo" class="drawer-page-info">—</span>
+            <div class="drawer-pager">
+              <button id="attributePrevBtn" type="button">上一页</button>
+              <button id="attributeNextBtn" type="button">下一页</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <datalist id="layerOptions"></datalist>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <!-- Chart.js 必须先于 ArcGIS AMD loader 加载，避免 Chart.js 被误注册成 AMD 模块。 -->
+  <script src="https://js.arcgis.com/4.29/"></script>
+  <script src="/static/app.js?v=backstrip-20261013k"></script>
+  <script src="/static/backstrip.js?v=backstrip-20261013k"></script>
+  <script src="/static/plotModule.js?v=backstrip-20261013k"></script>
+  <script src="/static/mapModule.js?v=backstrip-20261013p"></script>
+  <script src="/static/backstrip-profile.js?v=backstrip-20261013k"></script>
+  <script src="/static/backstrip-panel.js?v=backstrip-20261013n"></script>
+</body>
+</html>

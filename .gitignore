@@ -1,6 +1,5 @@
 __pycache__/
 *.py[cod]
-node_modules/
 .DS_Store
 
 # Runtime-created dataset catalog and imported GeoJSON files.

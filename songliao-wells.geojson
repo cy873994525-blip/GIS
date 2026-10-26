@@ -1,0 +1,66 @@
+{
+  "type": "FeatureCollection",
+  "name": "松辽盆地训练井位（虚构示例）",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "songliao-well-01",
+      "properties": {
+        "name": "松辽训练井 S1",
+        "wellId": "S1",
+        "layer": "井位",
+        "basin": "松辽盆地",
+        "note": "课程演示用虚构井位"
+      },
+      "geometry": { "type": "Point", "coordinates": [123.42, 46.20] }
+    },
+    {
+      "type": "Feature",
+      "id": "songliao-well-02",
+      "properties": {
+        "name": "松辽训练井 S2",
+        "wellId": "S2",
+        "layer": "井位",
+        "basin": "松辽盆地",
+        "note": "课程演示用虚构井位"
+      },
+      "geometry": { "type": "Point", "coordinates": [124.18, 45.62] }
+    },
+    {
+      "type": "Feature",
+      "id": "songliao-well-03",
+      "properties": {
+        "name": "松辽训练井 S3",
+        "wellId": "S3",
+        "layer": "井位",
+        "basin": "松辽盆地",
+        "note": "课程演示用虚构井位"
+      },
+      "geometry": { "type": "Point", "coordinates": [122.72, 44.88] }
+    },
+    {
+      "type": "Feature",
+      "id": "songliao-well-04",
+      "properties": {
+        "name": "松辽训练井 S4",
+        "wellId": "S4",
+        "layer": "井位",
+        "basin": "松辽盆地",
+        "note": "课程演示用虚构井位"
+      },
+      "geometry": { "type": "Point", "coordinates": [125.05, 46.72] }
+    },
+    {
+      "type": "Feature",
+      "id": "songliao-well-05",
+      "properties": {
+        "name": "松辽训练井 S5",
+        "wellId": "S5",
+        "layer": "井位",
+        "basin": "松辽盆地",
+        "note": "课程演示用虚构井位"
+      },
+      "geometry": { "type": "Point", "coordinates": [121.88, 45.35] }
+    }
+  ]
+}
