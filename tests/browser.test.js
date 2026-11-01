@@ -317,3 +317,55 @@ test("配置官方 Key 后可加载地图、切换图层和搜索地点", { time
     await stopServer(child);
   }
 });
+
+test("工作台导航：图层搜索、属性与回剥切换、帮助说明", { timeout: 60000 }, async () => {
+  const { child, baseUrl } = await startServer();
+  let browser;
+  try {
+    const channel = process.env.GIS_BROWSER_CHANNEL ||
+      (process.platform === "win32" ? "msedge" : undefined);
+    browser = await chromium.launch({ headless: true, ...(channel ? { channel } : {}) });
+    const page = await browser.newPage({ viewport: { width: 1500, height: 960 } });
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(baseUrl);
+    await page.locator("#layerList .layer-row").first().waitFor();
+    assert.equal(await page.locator("#featureInspector").isVisible(), true);
+    assert.equal(await page.locator("#backstripPanel").isVisible(), false);
+
+    const firstLayer = await page.locator("#layerList .layer-row").first().getAttribute("data-layer");
+    await page.locator("#layerSearch").fill("no-such-layer-2026");
+    assert.equal(await page.locator("#layerList .layer-row").count(), 0);
+    await page.locator("#layerSearch").fill(firstLayer);
+    assert.ok(await page.locator("#layerList .layer-row").count() >= 1);
+    await page.locator("#layerSearch").fill("");
+
+    await page.locator("#inspectorBackstripTab").click();
+    assert.equal(await page.locator("#backstripPanel").isVisible(), true);
+    assert.equal(await page.locator("#featureInspector").isVisible(), false);
+    await page.locator("#inspectorBackstripTab").press("ArrowRight");
+    assert.equal(await page.locator("#featureInspector").isVisible(), true);
+    assert.equal(await page.locator("#inspectorAttributesTab").getAttribute("aria-selected"), "true");
+
+    await page.locator("#helpBtn").click();
+    assert.equal(await page.locator("#helpDialog").isVisible(), true);
+    assert.match(await page.locator("#helpDialog").textContent(), /自动保存/);
+    await page.locator("#closeHelpBtn").click();
+    assert.equal(await page.locator("#helpDialog").isVisible(), false);
+
+    await page.locator("#inspectorBackstripTab").click();
+    await page.locator("#loadBackstripExampleBtn").click();
+    await page.locator("#runBackstripBtn").click();
+    await page.locator("#backstripMetrics").waitFor({ state: "visible" });
+    assert.ok(Number(await page.locator("#backstripRate").textContent()) > 0);
+    for (const endpoint of ["/api/spatial/features", "/api/routing/network"]) {
+      const response = await page.request.get(`${baseUrl}${endpoint}`);
+      assert.equal(response.status(), 200, endpoint);
+      assert.equal((await response.json()).ok, true, endpoint);
+    }
+    assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close();
+    await stopServer(child);
+  }
+});

@@ -1388,6 +1388,95 @@ section {
   display: none;
 }
 
+/* Keep the map visible while the analysis panel grows; switch the right rail by task. */
+.attribute-panel {
+  max-height: calc(100vh - 116px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.attribute-panel > [hidden] {
+  display: none !important;
+}
+
+.inspector-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.inspector-tabs button {
+  padding: 9px 5px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.inspector-tabs button[aria-selected="true"] {
+  background: #d9efed;
+  color: var(--primary-dark);
+  font-weight: 700;
+}
+
+.layer-search {
+  width: 100%;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.help-dialog {
+  width: min(620px, calc(100vw - 32px));
+  max-height: calc(100vh - 40px);
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: 0 24px 65px rgba(17, 45, 62, .24);
+}
+
+.help-dialog::backdrop { background: rgba(9, 27, 40, .55); }
+.help-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.help-heading h2 { margin: 4px 0 12px; }
+.help-dialog ol { padding-left: 22px; line-height: 1.8; }
+.help-dialog li + li { margin-top: 9px; }
+.help-dialog p { color: var(--muted); line-height: 1.6; }
+
+@media (max-width: 1050px) {
+  .attribute-panel {
+    display: flex;
+    grid-column: 1 / -1;
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+@media (max-width: 760px) {
+  body { min-width: 0; }
+  .map-panel { order: -1; }
+  .toolbar {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .tool-group { flex: 0 0 auto; }
+}
+
 .drawer-body {
   display: flex;
   flex-direction: column;

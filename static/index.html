@@ -24,6 +24,7 @@
       </div>
       <div class="top-actions">
         <span id="saveStatus" class="save-status" data-state="saved" role="status" aria-live="polite">自动保存</span>
+        <button id="helpBtn" type="button" aria-haspopup="dialog">使用说明</button>
         <a class="button" id="exportGeoJSON" href="/api/export">导出 GeoJSON</a>
         <a class="button" id="exportShapefile" href="/api/export?format=shapefile" title="导出为 .shp/.shx/.dbf/.prj 打包的 ZIP（需为单一几何类型）">导出 Shapefile</a>
         <a class="button" id="exportCSV" href="/api/export?format=csv" title="导出属性表为 CSV（含几何 WKT，UTF-8 带 BOM，可用 Excel 打开）">导出 CSV</a>
@@ -60,6 +61,8 @@
               <button id="hideAllBtn" class="text-button">全隐</button>
             </div>
           </div>
+          <label class="sr-only" for="layerSearch">查找图层</label>
+          <input id="layerSearch" class="layer-search" type="search" placeholder="查找图层…" autocomplete="off">
           <div id="layerList" class="layer-list"></div>
         </section>
 
@@ -184,7 +187,11 @@
       </section>
 
       <aside class="attribute-panel">
-        <section id="backstripPanel" class="backstrip-panel">
+        <div class="inspector-tabs" role="tablist" aria-label="右侧工作面板">
+          <button id="inspectorAttributesTab" type="button" role="tab" aria-selected="true" aria-controls="featureInspector">要素属性</button>
+          <button id="inspectorBackstripTab" type="button" role="tab" aria-selected="false" aria-controls="backstripPanel" tabindex="-1">沉降回剥</button>
+        </div>
+        <section id="backstripPanel" class="backstrip-panel" role="tabpanel" aria-labelledby="inspectorBackstripTab" hidden>
           <div class="section-heading">
             <h2>沉降回剥分析</h2>
             <span class="section-kicker">BACKSTRIP</span>
@@ -259,7 +266,7 @@
             <div class="backstrip-profile-note">颜色代表岩性；播放方向为现在 → 老年代。</div>
           </section>
         </section>
-        <section>
+        <section id="featureInspector" role="tabpanel" aria-labelledby="inspectorAttributesTab">
           <div class="section-heading">
             <h2>选中要素</h2>
             <button id="clearSelectionBtn" class="text-button">清除</button>
@@ -300,7 +307,7 @@
           </div>
         </section>
 
-        <section>
+        <section id="guidePanel">
           <div class="section-heading">
             <h2>操作提示</h2>
             <span class="section-kicker">QUICK GUIDE</span>
@@ -352,6 +359,23 @@
   </div>
 
   <datalist id="layerOptions"></datalist>
+
+  <dialog id="helpDialog" class="help-dialog" aria-labelledby="helpTitle">
+    <div class="help-heading">
+      <div>
+        <span class="section-kicker">QUICK START</span>
+        <h2 id="helpTitle">GIS 工作台使用说明</h2>
+      </div>
+      <button id="closeHelpBtn" type="button" aria-label="关闭使用说明">关闭</button>
+    </div>
+    <ol>
+      <li><strong>准备数据：</strong>打开真实地图示例，或导入 GeoJSON / Shapefile。左侧图层可搜索、排序并调整显示样式。</li>
+      <li><strong>查看与编辑：</strong>用地图工具点选、框选、画点线面；在右侧修改选中要素属性，或在下方属性表筛选和批量编辑。</li>
+      <li><strong>空间分析：</strong>使用地图上的路径分析工具；切换右侧“沉降回剥”查看井位、参数和分析图。</li>
+      <li><strong>保存成果：</strong>编辑结果自动保存到当前数据集，可在顶部导出 GeoJSON、Shapefile 或 CSV。</li>
+    </ol>
+    <p>真实底图需要联网；地理数据请确认坐标系。重置数据会清空当前数据集，请先导出需要保留的成果。</p>
+  </dialog>
 
   <dialog id="addFieldDialog" class="field-dialog" aria-labelledby="addFieldTitle">
     <form id="addFieldForm">

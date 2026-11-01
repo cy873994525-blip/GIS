@@ -1,6 +1,14 @@
 # GIS 矢量数据编辑与管理 Demo
 
-这是一个用于“GIS 算法与应用”第一次作业展示的最小可运行版本。
+这是“GIS 算法与应用”课程的 WebGIS 综合演示：A 组负责数据与 API，B 组负责地图显示和沉降回剥，C 组负责交互编辑与属性，D 组负责空间分析与路径。网页入口是 `static/index.html`，用 `python server.py 8000` 启动后访问 `http://127.0.0.1:8000/`。运行中的数据会写在本机 `data/`；演示或测试前可先导出需要保留的成果。
+
+### 2026-11-01 收尾整合
+
+- 恢复曾被整文件上传覆盖的 `server.py` 功能，重新接通 A 组导出、字段校验与质量检查，C 组地图配置与高德同源代理，以及已有数据集 API；保留后续已加入的沉降回剥前端和 D 组分析文件。
+- 右侧工作区增加“要素属性 / 沉降回剥”切换。打开页面先显示选中要素及编辑表单；选择地图要素时自动回到属性视图，回剥分析仍可直接切换查看。
+- 左侧图层列表增加即时搜索；顶部加入使用说明，覆盖数据准备、编辑、分析、保存以及底图联网和坐标系要求。
+- 修复根目录回剥算法测试的源码路径，加入浏览器测试验证工作区切换、图层搜索和使用说明。回归命令见下方“测试”。
+- 界面整理参考了[另一组的 WebGIS 工作台](https://mrblue.space/webgis/)在地图优先布局、图层查找和帮助入口上的做法；数据模型、算法和编辑保存仍以本仓库实现为准。
 
 ## 成员分工与代码归属
 
@@ -869,12 +877,12 @@ D 组在 10 月 16 日完成道路网络最短路径分析模块的基础上，�
 | `static/songliao-wells.geojson` | 课程演示用虚构训练井位；不是实测井位或真实沉降结果。 |
 | `static/map_demo.geojson` | 原 GIS 地图演示数据。 |
 | `server.py`、`d_spatial.py` | 提供静态页面、数据集 API 和原 GIS 空间分析接口。 |
-| `tests/backstrip.test.js` | 回剥输入排序、沉降拆分、薄层稳定性和异常输入测试。 |
+| `backstrip.test.js` | 回剥输入排序、沉降拆分、薄层稳定性和异常输入测试。 |
 | `tests/interaction.test.js` | GIS 选择、吸附、数据集编辑及持久化行为测试。 |
 | `BACKSTRIP_INTEGRATION.md` | 更细的加载顺序、GIS 联动和计算口径说明。 |
 | `.gitignore` | 排除 Python 缓存及运行时创建/导入的数据。 |
 
-实际网页入口是 `static/index.html`，页面加载的是 `static/` 下的版本。原项目根目录里的同名旧版文件不应与此处源码重复上传，以免出现两个入口或两套实现。
+实际网页入口是 `static/index.html`，页面加载的是 `static/` 下的版本。根目录中还保留其他小组上传的独立文件；修改网页时请以 `static/` 为准。
 
 ## 运行
 
@@ -893,10 +901,11 @@ python server.py 8000
 需要 Node.js。运行：
 
 ```powershell
-node --test --test-isolation=none tests/backstrip.test.js tests/interaction.test.js
+python -m unittest discover -s tests -p "test_*.py"
+node --test backstrip.test.js tests/interaction.test.js tests/browser.test.js
 ```
 
-当前测试覆盖核心算法与部分 GIS 数据交互；没有覆盖完整浏览器操作的端到端自动化测试。
+浏览器测试使用 Playwright，需先安装 `package.json` 中的开发依赖；Windows 默认使用 Edge，其他系统可安装 Playwright Chromium。测试服务使用临时目录，不会修改本机已有数据集。
 
 ## 计算口径与适用范围
 
@@ -928,9 +937,9 @@ node --test --test-isolation=none tests/backstrip.test.js tests/interaction.test
 
 随仓库提供的松辽井位仅为虚构训练坐标。地图上的点位和颜色只用于演示 GIS 与回剥结果联动，不代表实测地质结论或真实盆地沉降梯度。正式分析请替换为有来源说明的井位与地层数据。
 
-## 上传到 GitHub 前
+## 仓库与运行数据
 
-请将本目录中的文件作为仓库内容上传。不要把原项目运行时的 `data/uploads/`、`data/catalog.json`、`data/active_dataset.json`、`data/features.geojson`、`__pycache__/`、`.pyc` 或旧的集成 ZIP 一并提交；这些不是源代码，且运行过程中可能含有本机导入的数据。仓库目前不附带 `LICENSE`，若要公开发布并允许他人复用，请先选择并添加合适的开源许可证。
+`.gitignore` 会排除新生成的运行数据与 Python 缓存；仓库历史中已经追踪的 `data/` 示例文件仍会保留。提交前请检查 `git status`，避免将个人导入的数据或密钥加入仓库。仓库目前不附带 `LICENSE`；若要允许外部复用，请先确定并添加合适的开源许可证。
 
 
 

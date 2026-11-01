@@ -69,6 +69,7 @@ const state = {
   featureDrag: null,
   hoverVertexIndex: -1,
   lastRowClickId: null,
+  inspectorTab: "attributes",
   // 拖拽结束后浏览器会补一个 click，用它吃掉那次点击。
   skipClickOnce: false,
   geographic: false,
@@ -988,8 +989,11 @@ function renderLayers() {
 
   const layerList = document.getElementById("layerList");
   layerList.innerHTML = "";
+  const query = document.getElementById("layerSearch").value.trim().toLocaleLowerCase();
+  const displayedNames = state.layerOrder.filter((name) => counts[name] &&
+    name.toLocaleLowerCase().includes(query));
 
-  state.layerOrder.filter((name) => counts[name]).forEach((name) => {
+  displayedNames.forEach((name) => {
     const row = document.createElement("div");
     row.className = "layer-row";
     row.draggable = true;
@@ -1083,8 +1087,9 @@ function renderLayers() {
     layerList.appendChild(row);
   });
 
-  if (!Object.keys(counts).length) {
-    layerList.innerHTML = '<div class="empty-layer">暂无图层数据</div>';
+  if (!displayedNames.length) {
+    layerList.innerHTML = `<div class="empty-layer">${names.length
+      ? "没有匹配的图层，请换个关键词。" : "暂无图层数据"}</div>`;
   }
   renderLayerOptions();
   updateStats();
@@ -1133,13 +1138,32 @@ async function activeDatasetData() {
   return result.data;
 }
 
+function setInspectorTab(tab) {
+  const backstrip = tab === "backstrip";
+  state.inspectorTab = backstrip ? "backstrip" : "attributes";
+  document.getElementById("backstripPanel").hidden = !backstrip;
+  document.getElementById("featureInspector").hidden = backstrip;
+  document.getElementById("guidePanel").hidden = backstrip;
+  for (const [id, selected] of [
+    ["inspectorAttributesTab", !backstrip],
+    ["inspectorBackstripTab", backstrip],
+  ]) {
+    const button = document.getElementById(id);
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  }
+  document.querySelector(".attribute-panel").scrollTop = 0;
+}
+
 function selectFeatures(ids) {
   const nextIds = new Set(ids);
-  if (nextIds.size !== state.selectedIds.size ||
-      [...nextIds].some((id) => !state.selectedIds.has(id))) {
+  const changed = nextIds.size !== state.selectedIds.size ||
+    [...nextIds].some((id) => !state.selectedIds.has(id));
+  if (changed) {
     document.getElementById("bulkValueInput").value = "";
   }
   state.selectedIds = nextIds;
+  if (changed && nextIds.size) setInspectorTab("attributes");
   // 编辑几何模式下，选中项就是编辑目标。表格点行、框选都会走到这里。
   if (state.mode === "edit") {
     const target = getSingleSelectedFeature();
@@ -3389,6 +3413,21 @@ document.getElementById("placeSearchForm").addEventListener("submit", async (eve
   searchOfficialPlace(query);
 });
 document.getElementById("openMapDemoBtn").addEventListener("click", openMapDemo);
+document.getElementById("helpBtn").addEventListener("click", () =>
+  document.getElementById("helpDialog").showModal());
+document.getElementById("closeHelpBtn").addEventListener("click", () =>
+  document.getElementById("helpDialog").close());
+document.getElementById("layerSearch").addEventListener("input", renderLayers);
+document.getElementById("inspectorAttributesTab").addEventListener("click", () => setInspectorTab("attributes"));
+document.getElementById("inspectorBackstripTab").addEventListener("click", () => setInspectorTab("backstrip"));
+document.querySelector(".inspector-tabs").addEventListener("keydown", (event) => {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  event.preventDefault();
+  const next = state.inspectorTab === "attributes" ? "backstrip" : "attributes";
+  setInspectorTab(next);
+  document.getElementById(next === "attributes"
+    ? "inspectorAttributesTab" : "inspectorBackstripTab").focus();
+});
 document.getElementById("fileInput").addEventListener("change", (event) => {
   const files = Array.from(event.target.files || []);
   const shp = files.find((file) => file.name.toLowerCase().endsWith(".shp"));
@@ -3746,6 +3785,7 @@ window.GisApp = {
       return 0;
     }
     selectFeatures(features.map((feature) => feature.id));
+    setInspectorTab("attributes");
     state.attributeFilter = "selected";
     state.attributePage = 1;
     document.querySelectorAll(".filter-button").forEach((button) => {

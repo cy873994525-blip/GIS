@@ -4,7 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const source = fs.readFileSync(path.join(__dirname, "..", "static", "backstrip.js"), "utf8");
+const source = fs.readFileSync(path.join(__dirname, "static", "backstrip.js"), "utf8");
 const context = vm.createContext({ window: {} });
 vm.runInContext(source, context, { filename: "static/backstrip.js" });
 const backstrip = context.window.Backstrip.backstrip;
