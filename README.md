@@ -115,23 +115,41 @@ python server.py 8000
 
 ## A 组：后端文件数据模块（当前实现）
 
-后端现在提供一个轻量的数据集目录。导入的文件会存放在运行时目录 `data/uploads/`，并自动登记文件元数据：
+A 组承担”文件导入 → 格式校验/转换 → 元数据登记 → 多图层读取 → 导出互通 → 数据质量检查”的后端闭环。所有能力均有自动化测试覆盖（`tests/test_a_group.py`，**29/29 通过**）。
 
-- `GET /api/datasets`：列出数据集、当前激活数据集和要素统计。
-- `POST /api/datasets/import`：导入 GeoJSON/JSON、Shapefile ZIP 或成套 `.shp/.shx/.dbf/.prj/.cpg` 文件，并自动切换为当前数据集。
-- `POST /api/datasets/{id}/activate`：切换当前数据集。
-- `GET /api/datasets/{id}`：读取指定数据集和元数据。
-- `DELETE /api/datasets/{id}`：删除非当前数据集，至少保留一个数据集。
-- `GET /api/layers`：读取当前数据集，供地图显示。
-- `POST /api/save`、`POST /api/features`：保存当前数据集或追加要素。
-- `PUT /api/features/{id}`、`DELETE /api/features/{id}`：更新或删除当前数据集中的要素。
-- `GET /api/export`：导出当前数据集。
+### 功能总览（对标 GIS 基础能力）
 
-导入和保存过程会检查文件大小、要素数量、要素 ID、几何类型、坐标数值和面环闭合情况；缺少 ID 的导入要素会由后端自动生成唯一 ID。Shapefile 导入既支持 ZIP，也支持在文件选择器中同时选择同名的 `.shp/.shx/.dbf/.prj/.cpg` 文件；直接选择成套文件时至少需要 `.shp/.shx/.dbf`，`.prj/.cpg` 为可选。ZIP 会自动忽略 `__MACOSX`、`._*` 等系统隐藏文件；如果 ZIP 中没有 Shapefile 但只有一个 GeoJSON/JSON 文件，也会按 GeoJSON 导入。后端读取 `.shp` 几何、`.dbf` 属性、`.cpg` 编码和 `.prj` 坐标系提示，并统一转换为内部 GeoJSON 数据集；空几何记录会被跳过。当前支持 Point、PolyLine 和 Polygon 三类 Shapefile，单个组件最大 20 MB。
+| 能力 | 接口 / 实现 | 说明 |
+| --- | --- | --- |
+| **数据集目录** | `GET /api/datasets` | 列出数据集、激活状态、要素统计、字段类型、大小、来源格式 |
+| **导入 GeoJSON/JSON** | `POST /api/datasets/import` | 校验文件大小、要素数、ID、几何类型、坐标范围、面环闭合；缺 ID 自动生成 |
+| **导入 Shapefile ZIP** | `POST /api/datasets/import` | 解析 `.shp/.shx/.dbf/.prj/.cpg`，自动忽略 `__MACOSX`；ZIP 内只有 GeoJSON 时降级导入 |
+| **导入 Shapefile 成套文件** | `POST /api/datasets/import` | 同一 `.shp/.shx/.dbf` 多文件选择，`.prj/.cpg` 可选 |
+| **几何类型** | 后端读取/导出 | Point / MultiPoint / PolyLine / Polygon（含洞结构）；含 Z 坐标时升级为 PointZ/MultiPointZ/PolyLineZ/PolygonZ 并保留第三维 |
+| **坐标系统(CRS)** | `.prj` 解析 + pyproj | 区分地理/投影坐标系，提取规范名称与 EPSG；投影坐标自动转 WGS 84 经纬度，可直接叠加在线底图 |
+| **编码** | `.cpg` 解析 | 正确读取中文属性（GBK/UTF-8），避免乱码 |
+| **字段类型** | catalog `field_types` | 导入时自动推断字段类型（int/float/str/bool），用户可声明覆盖 |
+| **数据质量检查** | `GET /api/datasets/{id}/quality` | 检测重复 ID、空几何、非法坐标、字段类型不符；前端「检查」按钮触发 |
+| **多图层叠加** | `GET /api/layers?ids=id1,id2` | 多数据集合并为一个 FeatureCollection，要素自动附加 `layer`/`dataset_id` 来源标记 |
+| **导出 GeoJSON** | `GET /api/export` | UTF-8，要素完整 |
+| **导出 Shapefile** | `GET /api/export?format=shapefile` | `.shp/.shx/.dbf/.prj` 打包 ZIP；Z 维保真 roundtrip；混合几何拒绝并提示拆分 |
+| **导出 CSV 属性表** | `GET /api/export?format=csv` | 属性字段并集 + `geometry_type` + WKT 几何列；UTF-8 BOM，Excel 直接打开 |
+| **要素增删改** | `POST /api/features` / `PUT /api/features/{id}` / `DELETE /api/features/{id}` | 配合前端点选/框选/绘制/编辑 |
+| **数据集管理** | `POST .../activate` / `DELETE /api/datasets/{id}` | 切换激活、删除非当前数据集（至少保留一个） |
+| **重置** | `POST /api/reset` | 恢复内置示例数据 |
 
-前端的数据文件面板支持查看文件大小、来源格式、几何类型、bbox 和坐标系提示，并可切换或删除非当前数据集。
+### 已验证数据
 
-这部分已经形成“文件导入 → 格式校验/转换 → 元数据登记 → 数据集切换 → 地图读取 → 文件管理”的后端闭环。当前已增强 `.prj` 识别（区分地理/投影坐标系并提取规范名称与 EPSG），保留 Polygon 洞结构（内环），并在安装 `pyproj` 后自动把投影坐标转换为 WGS 84 经纬度（可叠加在线底图）；下一步可以继续扩展数据库存储。
+- **中国省界 + 省会城市**：WGS 84 经纬度，导入、多图层叠加、导出 roundtrip 均验证通过，与在线底图对齐无偏差。
+- **松辽盆地井位**（其他组训练数据）：通过 A 组管线导入、渲染、属性查看无问题。
+- **坐标偏移问题**已在 CRS 自动转换（pyproj）+ 统一 WGS84 输出后解决。
+
+### 技术要点
+
+- Shapefile 解析为纯 Python 实现（不依赖 pyshp / shapely），零第三方依赖即可运行；安装 `pyproj` 后自动获得投影转换能力。
+- 几何 WKT 手写生成器，CSV 导出不依赖 shapely。
+- 下载文件名用数据集名（RFC 5987 `filename*`），兼容中文与浏览器/Excel。
+- 空几何、非法坐标、混合几何在导入/导出两端对称校验，杜绝半写入。
 
 ### A 组本次工作详细记录
 
