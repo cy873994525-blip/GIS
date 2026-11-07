@@ -243,9 +243,8 @@ select {
 }
 
 .dataset-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   padding: 8px;
   border: 1px solid var(--border);
@@ -272,26 +271,29 @@ select {
 }
 
 .dataset-info strong {
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .dataset-info span {
   color: var(--muted);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .dataset-actions {
-  display: flex;
-  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: center;
-  gap: 4px;
+  gap: 6px;
+  min-width: 0;
 }
 
 .dataset-show {
   display: inline-flex;
+  grid-column: 1 / -1;
   align-items: center;
-  gap: 3px;
-  font-size: 11px;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
   color: var(--muted);
   cursor: pointer;
   user-select: none;
@@ -305,17 +307,17 @@ select {
   cursor: pointer;
 }
 
-.dataset-switch {
-  padding: 5px 7px;
-  font-size: 11px;
+.dataset-actions button {
+  min-width: 0;
+  padding: 6px 4px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .dataset-delete {
-  padding: 5px 7px;
   border-color: #e4c1c1;
   background: #fffafa;
   color: var(--danger);
-  font-size: 11px;
 }
 
 .dataset-meta {
