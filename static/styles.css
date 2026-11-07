@@ -239,35 +239,36 @@ select {
 
 .dataset-list {
   display: grid;
-  gap: 7px;
+  gap: 9px;
 }
 
 .dataset-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 8px;
-  padding: 8px;
+  gap: 10px;
+  padding: 11px;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-2);
+  border-radius: 10px;
+  background: var(--surface);
 }
 
 .dataset-row.active {
-  border-color: #9dc8c0;
-  background: #eef8f6;
+  border-color: #81bdb3;
+  background: #f0faf7;
+  box-shadow: inset 3px 0 0 var(--primary);
 }
 
 .dataset-info {
   min-width: 0;
   display: grid;
-  gap: 3px;
+  gap: 4px;
 }
 
 .dataset-info strong,
 .dataset-info span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
 }
 
 .dataset-info strong {
@@ -285,6 +286,8 @@ select {
   align-items: center;
   gap: 6px;
   min-width: 0;
+  padding-top: 9px;
+  border-top: 1px solid var(--border);
 }
 
 .dataset-show {
